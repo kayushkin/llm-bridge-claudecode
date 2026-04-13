@@ -100,9 +100,8 @@ func scanProjectDir(dir, project string) ([]msg.StoredSession, error) {
 	return sessions, nil
 }
 
-// parseSessionHead reads the first line of a CC session JSONL file to extract
-// the initial prompt and timestamp.
-// It also does a fast line count of "type":"user" lines to approximate turn count.
+// parseSessionHead scans a CC session JSONL file to extract the first user
+// prompt, timestamp, and turn count.
 func parseSessionHead(path string) (prompt string, ts time.Time, turns int) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -113,37 +112,39 @@ func parseSessionHead(path string) (prompt string, ts time.Time, turns int) {
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 256*1024), 1024*1024)
 
-	firstDone := false
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {
 			continue
 		}
 
-		if !firstDone {
-			firstDone = true
-			var head struct {
-				Type      string `json:"type"`
-				Content   string `json:"content"`
-				Timestamp string `json:"timestamp"`
-			}
-			if json.Unmarshal(line, &head) == nil {
-				if head.Content != "" {
-					prompt = truncate(head.Content, 200)
-				}
-				if head.Timestamp != "" {
-					ts, _ = time.Parse(time.RFC3339Nano, head.Timestamp)
-				}
-			}
+		var entry struct {
+			Type      string `json:"type"`
+			Timestamp string `json:"timestamp"`
+			Message   struct {
+				Content []struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"message"`
+		}
+		if json.Unmarshal(line, &entry) != nil {
+			continue
 		}
 
-		// Count user messages for turn count approximation.
-		if json.Valid(line) {
-			var entry struct {
-				Type string `json:"type"`
-			}
-			if json.Unmarshal(line, &entry) == nil && entry.Type == "user" {
-				turns++
+		if entry.Type == "user" {
+			turns++
+			// Extract first user message as prompt
+			if prompt == "" {
+				for _, block := range entry.Message.Content {
+					if block.Type == "text" && block.Text != "" {
+						prompt = truncate(block.Text, 200)
+						break
+					}
+				}
+				if ts.IsZero() && entry.Timestamp != "" {
+					ts, _ = time.Parse(time.RFC3339Nano, entry.Timestamp)
+				}
 			}
 		}
 	}
