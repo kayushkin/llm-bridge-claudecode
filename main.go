@@ -50,6 +50,32 @@ func main() {
 		os.Exit(0)
 	}
 
+	if len(os.Args) > 2 && os.Args[1] == "-import-history" {
+		sessionID := os.Args[2]
+		path := ""
+		if len(os.Args) > 3 {
+			path = os.Args[3]
+		} else {
+			// Find session file by ID
+			sessions, _ := discoverSessions("")
+			for _, s := range sessions {
+				if s.ID == sessionID {
+					path = s.Path
+					break
+				}
+			}
+		}
+		if path == "" {
+			fmt.Fprintf(os.Stderr, "import-history: session not found: %s\n", sessionID)
+			os.Exit(1)
+		}
+		if err := importHistory(sessionID, path); err != nil {
+			fmt.Fprintf(os.Stderr, "import-history: %v\n", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
 	log.SetOutput(os.Stderr)
 	log.SetPrefix("[llm-bridge-claudecode] ")
 
