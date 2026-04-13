@@ -36,6 +36,20 @@ func main() {
 		os.Exit(0)
 	}
 
+	if len(os.Args) > 1 && os.Args[1] == "-discover" {
+		project := ""
+		if len(os.Args) > 2 {
+			project = os.Args[2]
+		}
+		sessions, err := discoverSessions(project)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "discover: %v\n", err)
+			os.Exit(1)
+		}
+		json.NewEncoder(os.Stdout).Encode(sessions)
+		os.Exit(0)
+	}
+
 	log.SetOutput(os.Stderr)
 	log.SetPrefix("[llm-bridge-claudecode] ")
 
