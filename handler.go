@@ -26,6 +26,7 @@ type StartParams struct {
 	Fork         string   `json:"fork"`
 	AutoApprove  *bool    `json:"auto_approve,omitempty"`  // nil = true (default), false = restricted mode
 	AllowedTools []string `json:"allowed_tools,omitempty"` // tools to allow when auto_approve is false
+	WorkDir      string   `json:"work_dir,omitempty"`      // working directory for resumed sessions
 }
 
 // MessageParams are the parameters for the "message" method.
@@ -44,6 +45,7 @@ type Harness struct {
 	proc         *CCProcess
 	events       <-chan json.RawMessage // single reader for the process lifetime
 	sessionID    string
+	workDir      string   // persisted across respawns (for resumed sessions)
 	autoApprove  *bool    // persisted across respawns
 	allowedTools []string // persisted across respawns
 	agg          UsageAggregator
@@ -100,6 +102,9 @@ func (h *Harness) handleStart(params StartParams) error {
 	if params.AllowedTools != nil {
 		h.allowedTools = params.AllowedTools
 	}
+	if params.WorkDir != "" {
+		h.workDir = params.WorkDir
+	}
 
 	var extraArgs []string
 
@@ -116,7 +121,15 @@ func (h *Harness) handleStart(params StartParams) error {
 		extraArgs = append(extraArgs, "--model", h.cfg.Model)
 	}
 
-	proc, err := spawnClaudeCode(h.cfg, params.SessionID, h.autoApprove, h.allowedTools, extraArgs...)
+	// Use params.WorkDir if provided (for resumed sessions), otherwise fall back to config.
+	cfg := h.cfg
+	if params.WorkDir != "" {
+		cfgCopy := *h.cfg
+		cfgCopy.WorkDir = params.WorkDir
+		cfg = &cfgCopy
+	}
+
+	proc, err := spawnClaudeCode(cfg, params.SessionID, h.autoApprove, h.allowedTools, extraArgs...)
 	if err != nil {
 		emitEvent(msg.Event{
 			Type:      msg.EventError,
@@ -156,6 +169,7 @@ func (h *Harness) handleMessage(params MessageParams) error {
 			SessionID: h.sessionID,
 			Prompt:    params.Content,
 			Resume:    true,
+			WorkDir:   h.workDir,
 		})
 	}
 
@@ -190,6 +204,7 @@ func (h *Harness) handleResume() error {
 	return h.handleStart(StartParams{
 		SessionID: h.sessionID,
 		Resume:    true,
+		WorkDir:   h.workDir,
 	})
 }
 
