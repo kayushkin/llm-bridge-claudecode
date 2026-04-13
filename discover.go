@@ -119,14 +119,9 @@ func parseSessionHead(path string) (prompt string, ts time.Time, turns int) {
 		}
 
 		var entry struct {
-			Type      string `json:"type"`
-			Timestamp string `json:"timestamp"`
-			Message   struct {
-				Content []struct {
-					Type string `json:"type"`
-					Text string `json:"text"`
-				} `json:"content"`
-			} `json:"message"`
+			Type      string          `json:"type"`
+			Timestamp string          `json:"timestamp"`
+			Message   json.RawMessage `json:"message"`
 		}
 		if json.Unmarshal(line, &entry) != nil {
 			continue
@@ -136,11 +131,9 @@ func parseSessionHead(path string) (prompt string, ts time.Time, turns int) {
 			turns++
 			// Extract first user message as prompt
 			if prompt == "" {
-				for _, block := range entry.Message.Content {
-					if block.Type == "text" && block.Text != "" {
-						prompt = truncate(block.Text, 200)
-						break
-					}
+				prompt = extractUserContent(entry.Message)
+				if prompt != "" {
+					prompt = truncate(prompt, 200)
 				}
 				if ts.IsZero() && entry.Timestamp != "" {
 					ts, _ = time.Parse(time.RFC3339Nano, entry.Timestamp)
@@ -173,4 +166,39 @@ func truncate(s string, max int) string {
 		return s
 	}
 	return s[:max]
+}
+
+// extractUserContent extracts text from a CC user message.
+// CC stores user message.content as a plain string, not structured blocks.
+func extractUserContent(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+
+	// First, try to unmarshal the message object and get content field
+	var msgObj struct {
+		Content json.RawMessage `json:"content"`
+	}
+	if json.Unmarshal(raw, &msgObj) == nil && len(msgObj.Content) > 0 {
+		// Content field exists, try as plain string first
+		var str string
+		if json.Unmarshal(msgObj.Content, &str) == nil {
+			return str
+		}
+
+		// Try as array of content blocks
+		var blocks []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}
+		if json.Unmarshal(msgObj.Content, &blocks) == nil {
+			for _, b := range blocks {
+				if b.Type == "text" && b.Text != "" {
+					return b.Text
+				}
+			}
+		}
+	}
+
+	return ""
 }
