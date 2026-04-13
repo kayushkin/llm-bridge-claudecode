@@ -19,10 +19,11 @@ type ccStreamEvent struct {
 	IsError   bool            `json:"is_error,omitempty"`
 
 	// Result fields
-	DurationMS    int64   `json:"duration_ms,omitempty"`
-	DurationAPIMS int64   `json:"duration_api_ms,omitempty"`
-	NumTurns      int     `json:"num_turns,omitempty"`
-	TotalCostUSD  float64 `json:"total_cost_usd,omitempty"`
+	DurationMS        int64             `json:"duration_ms,omitempty"`
+	DurationAPIMS     int64             `json:"duration_api_ms,omitempty"`
+	NumTurns          int               `json:"num_turns,omitempty"`
+	TotalCostUSD      float64           `json:"total_cost_usd,omitempty"`
+	PermissionDenials []json.RawMessage `json:"permission_denials,omitempty"`
 }
 
 // ccAssistantMessage is a CC assistant event's message payload.
@@ -246,6 +247,23 @@ func translateResult(ev ccStreamEvent, sid string, raw json.RawMessage, agg *Usa
 		}))
 		events = append(events, makeEvent(sid, msg.EventSessionState, raw, func(e *msg.Event) {
 			e.State = &msg.StateEvent{State: msg.SessionIdle, Previous: msg.SessionRunning}
+		}))
+	}
+
+	// Surface permission denials as approval events.
+	for _, d := range ev.PermissionDenials {
+		var denial struct {
+			Tool    string `json:"tool"`
+			Message string `json:"message"`
+		}
+		_ = json.Unmarshal(d, &denial)
+		events = append(events, makeEvent(sid, msg.EventApproval, raw, func(e *msg.Event) {
+			e.Approval = &msg.ApprovalEvent{
+				Action:   "tool_use",
+				Status:   "denied",
+				ToolName: denial.Tool,
+				Detail:   denial.Message,
+			}
 		}))
 	}
 

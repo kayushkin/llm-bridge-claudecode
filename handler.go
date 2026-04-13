@@ -18,12 +18,14 @@ type Request struct {
 
 // StartParams are the parameters for the "start" method.
 type StartParams struct {
-	SessionID   string `json:"session_id"`
-	DisplayName string `json:"display_name"`
-	AgentID     string `json:"agent_id"`
-	Prompt      string `json:"prompt"`
-	Resume      bool   `json:"resume"`
-	Fork        string `json:"fork"`
+	SessionID    string   `json:"session_id"`
+	DisplayName  string   `json:"display_name"`
+	AgentID      string   `json:"agent_id"`
+	Prompt       string   `json:"prompt"`
+	Resume       bool     `json:"resume"`
+	Fork         string   `json:"fork"`
+	AutoApprove  *bool    `json:"auto_approve,omitempty"`  // nil = true (default), false = restricted mode
+	AllowedTools []string `json:"allowed_tools,omitempty"` // tools to allow when auto_approve is false
 }
 
 // MessageParams are the parameters for the "message" method.
@@ -38,13 +40,15 @@ type CompactParams struct {
 
 // Harness holds the runtime state for a single harness session.
 type Harness struct {
-	cfg       *Config
-	proc      *CCProcess
-	events    <-chan json.RawMessage // single reader for the process lifetime
-	sessionID string
-	agg       UsageAggregator
-	ctx       context.Context
-	cancel    context.CancelFunc
+	cfg          *Config
+	proc         *CCProcess
+	events       <-chan json.RawMessage // single reader for the process lifetime
+	sessionID    string
+	autoApprove  *bool    // persisted across respawns
+	allowedTools []string // persisted across respawns
+	agg          UsageAggregator
+	ctx          context.Context
+	cancel       context.CancelFunc
 }
 
 // NewHarness creates a new harness instance.
@@ -89,6 +93,14 @@ func (h *Harness) HandleRequest(req Request) error {
 func (h *Harness) handleStart(params StartParams) error {
 	h.sessionID = params.SessionID
 
+	// Persist permission config for respawns. Only update if explicitly set.
+	if params.AutoApprove != nil {
+		h.autoApprove = params.AutoApprove
+	}
+	if params.AllowedTools != nil {
+		h.allowedTools = params.AllowedTools
+	}
+
 	var extraArgs []string
 
 	if params.Resume {
@@ -104,7 +116,7 @@ func (h *Harness) handleStart(params StartParams) error {
 		extraArgs = append(extraArgs, "--model", h.cfg.Model)
 	}
 
-	proc, err := spawnClaudeCode(h.cfg, params.SessionID, extraArgs...)
+	proc, err := spawnClaudeCode(h.cfg, params.SessionID, h.autoApprove, h.allowedTools, extraArgs...)
 	if err != nil {
 		emitEvent(msg.Event{
 			Type:      msg.EventError,

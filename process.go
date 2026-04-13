@@ -55,14 +55,23 @@ type ccControlPayload struct {
 }
 
 // spawnClaudeCode starts a new Claude Code process with stream-json I/O.
-func spawnClaudeCode(cfg *Config, sessionID string, extraArgs ...string) (*CCProcess, error) {
+// autoApprove controls permission mode: nil/true uses --dangerously-skip-permissions,
+// false uses --allowed-tools with the given tool list.
+func spawnClaudeCode(cfg *Config, sessionID string, autoApprove *bool, allowedTools []string, extraArgs ...string) (*CCProcess, error) {
 	args := []string{
 		"-p",
 		"--input-format", "stream-json",
 		"--output-format", "stream-json",
 		"--verbose",
-		"--dangerously-skip-permissions",
 	}
+
+	if autoApprove == nil || *autoApprove {
+		args = append(args, "--dangerously-skip-permissions")
+	} else if len(allowedTools) > 0 {
+		args = append(args, "--allowed-tools")
+		args = append(args, allowedTools...)
+	}
+
 	args = append(args, extraArgs...)
 
 	cmd := exec.Command(cfg.ClaudePath, args...)
