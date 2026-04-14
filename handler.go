@@ -27,6 +27,17 @@ type StartParams struct {
 	AutoApprove  *bool    `json:"auto_approve,omitempty"`  // nil = true (default), false = restricted mode
 	AllowedTools []string `json:"allowed_tools,omitempty"` // tools to allow when auto_approve is false
 	WorkDir      string   `json:"work_dir,omitempty"`      // working directory for resumed sessions
+
+	// Claude Code CLI flags
+	SystemPrompt       string   `json:"system_prompt,omitempty"`        // --system-prompt: replace default system prompt
+	AppendSystemPrompt string   `json:"append_system_prompt,omitempty"` // --append-system-prompt: append to default system prompt
+	AddDirs            []string `json:"add_dirs,omitempty"`             // --add-dir: additional directories for tool access
+	MCPConfig          string   `json:"mcp_config,omitempty"`           // --mcp-config: MCP server config JSON file path
+	JSONSchema         string   `json:"json_schema,omitempty"`          // --json-schema: structured output validation schema
+	FallbackModel      string   `json:"fallback_model,omitempty"`       // --fallback-model: auto-fallback model on overload
+	PermissionMode     string   `json:"permission_mode,omitempty"`      // --permission-mode: acceptEdits/auto/bypassPermissions/default/dontAsk/plan
+	Worktree           string   `json:"worktree,omitempty"`             // --worktree: git worktree isolation (name or "true" for auto)
+	Betas              []string `json:"betas,omitempty"`                // --betas: beta API feature opt-in flags
 }
 
 // MessageParams are the parameters for the "message" method.
@@ -119,6 +130,39 @@ func (h *Harness) handleStart(params StartParams) error {
 
 	if h.cfg.Model != "" {
 		extraArgs = append(extraArgs, "--model", h.cfg.Model)
+	}
+
+	if params.SystemPrompt != "" {
+		extraArgs = append(extraArgs, "--system-prompt", params.SystemPrompt)
+	}
+	if params.AppendSystemPrompt != "" {
+		extraArgs = append(extraArgs, "--append-system-prompt", params.AppendSystemPrompt)
+	}
+	for _, dir := range params.AddDirs {
+		extraArgs = append(extraArgs, "--add-dir", dir)
+	}
+	if params.MCPConfig != "" {
+		extraArgs = append(extraArgs, "--mcp-config", params.MCPConfig)
+	}
+	if params.JSONSchema != "" {
+		extraArgs = append(extraArgs, "--json-schema", params.JSONSchema)
+	}
+	if params.FallbackModel != "" {
+		extraArgs = append(extraArgs, "--fallback-model", params.FallbackModel)
+	}
+	if params.PermissionMode != "" {
+		extraArgs = append(extraArgs, "--permission-mode", params.PermissionMode)
+	}
+	if params.Worktree != "" {
+		if params.Worktree == "true" {
+			extraArgs = append(extraArgs, "--worktree")
+		} else {
+			extraArgs = append(extraArgs, "--worktree", params.Worktree)
+		}
+	}
+	if len(params.Betas) > 0 {
+		extraArgs = append(extraArgs, "--betas")
+		extraArgs = append(extraArgs, params.Betas...)
 	}
 
 	// Use params.WorkDir if provided (for resumed sessions), otherwise fall back to config.
