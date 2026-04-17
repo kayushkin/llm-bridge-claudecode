@@ -286,39 +286,88 @@ claude \
 
 ### Conditional flags
 
+Session / resume:
 ```bash
-  [--resume <session_id>]               # Resume existing session
-  [--fork-session]                      # Fork from resumed session
-  [--session-id <uuid>]                # Use specific session ID
-  [--model <model>]                    # Model override
-  [--max-budget-usd <budget>]          # Cost cap
-  [--effort <low|medium|high|max>]     # Reasoning effort
-  [--disallowed-tools <tool1> ...]     # Tool restrictions
-  [--allowed-tools <tool1> ...]        # Tool allowlist
+  [--resume <session_id>]              # Resume existing session
+  [--fork-session]                     # Fork from resumed session
+  [--continue]                         # Continue most recent session in cwd
+  [--from-pr <pr>]                     # Resume session linked to a PR
+  [--session-id <uuid>]                # Caller-supplied UUID
+  [--name <name>]                      # Session display name
   [--no-session-persistence]           # Ephemeral sessions
 ```
 
-### Available for future integration
-
-These require new fields in the llm-bridge harness protocol:
-
+Model / cost / effort:
 ```bash
-  [--system-prompt <prompt>]            # Custom system prompt
-  [--append-system-prompt <prompt>]     # Append to system prompt
-  [--add-dir <dirs...>]                # Additional tool access dirs
-  [--mcp-config <configs...>]          # MCP server configuration
-  [--json-schema <schema>]             # Structured output
+  [--model <model>]                    # Model override
   [--fallback-model <model>]           # Auto-fallback on overload
+  [--max-budget-usd <budget>]          # Per-session cost cap
+  [--effort <low|medium|high|xhigh|max>]  # Reasoning effort
+```
+
+Prompts / context:
+```bash
+  [--system-prompt <prompt>]           # Replace system prompt
+  [--append-system-prompt <prompt>]    # Append to system prompt
+  [--add-dir <dirs...>]                # Additional tool access dirs
+  [--file <file_id:path> ...]          # File resources to download at start
+  [--json-schema <schema>]             # Structured output validation
+```
+
+Tools / permissions:
+```bash
+  [--allowed-tools <tool1> ...]        # Tool allowlist
+  [--disallowed-tools <tool1> ...]     # Tool deny-list
+  [--tools <tool1> ...]                # Exact built-in tool set
   [--permission-mode <mode>]           # Fine-grained permissions
-  [--tools <tools...>]                 # Exact tool set
+  [--disable-slash-commands]           # Disable all skills
+  [--brief]                            # Enable SendUserMessage tool
+```
+
+MCP / plugins / settings:
+```bash
+  [--mcp-config <configs...>]          # MCP server configuration
+  [--strict-mcp-config]                # Only use --mcp-config
+  [--plugin-dir <path>] ...            # Load plugins from directories
+  [--settings <file-or-json>]          # Load additional settings
+  [--setting-sources user,project,...] # Which setting layers to load
+  [--agent <agent>]                    # Select configured agent
+  [--agents <json>]                    # Inline agent definitions
+```
+
+Modes / observability:
+```bash
   [--worktree [name]]                  # Git worktree isolation
   [--bare]                             # Minimal mode
-  [--betas <betas...>]                 # Beta features
-  [--include-partial-messages]         # Finer streaming
-  [--include-hook-events]              # Hook lifecycle events
-  [--name <name>]                      # Session display name
-  [--agent <agent>]                    # CC agent config
+  [--include-partial-messages]         # Finer streaming deltas
+  [--include-hook-events]              # Hook lifecycle events in stream
+  [--replay-user-messages]             # Echo user msgs back on stdout
+  [--debug [filter]]                   # Debug mode
+  [--debug-file <path>]                # Debug log file
+  [--betas <betas...>]                 # Beta API opt-ins
 ```
+
+### Explicitly not exposed
+
+Interactive-only flags have no role in a headless subprocess:
+
+- `--ide`, `--tmux`, `--chrome` / `--no-chrome`
+- `--allow-dangerously-skip-permissions` (we pass `--dangerously-skip-permissions` directly when needed)
+- `--remote-control-session-name-prefix` (niche remote-control feature)
+- `--mcp-debug` (deprecated; use `--debug`)
+
+### Mid-session control_request subtypes
+
+The harness exposes additional JSON-RPC methods that forward to CC's stream-json `control_request` channel on stdin:
+
+| Method | control_request subtype | Params | Purpose |
+|---|---|---|---|
+| `set_model` | `set_model` | `{model}` | Change model mid-session |
+| `set_permission_mode` | `set_permission_mode` | `{mode}` | Change permission mode mid-session |
+| `control` | caller-supplied | `{subtype, payload}` | Generic pass-through for new CC subtypes |
+| `config:<json>` | derived from `subtype` field | JSON in method tail | Used by bridge-server's `handleConfigSession` route |
+
+`interrupt` is routed via SIGINT from the bridge-server (see `Harness.Interrupt`); the others require a live CC process.
 
 ## Error Handling
 

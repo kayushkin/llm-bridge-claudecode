@@ -6,7 +6,7 @@ Claude Code harness subprocess for [llm-bridge](../llm-bridge). Wraps the Claude
 
 llm-bridge spawns `llm-bridge-claudecode` as a child process. Communication is bidirectional over stdio:
 
-- **stdin** - llm-bridge sends JSON-RPC requests (start, message, compact, resume)
+- **stdin** - llm-bridge sends JSON-RPC requests (start, message, compact, resume, set_model, set_permission_mode, control, config:&lt;json&gt;)
 - **stdout** - this binary emits NDJSON `msg.Event` objects (stream, tool_call, tool_result, result, etc.)
 - **signals** - llm-bridge sends SIGINT for pause/interrupt
 
@@ -44,13 +44,14 @@ This eliminates per-turn process startup overhead and keeps the Node.js runtime 
 ### Core Loop
 
 1. Receive `start` JSON-RPC request from llm-bridge on stdin
-2. Spawn Claude Code with `--input-format stream-json --output-format stream-json --verbose`
+2. Spawn Claude Code with `--input-format stream-json --output-format stream-json --verbose` plus any start-time flags from `StartParams` (see `handler.go`)
 3. Write the initial user message to Claude Code's stdin
 4. Read stream-json events from Claude Code's stdout in a goroutine
 5. Translate each event to canonical `msg.Event` and write to our stdout
 6. On `result` event, aggregate usage and emit canonical result
-7. Wait for next JSON-RPC request from llm-bridge (message, compact, etc.)
+7. Wait for next JSON-RPC request from llm-bridge (message, compact, set_model, set_permission_mode, control, config:&lt;json&gt;, etc.)
 8. For `message` requests, write a new user message to Claude Code's stdin (no new process)
+9. For mid-session control requests (`set_model`, `set_permission_mode`, `control`, `config:<json>`), write a `control_request` JSON to Claude Code's stdin without respawning
 
 ### Key Responsibilities
 
@@ -190,6 +191,45 @@ Content can be a string or an array of content blocks (text, images, etc).
 ```
 
 Claude Code responds with a `control_response` on stdout and aborts the current turn. The session remains alive for further messages.
+
+### Set Model (control_request)
+
+```json
+{
+  "type": "control_request",
+  "request_id": "ctl-...",
+  "request": {
+    "subtype": "set_model",
+    "model": "sonnet"
+  }
+}
+```
+
+Triggered by the `set_model` JSON-RPC method or the `config:<json>` pass-through.
+
+### Set Permission Mode (control_request)
+
+```json
+{
+  "type": "control_request",
+  "request_id": "ctl-...",
+  "request": {
+    "subtype": "set_permission_mode",
+    "mode": "acceptEdits"
+  }
+}
+```
+
+Triggered by the `set_permission_mode` JSON-RPC method or the `config:<json>` pass-through.
+
+### Generic Control (control_request)
+
+The `control` JSON-RPC method accepts any subtype plus an optional payload, allowing the bridge to forward new CC control_request subtypes without requiring a code change here:
+
+```jsonc
+// JSON-RPC request from llm-bridge
+{"method":"control","params":{"subtype":"some_new_subtype","payload":{"k":"v"}}}
+```
 
 ## Claude Code stdout Protocol (stream-json output)
 
@@ -412,7 +452,7 @@ Claude Code reports usage per-API-call within `assistant` events and aggregate t
 | `--session-id <uuid>` | start | Use specific session ID |
 | `--model <model>` | config | Model override |
 | `--max-budget-usd <n>` | config | Cost cap |
-| `--effort <level>` | config | Reasoning effort (low/medium/high/max) |
+| `--effort <level>` | config | Reasoning effort (low/medium/high/xhigh/max) |
 | `--disallowed-tools <t...>` | config | Tool restrictions |
 | `--allowed-tools <t...>` | config | Tool allowlist |
 | `--no-session-persistence` | ephemeral | Don't save session to CC's storage |

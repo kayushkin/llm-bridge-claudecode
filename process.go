@@ -44,14 +44,12 @@ type ccContentBlock struct {
 }
 
 // ccControlRequest is the JSON format for control commands sent to CC stdin.
+// The request body carries a subtype plus arbitrary additional fields (e.g.
+// "model" for set_model, "mode" for set_permission_mode).
 type ccControlRequest struct {
-	Type      string           `json:"type"`
-	RequestID string           `json:"request_id"`
-	Request   ccControlPayload `json:"request"`
-}
-
-type ccControlPayload struct {
-	Subtype string `json:"subtype"`
+	Type      string         `json:"type"`
+	RequestID string         `json:"request_id"`
+	Request   map[string]any `json:"request"`
 }
 
 // spawnClaudeCode starts a new Claude Code process with stream-json I/O.
@@ -135,10 +133,25 @@ func (p *CCProcess) WriteMessage(content string) error {
 
 // WriteInterrupt sends an interrupt control_request to Claude Code's stdin.
 func (p *CCProcess) WriteInterrupt(requestID string) error {
+	return p.WriteControl(requestID, "interrupt", nil)
+}
+
+// WriteControl sends a generic control_request to Claude Code's stdin. The
+// subtype identifies the command (e.g. "interrupt", "set_model",
+// "set_permission_mode"); additional payload fields are merged into the
+// request body alongside the subtype.
+func (p *CCProcess) WriteControl(requestID, subtype string, payload map[string]any) error {
+	body := map[string]any{"subtype": subtype}
+	for k, v := range payload {
+		if k == "subtype" {
+			continue
+		}
+		body[k] = v
+	}
 	req := ccControlRequest{
 		Type:      "control_request",
 		RequestID: requestID,
-		Request:   ccControlPayload{Subtype: "interrupt"},
+		Request:   body,
 	}
 	return p.writeJSON(req)
 }
