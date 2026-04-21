@@ -103,9 +103,15 @@ type Harness struct {
 	workDir      string   // persisted across respawns (for resumed sessions)
 	autoApprove  *bool    // persisted across respawns
 	allowedTools []string // persisted across respawns
-	agg          UsageAggregator
-	ctx          context.Context
-	cancel       context.CancelFunc
+
+	// Start-time prompt flags persisted across respawns so they can be
+	// surfaced in SessionInfo after every init (CC never echoes them back).
+	systemPrompt       string
+	appendSystemPrompt string
+
+	agg    UsageAggregator
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // NewHarness creates a new harness instance.
@@ -192,6 +198,12 @@ func (h *Harness) handleStart(params StartParams) error {
 	}
 	if params.WorkDir != "" {
 		h.workDir = params.WorkDir
+	}
+	if params.SystemPrompt != "" {
+		h.systemPrompt = params.SystemPrompt
+	}
+	if params.AppendSystemPrompt != "" {
+		h.appendSystemPrompt = params.AppendSystemPrompt
 	}
 
 	var extraArgs []string
@@ -517,13 +529,28 @@ func (h *Harness) drainUntilResult() {
 		for _, ev := range translated {
 			emitEvent(ev)
 
-			// Update session ID if CC assigned a new one (fork case).
+			// Update session ID if CC assigned a new one (fork case), and emit
+			// a SessionInfo event carrying the start-time flags + CC init payload.
 			if ev.Type == msg.EventSystem && ev.System != nil && ev.System.Subtype == "init" {
 				var init struct {
 					SessionID string `json:"session_id"`
 				}
 				if json.Unmarshal(raw, &init) == nil && init.SessionID != "" {
 					h.sessionID = init.SessionID
+				}
+				if info := parseInitInfo(raw); info != nil {
+					info.SystemPrompt = h.systemPrompt
+					info.AppendSystemPrompt = h.appendSystemPrompt
+					if info.WorkingDir == "" {
+						info.WorkingDir = h.workDir
+					}
+					emitEvent(msg.Event{
+						Type:      msg.EventSessionInfo,
+						Harness:   harness,
+						SessionID: h.sessionID,
+						Timestamp: time.Now(),
+						Info:      info,
+					})
 				}
 			}
 

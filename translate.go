@@ -84,6 +84,45 @@ func translateEvent(raw json.RawMessage, sessionID string, agg *UsageAggregator)
 	}
 }
 
+// parseInitInfo extracts the session-metadata fields from a Claude Code
+// `{"type":"system","subtype":"init",...}` event. The CC CLI is the canonical
+// source for tools / slash_commands / agents / skills / MCP servers / model;
+// fields that CC doesn't emit (system prompt, append system prompt) must be
+// filled in by the caller from the StartParams the harness was given.
+func parseInitInfo(raw json.RawMessage) *msg.SessionInfo {
+	var init struct {
+		Model          string `json:"model"`
+		CWD            string `json:"cwd"`
+		PermissionMode string `json:"permissionMode"`
+		Tools          []string `json:"tools"`
+		SlashCommands  []string `json:"slash_commands"`
+		Agents         []string `json:"agents"`
+		Skills         []string `json:"skills"`
+		MCPServers     []struct {
+			Name   string `json:"name"`
+			Status string `json:"status"`
+		} `json:"mcp_servers"`
+	}
+	if err := json.Unmarshal(raw, &init); err != nil {
+		return nil
+	}
+	info := &msg.SessionInfo{
+		WorkingDir:     init.CWD,
+		Model:          init.Model,
+		PermissionMode: init.PermissionMode,
+		SlashCommands:  init.SlashCommands,
+		Agents:         init.Agents,
+		Skills:         init.Skills,
+	}
+	for _, t := range init.Tools {
+		info.Tools = append(info.Tools, msg.ToolInfo{Name: t})
+	}
+	for _, m := range init.MCPServers {
+		info.MCPServers = append(info.MCPServers, msg.MCPServerInfo{Name: m.Name, Status: m.Status})
+	}
+	return info
+}
+
 func translateSystem(ev ccStreamEvent, sid string, raw json.RawMessage) []msg.Event {
 	var events []msg.Event
 
