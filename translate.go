@@ -160,6 +160,28 @@ func translateSystem(ev ccStreamEvent, sid string, raw json.RawMessage) []msg.Ev
 			}
 		}))
 
+	case "task_progress":
+		// Claude Code narrates in-flight tool calls with a task_progress
+		// event that carries the tool_use_id of the tool it's reporting on.
+		// Surface the correlator fields so the bridge server can resolve
+		// this event back to its containing message bubble.
+		var tp struct {
+			TaskID       string `json:"task_id"`
+			ToolUseID    string `json:"tool_use_id"`
+			Description  string `json:"description"`
+			LastToolName string `json:"last_tool_name"`
+		}
+		_ = json.Unmarshal(raw, &tp)
+		events = append(events, makeEvent(sid, msg.EventSystem, raw, func(e *msg.Event) {
+			e.System = &msg.SystemEvent{
+				Subtype:      "task_progress",
+				ToolUseID:    tp.ToolUseID,
+				TaskID:       tp.TaskID,
+				Description:  tp.Description,
+				LastToolName: tp.LastToolName,
+			}
+		}))
+
 	default:
 		// Forward all other system subtypes (compact_boundary, hook_*, task_*, status, etc.)
 		events = append(events, makeEvent(sid, msg.EventSystem, raw, func(e *msg.Event) {
@@ -212,19 +234,21 @@ func translateAssistant(ev ccStreamEvent, sid string, raw json.RawMessage, agg *
 			agg.AddToolCall()
 			events = append(events, makeEvent(sid, msg.EventToolCall, raw, func(e *msg.Event) {
 				e.ToolCall = &msg.ToolCallEvent{
-					ToolID: block.ID,
-					Name:   block.Name,
-					Input:  block.Input,
+					ToolID:    block.ID,
+					Name:      block.Name,
+					Input:     block.Input,
+					MessageID: am.ID,
 				}
 			}))
 
 		case "tool_result":
 			events = append(events, makeEvent(sid, msg.EventToolResult, raw, func(e *msg.Event) {
 				e.ToolResult = &msg.ToolResultEvent{
-					ToolID:  block.ID,
-					Name:    block.Name,
-					Output:  block.Content,
-					IsError: block.IsError,
+					ToolID:    block.ID,
+					Name:      block.Name,
+					Output:    block.Content,
+					IsError:   block.IsError,
+					MessageID: am.ID,
 				}
 			}))
 		}
