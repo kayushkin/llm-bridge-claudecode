@@ -72,11 +72,16 @@ func (a *UsageAggregator) Finalize(raw json.RawMessage) (msg.TokenUsage, *msg.Co
 		TotalTokens:      result.Usage.InputTokens + result.Usage.OutputTokens,
 	}
 
-	// Extract context window and total cost from modelUsage.
+	// ContextLimit: model's context window from modelUsage (last entry wins if multi-model).
 	for _, mu := range result.ModelUsage {
 		usage.ContextLimit = mu.ContextWindow
-		// Use the last model entry's context for ContextTokens estimate.
-		usage.ContextTokens = mu.InputTokens + mu.CacheReadInputTokens + mu.CacheCreationInputTokens
+	}
+
+	// ContextTokens: snapshot of the final API call's input (input + cache read + cache write).
+	// modelUsage sums across every API call in the run, so it cannot represent a context-window snapshot.
+	if n := len(a.calls); n > 0 {
+		last := a.calls[n-1]
+		usage.ContextTokens = last.InputTokens + last.CacheReadTokens + last.CacheWriteTokens
 	}
 
 	var cost *msg.Cost
