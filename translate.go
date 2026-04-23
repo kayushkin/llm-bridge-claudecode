@@ -182,14 +182,88 @@ func translateSystem(ev ccStreamEvent, sid string, raw json.RawMessage) []msg.Ev
 			}
 		}))
 
+	case "hook_started", "hook_progress", "hook_response":
+		events = append(events, translateHook(ev, sid, raw)...)
+
 	default:
-		// Forward all other system subtypes (compact_boundary, hook_*, task_*, status, etc.)
+		// Forward all other system subtypes (compact_boundary, task_*, status, etc.)
 		events = append(events, makeEvent(sid, msg.EventSystem, raw, func(e *msg.Event) {
 			e.System = &msg.SystemEvent{Subtype: ev.Subtype}
 		}))
 	}
 
 	return events
+}
+
+// ccHookEvent is the Claude Code stream-json payload for hook lifecycle events
+// emitted when the process is run with --include-hook-events. CC emits three
+// subtypes: hook_started (fires when a hook begins), hook_progress (optional
+// intermediate update), and hook_response (fires when the hook returns).
+type ccHookEvent struct {
+	HookID    string `json:"hook_id"`
+	HookName  string `json:"hook_name"`  // "<Event>:<index-or-name>"
+	HookEvent string `json:"hook_event"` // "PreToolUse", "SessionStart", etc.
+	ToolName  string `json:"tool_name,omitempty"`
+
+	// Populated on hook_response only.
+	Output   string `json:"output,omitempty"`
+	Stdout   string `json:"stdout,omitempty"`
+	Stderr   string `json:"stderr,omitempty"`
+	ExitCode int    `json:"exit_code,omitempty"`
+	Outcome  string `json:"outcome,omitempty"` // "success", "timeout", "error", ...
+}
+
+// translateHook converts a CC hook lifecycle event into a canonical HookEvent.
+// HookID on the emitted msg.HookEvent is left empty — it is the bridge's
+// hook-store registry id, which only applies when the hook was registered via
+// the bridge server. For observation (CC-native hooks defined in settings.json
+// outside the bridge), there is no registry id to report.
+func translateHook(ev ccStreamEvent, sid string, raw json.RawMessage) []msg.Event {
+	var h ccHookEvent
+	_ = json.Unmarshal(raw, &h)
+
+	hook := &msg.HookEvent{
+		Event:    h.HookEvent,
+		ToolName: h.ToolName,
+	}
+
+	switch ev.Subtype {
+	case "hook_started":
+		hook.Phase = "started"
+	case "hook_progress":
+		hook.Phase = "progress"
+	case "hook_response":
+		hook.Phase = "completed"
+		hook.ExitCode = h.ExitCode
+
+		// Prefer stdout for the hook's JSON response (CC's hook protocol reads
+		// the hook's structured decision from stdout). Fall back to `output`.
+		responseText := h.Stdout
+		if responseText == "" {
+			responseText = h.Output
+		}
+		if responseText != "" && json.Valid([]byte(responseText)) {
+			hook.Output = json.RawMessage(responseText)
+			var dec struct {
+				Decision string `json:"decision"`
+			}
+			_ = json.Unmarshal([]byte(responseText), &dec)
+			hook.Decision = dec.Decision
+		}
+
+		if h.Outcome != "" && h.Outcome != "success" {
+			hook.Error = h.Outcome
+			if h.Stderr != "" {
+				hook.Error = h.Outcome + ": " + h.Stderr
+			}
+		}
+	default:
+		return nil
+	}
+
+	return []msg.Event{makeEvent(sid, msg.EventHook, raw, func(e *msg.Event) {
+		e.Hook = hook
+	})}
 }
 
 func translateAssistant(ev ccStreamEvent, sid string, raw json.RawMessage, agg *UsageAggregator) []msg.Event {
