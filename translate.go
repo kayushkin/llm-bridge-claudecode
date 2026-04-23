@@ -160,6 +160,26 @@ func translateSystem(ev ccStreamEvent, sid string, raw json.RawMessage) []msg.Ev
 			}
 		}))
 
+	case "task_started":
+		// task_started opens a sub-agent task. Claude Code includes a
+		// description ("Deploy to dash"), task_id, tool_use_id, and a
+		// task_type tag — preserve them all so the UI can render the task
+		// opener with context instead of a bare "Task" row.
+		var ts struct {
+			TaskID      string `json:"task_id"`
+			ToolUseID   string `json:"tool_use_id"`
+			Description string `json:"description"`
+		}
+		_ = json.Unmarshal(raw, &ts)
+		events = append(events, makeEvent(sid, msg.EventSystem, raw, func(e *msg.Event) {
+			e.System = &msg.SystemEvent{
+				Subtype:     "task_started",
+				ToolUseID:   ts.ToolUseID,
+				TaskID:      ts.TaskID,
+				Description: ts.Description,
+			}
+		}))
+
 	case "task_progress":
 		// Claude Code narrates in-flight tool calls with a task_progress
 		// event that carries the tool_use_id of the tool it's reporting on.
