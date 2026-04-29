@@ -25,10 +25,14 @@ type StartParams struct {
 	// fallback for older bridge-server binaries that haven't been rebuilt.
 	BridgeSessionID string `json:"bridge_session_id,omitempty"`
 
+	// HarnessSessionID is the harness-internal id (Claude Code session UUID).
+	// New code passes this on Resume/Fork; --resume reads from here.
+	HarnessSessionID string `json:"harness_session_id,omitempty"`
+
 	// SessionID historically meant either the bridge_id (fresh start) or the
 	// harness_id (resume). Kept for backward compatibility — when Resume is
 	// true it carries the Claude Code session UUID to --resume against.
-	SessionID    string   `json:"session_id"`
+	SessionID    string   `json:"session_id,omitempty"`
 	DisplayName  string   `json:"display_name"`
 	AgentID      string   `json:"agent_id"`
 	Prompt       string   `json:"prompt"`
@@ -210,7 +214,13 @@ func (h *Harness) HandleRequest(req Request) error {
 
 // handleStart spawns a Claude Code process and begins streaming events.
 func (h *Harness) handleStart(params StartParams) error {
-	h.sessionID = params.SessionID
+	// Prefer the explicit HarnessSessionID; fall back to legacy SessionID
+	// when older callers (or our own internal respawns) only set that field.
+	if params.HarnessSessionID != "" {
+		h.sessionID = params.HarnessSessionID
+	} else {
+		h.sessionID = params.SessionID
+	}
 
 	// Adopt bridge-server's stable id from the new field if present. For older
 	// bridge-server binaries that don't send BridgeSessionID, fall back: on a
@@ -242,8 +252,12 @@ func (h *Harness) handleStart(params StartParams) error {
 
 	var extraArgs []string
 
+	resumeID := params.HarnessSessionID
+	if resumeID == "" {
+		resumeID = params.SessionID
+	}
 	if params.Resume {
-		extraArgs = append(extraArgs, "--resume", params.SessionID)
+		extraArgs = append(extraArgs, "--resume", resumeID)
 	} else if params.Fork != "" {
 		extraArgs = append(extraArgs, "--resume", params.Fork, "--fork-session")
 	}
@@ -421,10 +435,10 @@ func (h *Harness) handleMessage(params MessageParams) error {
 	if h.proc == nil || !h.proc.Alive() {
 		// Process died or was never started. Respawn with --resume.
 		return h.handleStart(StartParams{
-			SessionID: h.sessionID,
-			Prompt:    params.Content,
-			Resume:    true,
-			WorkDir:   h.workDir,
+			HarnessSessionID: h.sessionID,
+			Prompt:           params.Content,
+			Resume:           true,
+			WorkDir:          h.workDir,
 		})
 	}
 
@@ -456,9 +470,9 @@ func (h *Harness) handleResume() error {
 		return nil
 	}
 	return h.handleStart(StartParams{
-		SessionID: h.sessionID,
-		Resume:    true,
-		WorkDir:   h.workDir,
+		HarnessSessionID: h.sessionID,
+		Resume:           true,
+		WorkDir:          h.workDir,
 	})
 }
 
