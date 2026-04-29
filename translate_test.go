@@ -93,3 +93,62 @@ func TestTranslateHook_NonJSONStdout(t *testing.T) {
 		t.Errorf("Decision = %q, want empty for non-JSON stdout", h.Decision)
 	}
 }
+
+func TestTranslateAssistant_TextBlock(t *testing.T) {
+	raw := json.RawMessage(`{"type":"assistant","session_id":"s1","message":{"id":"msg_abc","role":"assistant","content":[{"type":"text","text":"hello world"}],"usage":{"input_tokens":1,"output_tokens":2}}}`)
+	events := translateEvent(raw, "s1", &UsageAggregator{})
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	e := events[0]
+	if e.Type != msg.EventBlock {
+		t.Fatalf("expected EventBlock, got %s", e.Type)
+	}
+	if e.Block == nil || e.Block.Block == nil {
+		t.Fatal("Block payload missing")
+	}
+	if e.Block.MessageID != "msg_abc" {
+		t.Errorf("MessageID = %q, want msg_abc", e.Block.MessageID)
+	}
+	if e.Block.Block.Type != msg.BlockText {
+		t.Errorf("Block.Type = %q, want text", e.Block.Block.Type)
+	}
+	if e.Block.Block.Text == nil || e.Block.Block.Text.Text != "hello world" {
+		t.Errorf("Text = %+v, want %q", e.Block.Block.Text, "hello world")
+	}
+}
+
+func TestTranslateAssistant_ThinkingBlock(t *testing.T) {
+	raw := json.RawMessage(`{"type":"assistant","session_id":"s1","message":{"id":"msg_def","role":"assistant","content":[{"type":"thinking","thinking":"reasoning text","signature":"sigblob"}],"usage":{"input_tokens":1,"output_tokens":2}}}`)
+	events := translateEvent(raw, "s1", &UsageAggregator{})
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event (no fan-out), got %d", len(events))
+	}
+	e := events[0]
+	if e.Type != msg.EventBlock {
+		t.Fatalf("expected EventBlock, got %s", e.Type)
+	}
+	if e.Block == nil || e.Block.Block == nil || e.Block.Block.Thinking == nil {
+		t.Fatal("Thinking block payload missing")
+	}
+	if e.Block.Block.Type != msg.BlockThinking {
+		t.Errorf("Block.Type = %q, want thinking", e.Block.Block.Type)
+	}
+	if e.Block.Block.Thinking.Text != "reasoning text" {
+		t.Errorf("Thinking.Text = %q, want %q", e.Block.Block.Thinking.Text, "reasoning text")
+	}
+	if e.Block.Block.Thinking.Signature != "sigblob" {
+		t.Errorf("Thinking.Signature = %q, want sigblob", e.Block.Block.Thinking.Signature)
+	}
+}
+
+func TestTranslateAssistant_ToolUseAndResultUnchanged(t *testing.T) {
+	raw := json.RawMessage(`{"type":"assistant","session_id":"s1","message":{"id":"msg_ghi","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"cmd":"ls"}}],"usage":{"input_tokens":1,"output_tokens":2}}}`)
+	events := translateEvent(raw, "s1", &UsageAggregator{})
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	if events[0].Type != msg.EventToolCall {
+		t.Errorf("expected EventToolCall, got %s", events[0].Type)
+	}
+}

@@ -298,29 +298,29 @@ func translateAssistant(ev ccStreamEvent, sid string, raw json.RawMessage, agg *
 	for i, block := range am.Content {
 		switch block.Type {
 		case "text":
-			events = append(events, makeEvent(sid, msg.EventStream, raw, func(e *msg.Event) {
-				e.Stream = &msg.HarnessStream{
-					Delta: &msg.BlockDelta{
-						Index: i,
-						Type:  msg.DeltaText,
-						Text:  block.Text,
-					},
+			events = append(events, makeEvent(sid, msg.EventBlock, raw, func(e *msg.Event) {
+				e.Block = &msg.BlockEvent{
+					Index:     i,
 					MessageID: am.ID,
+					Block: &msg.ContentBlock{
+						Type: msg.BlockText,
+						Text: &msg.TextBlock{Text: block.Text},
+					},
 				}
 			}))
 
 		case "thinking":
-			events = append(events, makeEvent(sid, msg.EventThinking, raw, func(e *msg.Event) {
-				e.Thinking = &msg.ThinkingEvent{Text: block.Thinking}
-			}))
-			events = append(events, makeEvent(sid, msg.EventStream, raw, func(e *msg.Event) {
-				e.Stream = &msg.HarnessStream{
-					Delta: &msg.BlockDelta{
-						Index:    i,
-						Type:     msg.DeltaThinking,
-						Thinking: block.Thinking,
-					},
+			events = append(events, makeEvent(sid, msg.EventBlock, raw, func(e *msg.Event) {
+				e.Block = &msg.BlockEvent{
+					Index:     i,
 					MessageID: am.ID,
+					Block: &msg.ContentBlock{
+						Type: msg.BlockThinking,
+						Thinking: &msg.ThinkingBlock{
+							Text:      block.Thinking,
+							Signature: block.Signature,
+						},
+					},
 				}
 			}))
 
@@ -440,14 +440,16 @@ func translateToolProgress(sid string, raw json.RawMessage) []msg.Event {
 	})}
 }
 
-// makeEvent builds a canonical msg.Event with common fields set.
+// makeEvent builds a canonical msg.Event with common fields set. sessionID is
+// the harness-native id (Claude Code's session UUID); BridgeSessionID is
+// stamped later by Harness.emit, which has access to the stable bridge id.
 func makeEvent(sessionID string, eventType msg.EventType, raw json.RawMessage, fill func(*msg.Event)) msg.Event {
 	e := msg.Event{
-		Type:      eventType,
-		Harness:   harness,
-		SessionID: sessionID,
-		Timestamp: time.Now(),
-		Raw:       raw,
+		Type:             eventType,
+		Harness:          harness,
+		HarnessSessionID: sessionID,
+		Timestamp:        time.Now(),
+		Raw:              raw,
 	}
 	fill(&e)
 	return e

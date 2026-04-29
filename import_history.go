@@ -123,7 +123,7 @@ func translateUserEvent(stored ccStoredEvent, sessionID string, ts time.Time) []
 	return []msg.Event{{
 		Type:      msg.EventType("user_message"),
 		Harness:   harness,
-		SessionID: sessionID,
+		HarnessSessionID: sessionID,
 		Timestamp: ts,
 		Result: &msg.ResultEvent{
 			Text: text,
@@ -180,7 +180,7 @@ func translateAssistantEvent(stored ccStoredEvent, sessionID string, ts time.Tim
 	ev := msg.Event{
 		Type:      msg.EventResult,
 		Harness:   harness,
-		SessionID: sessionID,
+		HarnessSessionID: sessionID,
 		Timestamp: ts,
 		Result: &msg.ResultEvent{
 			Text: text,

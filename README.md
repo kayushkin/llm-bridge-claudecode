@@ -1,6 +1,8 @@
 # llm-bridge-claudecode
 
-Claude Code harness subprocess for [llm-bridge](../llm-bridge). Wraps the Claude Code CLI as a managed subprocess, translating its `--output-format stream-json` output into the canonical `msg.Event` protocol that llm-bridge expects.
+[![status: implemented](https://img.shields.io/badge/status-implemented-green)](#)
+
+Claude Code harness subprocess for [llm-bridge](https://github.com/kayushkin/llm-bridge). Wraps the [Claude Code](https://docs.claude.com/en/docs/claude-code) CLI as a managed subprocess, translating its `--output-format stream-json` output into the canonical `msg.Event` protocol that llm-bridge expects.
 
 ## How It Works
 
@@ -76,14 +78,18 @@ This eliminates per-turn process startup overhead and keeps the Node.js runtime 
 
 ```
 llm-bridge-claudecode/
-├── main.go              # Entry point: stdin reader, dispatch loop
-├── handler.go           # JSON-RPC method handlers (start, message, compact, resume)
+├── main.go              # Entry point: stdin reader, dispatch loop, CLI subcommands
+├── handler.go           # JSON-RPC method handlers (start, message, compact, resume, set_model, set_permission_mode, control, config:<json>)
 ├── process.go           # Claude Code subprocess: spawn, stdin writes, stdout reader
 ├── translate.go         # CC stream-json event -> msg.Event translation
+├── translate_test.go    # Unit tests for translation
 ├── usage.go             # Token usage aggregation and cost calculation
 ├── config.go            # Environment config and per-session overrides
-├── go.mod
-└── go.sum
+├── discover.go          # `-discover` mode: list CC sessions on disk
+├── import_history.go    # `-import-history` mode: replay a CC session as NDJSON
+├── DESIGN.md            # Design notes
+├── LICENSE              # Apache 2.0
+└── go.mod
 ```
 
 ## Configuration
@@ -157,6 +163,31 @@ Context compaction happens automatically within Claude Code when needed. This em
 ```
 
 If the Claude Code process was killed (e.g. after SIGTERM), spawns a new process with `--resume <session_id>`.
+
+### `set_model` / `set_permission_mode` / `control` / `config:<json>` - Mid-session control
+
+These methods all surface as a `control_request` written to Claude Code's stdin without respawning the process (see the *Claude Code stdin Protocol* section below). The JSON-RPC payloads:
+
+```jsonc
+{"method":"set_model","params":{"model":"sonnet"}}
+{"method":"set_permission_mode","params":{"mode":"acceptEdits"}}
+{"method":"control","params":{"subtype":"some_new_subtype","payload":{"k":"v"}}}
+// "config:<json>" — the method name itself carries an inline JSON blob, used as
+// a generic pass-through when the bridge wants to forward an opaque CC config
+// override without a dedicated JSON-RPC method.
+```
+
+`control` is the generic forward — use it to ship new CC `control_request` subtypes without a code change here.
+
+## CLI subcommands (out-of-band)
+
+In addition to the JSON-RPC dispatch loop, the binary supports a few one-shot subcommands invoked via flags:
+
+| Flag | Purpose |
+|------|---------|
+| `-version` | Print the harness version (currently `0.1.0`) and exit. |
+| `-discover [project]` | List Claude Code sessions found on disk (under `~/.claude/projects/<project>`) as JSON. |
+| `-import-history <session_id> [path]` | Replay an existing CC session file as NDJSON `msg.Event` lines on stdout. If `path` is omitted, looks the session up via `-discover`. |
 
 ## Claude Code stdin Protocol (stream-json input)
 
@@ -441,44 +472,71 @@ Claude Code reports usage per-API-call within `assistant` events and aggregate t
 
 ### Flags used at session start
 
-| Flag | Source | Description |
-|------|--------|-------------|
-| `--input-format stream-json` | Always | Bidirectional streaming input |
-| `--output-format stream-json` | Always | NDJSON streaming output |
-| `--verbose` | Always | Include system events in output |
-| `--dangerously-skip-permissions` | Default | No interactive approval prompts |
-| `--resume <id>` | resume/fork | Resume existing session |
-| `--fork-session` | fork | Fork from resumed session |
-| `--session-id <uuid>` | start | Use specific session ID |
-| `--model <model>` | config | Model override |
-| `--max-budget-usd <n>` | config | Cost cap |
-| `--effort <level>` | config | Reasoning effort (low/medium/high/xhigh/max) |
-| `--disallowed-tools <t...>` | config | Tool restrictions |
-| `--allowed-tools <t...>` | config | Tool allowlist |
-| `--no-session-persistence` | ephemeral | Don't save session to CC's storage |
-
-### Flags available but not yet wired
-
-These Claude Code flags are available for future integration. They need corresponding fields added to the llm-bridge harness protocol to be configurable per-session:
+Always-on flags:
 
 | Flag | Description |
 |------|-------------|
-| `--system-prompt <prompt>` | Replace default system prompt |
-| `--append-system-prompt <prompt>` | Append to default system prompt |
-| `--add-dir <dirs...>` | Additional directories for tool access |
-| `--mcp-config <configs...>` | Load MCP servers from JSON |
-| `--json-schema <schema>` | Structured output validation |
-| `--fallback-model <model>` | Auto-fallback on overload |
-| `--permission-mode <mode>` | acceptEdits/auto/bypassPermissions/default/dontAsk/plan |
-| `--tools <tools...>` | Specify exact built-in tool set |
-| `--worktree [name]` | Git worktree isolation |
-| `--bare` | Minimal mode (skip hooks, LSP, plugins, etc.) |
-| `--betas <betas...>` | Beta API feature opt-in |
-| `--include-partial-messages` | Finer-grained streaming deltas |
-| `--include-hook-events` | Hook lifecycle in output stream |
-| `--name <name>` | Display name for session |
-| `--agent <agent>` | Use specific CC agent config |
-| `-c` / `--continue` | Continue most recent conversation |
+| `-p` | Headless / programmatic mode |
+| `--input-format stream-json` | Bidirectional streaming input |
+| `--output-format stream-json` | NDJSON streaming output |
+| `--verbose` | Include system events in output |
+
+Permission mode (mutually exclusive):
+
+| Flag | When |
+|------|------|
+| `--dangerously-skip-permissions` | `auto_approve` is unset or `true` (default) |
+| `--allowed-tools <t...>` | `auto_approve` is `false` and `allowed_tools` is non-empty |
+
+Resume / fork:
+
+| Flag | When |
+|------|------|
+| `--resume <id>` | `resume:true` or `fork:<id>` |
+| `--fork-session` | `fork:<id>` |
+
+Per-session flags wired through `StartParams` (each is added only when the corresponding field is non-zero):
+
+| Flag | StartParams field |
+|------|-------------------|
+| `--session-id <uuid>` | `session_id_override` only — bridge session IDs aren't UUIDs, so by default CC picks its own |
+| `--name <name>` | `display_name` (path-like values are skipped) |
+| `--model <model>` | env `CLAUDE_MODEL` |
+| `--system-prompt <p>` | `system_prompt` |
+| `--append-system-prompt <p>` | `append_system_prompt` |
+| `--add-dir <dir>` (repeatable) | `add_dirs` |
+| `--mcp-config <path>` | `mcp_config` |
+| `--strict-mcp-config` | `strict_mcp_config` |
+| `--json-schema <schema>` | `json_schema` |
+| `--fallback-model <model>` | `fallback_model` |
+| `--permission-mode <mode>` | `permission_mode` (acceptEdits / auto / bypassPermissions / default / dontAsk / plan) |
+| `--worktree [name]` | `worktree` (`"true"` for auto) |
+| `--betas <flag...>` | `betas` |
+| `--effort <level>` | `effort` (low / medium / high / xhigh / max) |
+| `--max-budget-usd <n>` | `max_budget_usd` |
+| `--disallowed-tools <t...>` | `disallowed_tools` |
+| `--tools <t...>` | `tools` (`""` disables all, `"default"` enables all) |
+| `--disable-slash-commands` | `disable_slash_commands` |
+| `--no-session-persistence` | `no_session_persistence` |
+| `--include-partial-messages` | `include_partial_messages` |
+| `--include-hook-events` | `include_hook_events` |
+| `--replay-user-messages` | `replay_user_messages` |
+| `--settings <path-or-json>` | `settings` |
+| `--setting-sources <a,b>` | `setting_sources` |
+| `--plugin-dir <dir>` (repeatable) | `plugin_dirs` |
+| `--bare` | `bare` |
+| `--agent <name>` | `agent` |
+| `--agents <inline-json>` | `agents` |
+| `--brief` | `brief` |
+| `--file <id:path>` (repeatable) | `files` |
+| `--continue` | `continue` |
+| `--from-pr <ref>` | `from_pr` |
+| `--debug [filter]` | `debug` |
+| `--debug-file <path>` | `debug_file` |
+
+### Wiring a new Claude Code flag
+
+If `claude --help` exposes a flag that's not in the table above, wiring it is mechanical: add a field on `StartParams` in `handler.go`, then append it to `extraArgs` in `handleStart`. The canonical list of supported flags is `claude --help`; this README is best-effort.
 
 ## Interrupt Handling
 
@@ -508,7 +566,18 @@ Claude Code responds with:
 go build -o llm-bridge-claudecode .
 ```
 
-The binary should be placed where llm-bridge can find it (typically `~/bin/` or on `$PATH`). llm-bridge discovers harness binaries by looking for `llm-bridge-*` executables.
+The binary should be placed on `$PATH` where the parent llm-bridge process can find it. llm-bridge discovers harness binaries by looking for `llm-bridge-*` executables on `$PATH`.
+
+> **Local-development note.** `go.mod` carries `replace github.com/kayushkin/llm-bridge => ../llm-bridge`, which expects a sibling checkout of [llm-bridge](https://github.com/kayushkin/llm-bridge) on disk. This makes the harness easy to develop alongside the protocol library, but means publishing a tagged release of this repo requires either dropping the `replace` line in favour of a published `llm-bridge` version, or moving the override into a top-level `go.work` file. See *OSS publish blockers* below.
+
+## OSS publish blockers
+
+This repo currently builds and runs against a local sibling checkout of [llm-bridge](https://github.com/kayushkin/llm-bridge). Before tagging a v1 release on GitHub, resolve:
+
+- **`go.mod` `replace` directive.** Drop `replace github.com/kayushkin/llm-bridge => ../llm-bridge` (or move it into a `go.work` overlay that doesn't ship in the tagged module). Without this, `go install github.com/kayushkin/llm-bridge-claudecode@latest` will fail for downstream consumers because the relative path doesn't exist in their tree.
+- **Tagged `llm-bridge` version.** The `require` line currently pins `v0.0.0`; bump it to a real published `llm-bridge` tag at the same time the `replace` line is removed.
+
+Both changes are coordinated across every `llm-bridge-*` harness, so they're tracked together rather than per-repo.
 
 ## Relationship to claude-code-adapter
 

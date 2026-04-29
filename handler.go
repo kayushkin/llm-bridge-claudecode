@@ -20,6 +20,14 @@ type Request struct {
 
 // StartParams are the parameters for the "start" method.
 type StartParams struct {
+	// BridgeSessionID is the routing/storage id from bridge-server. Stable
+	// across resumes and forks. New code reads this; legacy SessionID is the
+	// fallback for older bridge-server binaries that haven't been rebuilt.
+	BridgeSessionID string `json:"bridge_session_id,omitempty"`
+
+	// SessionID historically meant either the bridge_id (fresh start) or the
+	// harness_id (resume). Kept for backward compatibility — when Resume is
+	// true it carries the Claude Code session UUID to --resume against.
 	SessionID    string   `json:"session_id"`
 	DisplayName  string   `json:"display_name"`
 	AgentID      string   `json:"agent_id"`
@@ -96,13 +104,14 @@ type ControlParams struct {
 
 // Harness holds the runtime state for a single harness session.
 type Harness struct {
-	cfg          *Config
-	proc         *CCProcess
-	events       <-chan json.RawMessage // single reader for the process lifetime
-	sessionID    string
-	workDir      string   // persisted across respawns (for resumed sessions)
-	autoApprove  *bool    // persisted across respawns
-	allowedTools []string // persisted across respawns
+	cfg             *Config
+	proc            *CCProcess
+	events          <-chan json.RawMessage // single reader for the process lifetime
+	bridgeSessionID string                 // bridge-server's stable session id; stamped on every emitted event
+	sessionID       string                 // harness session id (Claude Code session UUID after init)
+	workDir         string                 // persisted across respawns (for resumed sessions)
+	autoApprove     *bool                  // persisted across respawns
+	allowedTools    []string               // persisted across respawns
 
 	// Start-time prompt flags persisted across respawns so they can be
 	// surfaced in SessionInfo after every init (CC never echoes them back).
@@ -118,6 +127,20 @@ type Harness struct {
 func NewHarness(cfg *Config) *Harness {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Harness{cfg: cfg, ctx: ctx, cancel: cancel}
+}
+
+// emit stamps the canonical bridge_session_id and harness_session_id onto the
+// event before sending it to bridge-server. Bridge-server's manager re-stamps
+// the legacy BridgeID mirror for downstream NATS subscribers — bridges
+// themselves only emit the new fields.
+func (h *Harness) emit(e msg.Event) {
+	if e.BridgeSessionID == "" {
+		e.BridgeSessionID = h.bridgeSessionID
+	}
+	if e.HarnessSessionID == "" {
+		e.HarnessSessionID = h.sessionID
+	}
+	emitEvent(e)
 }
 
 // HandleRequest dispatches a JSON-RPC request to the appropriate handler.
@@ -188,6 +211,17 @@ func (h *Harness) HandleRequest(req Request) error {
 // handleStart spawns a Claude Code process and begins streaming events.
 func (h *Harness) handleStart(params StartParams) error {
 	h.sessionID = params.SessionID
+
+	// Adopt bridge-server's stable id from the new field if present. For older
+	// bridge-server binaries that don't send BridgeSessionID, fall back: on a
+	// fresh start params.SessionID is the bridge_id; on resume we have no way
+	// to recover bridge_id locally — leave it empty and let bridge-server's
+	// readEvents() backfill it onto outgoing events.
+	if params.BridgeSessionID != "" {
+		h.bridgeSessionID = params.BridgeSessionID
+	} else if !params.Resume && h.bridgeSessionID == "" {
+		h.bridgeSessionID = params.SessionID
+	}
 
 	// Persist permission config for respawns. Only update if explicitly set.
 	if params.AutoApprove != nil {
@@ -342,10 +376,9 @@ func (h *Harness) handleStart(params StartParams) error {
 
 	proc, err := spawnClaudeCode(cfg, params.SessionID, h.autoApprove, h.allowedTools, extraArgs...)
 	if err != nil {
-		emitEvent(msg.Event{
+		h.emit(msg.Event{
 			Type:      msg.EventError,
 			Harness:   harness,
-			SessionID: h.sessionID,
 			Timestamp: time.Now(),
 			Error: &msg.ErrorEvent{
 				Code:    "SPAWN_ERROR",
@@ -358,6 +391,17 @@ func (h *Harness) handleStart(params StartParams) error {
 
 	// Start a single event reader for the lifetime of this process.
 	h.events = proc.ReadEvents(h.ctx)
+
+	// Announce that the session is running. The CC subprocess also emits a
+	// system:init event that translates to SessionRunning, but that only
+	// fires after CC starts processing — so without an explicit emission
+	// here, a no-prompt start would leave clients waiting indefinitely.
+	h.emit(msg.Event{
+		Type:      msg.EventSessionState,
+		Harness:   harness,
+		Timestamp: time.Now(),
+		State:     &msg.StateEvent{State: msg.SessionRunning, Previous: msg.SessionIdle},
+	})
 
 	// Send the initial prompt as a user message.
 	if params.Prompt != "" {
@@ -396,10 +440,9 @@ func (h *Harness) handleMessage(params MessageParams) error {
 
 // handleCompact acknowledges a compact request. CC manages compaction internally.
 func (h *Harness) handleCompact(params CompactParams) error {
-	emitEvent(msg.Event{
+	h.emit(msg.Event{
 		Type:      msg.EventSystem,
 		Harness:   harness,
-		SessionID: h.sessionID,
 		Timestamp: time.Now(),
 		System:    &msg.SystemEvent{Subtype: "compact_ack", Message: "compaction delegated to Claude Code"},
 	})
@@ -527,7 +570,7 @@ func (h *Harness) drainUntilResult() {
 	for raw := range h.events {
 		translated := translateEvent(raw, h.sessionID, &h.agg)
 		for _, ev := range translated {
-			emitEvent(ev)
+			h.emit(ev)
 
 			// Update session ID if CC assigned a new one (fork case), and emit
 			// a SessionInfo event carrying the start-time flags + CC init payload.
@@ -544,10 +587,9 @@ func (h *Harness) drainUntilResult() {
 					if info.WorkingDir == "" {
 						info.WorkingDir = h.workDir
 					}
-					emitEvent(msg.Event{
+					h.emit(msg.Event{
 						Type:      msg.EventSessionInfo,
 						Harness:   harness,
-						SessionID: h.sessionID,
 						Timestamp: time.Now(),
 						Info:      info,
 					})
@@ -563,20 +605,18 @@ func (h *Harness) drainUntilResult() {
 
 	// If we get here, the event channel closed — process died.
 	if h.proc != nil && !h.proc.Alive() {
-		emitEvent(msg.Event{
+		h.emit(msg.Event{
 			Type:      msg.EventError,
 			Harness:   harness,
-			SessionID: h.sessionID,
 			Timestamp: time.Now(),
 			Error: &msg.ErrorEvent{
 				Code:    "PROCESS_DIED",
 				Message: fmt.Sprintf("Claude Code process exited unexpectedly: %v", h.proc.Err()),
 			},
 		})
-		emitEvent(msg.Event{
+		h.emit(msg.Event{
 			Type:      msg.EventSessionState,
 			Harness:   harness,
-			SessionID: h.sessionID,
 			Timestamp: time.Now(),
 			State:     &msg.StateEvent{State: msg.SessionError, Previous: msg.SessionRunning, Reason: "process_died"},
 		})

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
 	"sync"
 	"syscall"
@@ -15,6 +16,26 @@ const version = "0.1.0"
 
 // emitMu guards stdout writes so concurrent goroutines don't interleave JSON lines.
 var emitMu sync.Mutex
+
+// execClaudePTY replaces this process with the upstream `claude` CLI so
+// the inherited pseudoterminal is wired straight to its native TUI. The
+// caller (llm-bridge-server.StartProcessPTY) already set ANTHROPIC_API_KEY
+// (or whichever credential the harness's auth path provides), and the cwd
+// is honored from the parent. We deliberately pass no flags: no
+// --input-format, no --output-format — the user wants the unmodified
+// claude experience.
+func execClaudePTY() {
+	cfg := loadConfig()
+	bin, err := exec.LookPath(cfg.ClaudePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "llm-bridge-claudecode pty: claude binary not found at %q: %v\n", cfg.ClaudePath, err)
+		os.Exit(127)
+	}
+	if err := syscall.Exec(bin, []string{bin}, os.Environ()); err != nil {
+		fmt.Fprintf(os.Stderr, "llm-bridge-claudecode pty: exec %s: %v\n", bin, err)
+		os.Exit(127)
+	}
+}
 
 // emitEvent writes a canonical msg.Event as a single NDJSON line to stdout.
 func emitEvent(ev any) {
@@ -34,6 +55,16 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "-version" {
 		fmt.Println(version)
 		os.Exit(0)
+	}
+
+	// PTY mode hand-off. llm-bridge-server's StartProcessPTY launches us
+	// inside a pseudoterminal with LLMBRIDGE_PTY_MODE=1; the contract is
+	// that we exec into the upstream `claude` CLI so the pty fd connects
+	// directly to its TUI. The harness wrapper has nothing to do in pty
+	// mode — there's no msg.Event translation, no JSON-RPC channel.
+	if os.Getenv("LLMBRIDGE_PTY_MODE") == "1" {
+		execClaudePTY()
+		return
 	}
 
 	if len(os.Args) > 1 && os.Args[1] == "-discover" {
