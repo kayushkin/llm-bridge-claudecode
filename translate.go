@@ -407,19 +407,31 @@ func translateResult(ev ccStreamEvent, sid string, raw json.RawMessage, agg *Usa
 		}))
 	}
 
-	// Surface permission denials as approval events.
+	// Surface permission denials CC reports post-hoc in its result event as
+	// completed permission_prompt hooks. These are denials CC made on its
+	// own (e.g. tools blocked by --allowed-tools or --disallowed-tools) —
+	// the bridge never had a chance to consult its UI. Emitting them as
+	// HookEvent{phase:completed, decision:deny} keeps the canonical surface
+	// uniform with awaiting_resolution → completed flows initiated through
+	// the embedded MCP.
 	for _, d := range ev.PermissionDenials {
 		var denial struct {
 			Tool    string `json:"tool"`
 			Message string `json:"message"`
 		}
 		_ = json.Unmarshal(d, &denial)
-		events = append(events, makeEvent(sid, msg.EventApproval, raw, func(e *msg.Event) {
-			e.Approval = &msg.ApprovalEvent{
-				Action:   "tool_use",
-				Status:   "denied",
+		events = append(events, makeEvent(sid, msg.EventHook, raw, func(e *msg.Event) {
+			e.Hook = &msg.HookEvent{
+				Source:   "permission_prompt",
+				Event:    "PreToolUse",
 				ToolName: denial.Tool,
-				Detail:   denial.Message,
+				Phase:    "completed",
+				Decision: "deny",
+				Resolution: &msg.HookResolution{
+					Behavior:   "deny",
+					Message:    denial.Message,
+					ResolvedBy: "auto",
+				},
 			}
 		}))
 	}

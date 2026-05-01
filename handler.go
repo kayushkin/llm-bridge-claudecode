@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -99,6 +100,17 @@ type SetPermissionModeParams struct {
 	Mode string `json:"mode"`
 }
 
+// ResolveHookParams are the parameters for the "resolve_hook" method.
+// Delivers a decision for a HookEvent that was emitted with
+// Phase="awaiting_resolution"; the matching RequestID is required.
+type ResolveHookParams struct {
+	RequestID    string          `json:"request_id"`
+	Behavior     string          `json:"behavior"` // "allow" | "deny"
+	UpdatedInput json.RawMessage `json:"updated_input,omitempty"`
+	Message      string          `json:"message,omitempty"`
+	ResolvedBy   string          `json:"resolved_by,omitempty"`
+}
+
 // ControlParams is a generic control_request pass-through.
 // Subtype identifies the command; Payload carries any additional fields.
 type ControlParams struct {
@@ -137,6 +149,12 @@ type Harness struct {
 	agg    UsageAggregator
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	// Embedded MCP server for CC's --permission-prompt-tool flow. Lazily
+	// created on the first restricted-mode start; persists across CC
+	// respawns within a harness lifetime.
+	permissionMCP     *PermissionMCP
+	permissionCfgPath string // tmp --mcp-config file path; removed on Shutdown
 }
 
 // NewHarness creates a new harness instance.
@@ -348,6 +366,13 @@ func (h *Harness) HandleRequest(req Request) error {
 		}
 		return h.handleControl(params)
 
+	case "resolve_hook":
+		var params ResolveHookParams
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			return fmt.Errorf("parse resolve_hook params: %w", err)
+		}
+		return h.handleResolveHook(params)
+
 	default:
 		return fmt.Errorf("unknown method: %s", req.Method)
 	}
@@ -519,6 +544,21 @@ func (h *Harness) handleStart(params StartParams) error {
 	}
 	if params.DebugFile != "" {
 		extraArgs = append(extraArgs, "--debug-file", params.DebugFile)
+	}
+
+	// Restricted-permission mode wires our embedded MCP server so CC can
+	// consult --permission-prompt-tool for each tool call. Skip-permissions
+	// mode (autoApprove nil/true) bypasses the prompt entirely so there's no
+	// listener to start.
+	if h.autoApprove != nil && !*h.autoApprove {
+		permCfgPath, err := h.ensurePermissionMCP()
+		if err != nil {
+			return fmt.Errorf("ensure permission MCP: %w", err)
+		}
+		extraArgs = append(extraArgs,
+			"--mcp-config", permCfgPath,
+			"--permission-prompt-tool", PermissionPromptToolSpec(),
+		)
 	}
 
 	// Use params.WorkDir if provided (for resumed sessions), otherwise fall back to config.
@@ -717,6 +757,104 @@ func (h *Harness) handleSetPermissionMode(params SetPermissionModeParams) error 
 	})
 }
 
+// ensurePermissionMCP starts the embedded MCP server (if not already running)
+// and writes a temp --mcp-config file pointing at it. Returns the config
+// path so the caller can pass it to spawnClaudeCode via --mcp-config.
+//
+// The MCP and its config file persist across CC respawns within a harness
+// lifetime — the listener stays bound to the same loopback port so Resume
+// reuses the same URL.
+func (h *Harness) ensurePermissionMCP() (string, error) {
+	if h.permissionMCP != nil {
+		return h.permissionCfgPath, nil
+	}
+
+	pmcp, err := NewPermissionMCP(func(toolName string, input json.RawMessage, requestID string) {
+		h.emit(msg.Event{
+			Type:      msg.EventHook,
+			Harness:   harness,
+			Timestamp: time.Now(),
+			Hook: &msg.HookEvent{
+				Source:    "permission_prompt",
+				Event:     "PreToolUse",
+				ToolName:  toolName,
+				Phase:     "awaiting_resolution",
+				RequestID: requestID,
+				Input:     input,
+			},
+		})
+	})
+	if err != nil {
+		return "", fmt.Errorf("start permission MCP: %w", err)
+	}
+	h.permissionMCP = pmcp
+
+	cfgJSON, err := pmcp.MCPConfigJSON()
+	if err != nil {
+		return "", fmt.Errorf("encode permission MCP config: %w", err)
+	}
+	f, err := os.CreateTemp("", "bridge-perm-mcp-*.json")
+	if err != nil {
+		return "", fmt.Errorf("create permission MCP config tmpfile: %w", err)
+	}
+	if _, err := f.Write(cfgJSON); err != nil {
+		f.Close()
+		os.Remove(f.Name())
+		return "", fmt.Errorf("write permission MCP config: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(f.Name())
+		return "", fmt.Errorf("close permission MCP config: %w", err)
+	}
+	h.permissionCfgPath = f.Name()
+	log.Printf("[harness] permission MCP listening at %s (config %s)", pmcp.URL(), h.permissionCfgPath)
+	return h.permissionCfgPath, nil
+}
+
+// handleResolveHook delivers a decision for an awaiting_resolution hook.
+// Looks up the parked MCP call by RequestID, replies to CC via the MCP
+// transport, and emits the matching phase="completed" HookEvent.
+func (h *Harness) handleResolveHook(p ResolveHookParams) error {
+	if h.permissionMCP == nil {
+		return fmt.Errorf("resolve_hook: no permission MCP wired (auto-approve mode)")
+	}
+	if p.Behavior != "allow" && p.Behavior != "deny" {
+		return fmt.Errorf("resolve_hook: behavior must be \"allow\" or \"deny\", got %q", p.Behavior)
+	}
+	if p.RequestID == "" {
+		return fmt.Errorf("resolve_hook: request_id is required")
+	}
+
+	ok := h.permissionMCP.Resolve(p.RequestID, permissionDecision{
+		Behavior:     p.Behavior,
+		UpdatedInput: p.UpdatedInput,
+		Message:      p.Message,
+	})
+	if !ok {
+		return fmt.Errorf("resolve_hook: no pending request with id %q", p.RequestID)
+	}
+
+	h.emit(msg.Event{
+		Type:      msg.EventHook,
+		Harness:   harness,
+		Timestamp: time.Now(),
+		Hook: &msg.HookEvent{
+			Source:    "permission_prompt",
+			Event:     "PreToolUse",
+			Phase:     "completed",
+			RequestID: p.RequestID,
+			Decision:  p.Behavior,
+			Resolution: &msg.HookResolution{
+				Behavior:     p.Behavior,
+				UpdatedInput: p.UpdatedInput,
+				Message:      p.Message,
+				ResolvedBy:   p.ResolvedBy,
+			},
+		},
+	})
+	return nil
+}
+
 // handleControl sends a generic control_request to Claude Code's stdin. The
 // subtype identifies the command; the payload is merged into the request body.
 func (h *Harness) handleControl(params ControlParams) error {
@@ -793,6 +931,18 @@ func (h *Harness) Shutdown() {
 		case <-time.After(3 * time.Second):
 			h.proc.Kill()
 		}
+	}
+	if h.permissionMCP != nil {
+		shutCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if err := h.permissionMCP.Shutdown(shutCtx); err != nil {
+			log.Printf("[harness] permission MCP shutdown: %v", err)
+		}
+		cancel()
+		h.permissionMCP = nil
+	}
+	if h.permissionCfgPath != "" {
+		_ = os.Remove(h.permissionCfgPath)
+		h.permissionCfgPath = ""
 	}
 	if h.state != nil {
 		_ = h.state.Close()
