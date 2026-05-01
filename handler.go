@@ -175,6 +175,87 @@ func (h *Harness) nextSequence() int {
 	return rs[len(rs)-1].Sequence + 1
 }
 
+// recordChainOnInit applies persistent chain state once CC's system:init
+// event has delivered the new session UUID. Behavior depends on the staged
+// pendingIntent:
+//
+//   - "start" / "fork": commit the pending WAL row, insert a rollout row,
+//     upsert the session's current_harness_id.
+//   - "resume": CC's --resume normally keeps the same UUID — touch
+//     sessions.updated_at so the resume timestamp is fresh. If newHarnessID
+//     differs from pendingParent (defensive: CC unexpectedly rotated the
+//     UUID), insert a kind='resume' rollout row + UpsertSession with the
+//     new id.
+//
+// Any pending state is cleared before returning. The caller supplies
+// rolloutPath so tests can pass an empty string without touching the
+// filesystem.
+func (h *Harness) recordChainOnInit(newHarnessID, rolloutPath string) {
+	if h.state == nil || h.bridgeSessionID == "" {
+		return
+	}
+	intent := h.pendingIntent
+	parent := h.pendingParent
+	walID := h.pendingWALID
+	h.pendingWALID = 0
+	h.pendingIntent = ""
+	h.pendingParent = ""
+
+	switch intent {
+	case "start", "fork":
+		if walID == 0 {
+			return
+		}
+		seq := h.nextSequence()
+		if cErr := h.state.CommitWAL(walID, newHarnessID, rolloutPath); cErr != nil {
+			log.Printf("[harness] commit WAL: %v", cErr)
+			return
+		}
+		if iErr := h.state.InsertRollout(RolloutRow{
+			HarnessSessionID: newHarnessID,
+			BridgeSessionID:  h.bridgeSessionID,
+			RolloutPath:      rolloutPath,
+			Sequence:         seq,
+			ParentHarnessID:  parent,
+			Kind:             intent,
+		}); iErr != nil {
+			log.Printf("[harness] insert rollout: %v", iErr)
+		}
+		if uErr := h.state.UpsertSession(h.bridgeSessionID, newHarnessID); uErr != nil {
+			log.Printf("[harness] upsert session: %v", uErr)
+		}
+
+	case "resume":
+		// Same UUID is the expected case under current CC semantics. Bump
+		// sessions.updated_at without inserting a rollout row.
+		if newHarnessID == "" || parent == "" || newHarnessID == parent {
+			id := newHarnessID
+			if id == "" {
+				id = parent
+			}
+			if uErr := h.state.UpsertSession(h.bridgeSessionID, id); uErr != nil {
+				log.Printf("[harness] touch session on resume: %v", uErr)
+			}
+			return
+		}
+		// CC rotated the UUID on resume — treat as fork-in-disguise.
+		seq := h.nextSequence()
+		if iErr := h.state.InsertRollout(RolloutRow{
+			HarnessSessionID: newHarnessID,
+			BridgeSessionID:  h.bridgeSessionID,
+			RolloutPath:      rolloutPath,
+			Sequence:         seq,
+			ParentHarnessID:  parent,
+			Kind:             "resume",
+		}); iErr != nil {
+			log.Printf("[harness] insert rollout on resume rotation: %v", iErr)
+		}
+		if uErr := h.state.UpsertSession(h.bridgeSessionID, newHarnessID); uErr != nil {
+			log.Printf("[harness] upsert session on resume rotation: %v", uErr)
+		}
+	}
+}
+
 // recoverOrphansOnBoot marks any pending WAL rows from a prior crash as
 // orphaned so they don't shadow future operations. Idempotent: a second
 // call after recovery is a no-op.
@@ -450,8 +531,8 @@ func (h *Harness) handleStart(params StartParams) error {
 
 	// Cold-start chain rotation: open a WAL row before spawning CC. The init
 	// event delivered later in drainUntilResult commits this WAL with the new
-	// session UUID and writes the kind='start' rollout. Resume + fork are
-	// wired in children 3 + 4 of the session-chain port.
+	// session UUID and writes the kind='start' rollout. Fork is wired in
+	// child 4.
 	isColdStart := !params.Resume && params.Fork == ""
 	if isColdStart && h.state != nil && h.bridgeSessionID != "" {
 		if err := h.state.UpsertSession(h.bridgeSessionID, ""); err != nil {
@@ -469,18 +550,31 @@ func (h *Harness) handleStart(params StartParams) error {
 		h.pendingParent = ""
 	}
 
+	// Resume chain rotation: CC's --resume keeps the same session UUID, so
+	// there is no chain rotation in the normal case — just bump
+	// sessions.updated_at when init arrives. We still stage pendingIntent +
+	// pendingParent so drainUntilResult can detect an unexpected UUID change
+	// (treated as fork-in-disguise: insert a kind='resume' rollout row). No
+	// WAL row is opened; resume is a no-op for the WAL.
+	if params.Resume && h.state != nil && h.bridgeSessionID != "" {
+		h.pendingWALID = 0
+		h.pendingIntent = "resume"
+		h.pendingParent = h.sessionID
+	}
+
 	proc, err := spawnClaudeCode(cfg, params.SessionID, h.autoApprove, h.allowedTools, extraArgs...)
 	if err != nil {
 		// Spawn failed before CC could mint a session UUID — the chain
-		// rotation never happened, so orphan the pending WAL row.
+		// rotation never happened. Orphan any pending WAL row and clear
+		// staged intent so the next call doesn't read stale state.
 		if h.state != nil && h.pendingWALID != 0 {
 			if oErr := h.state.OrphanWAL(h.pendingWALID); oErr != nil {
 				log.Printf("[harness] orphan WAL after spawn failure: %v", oErr)
 			}
-			h.pendingWALID = 0
-			h.pendingIntent = ""
-			h.pendingParent = ""
 		}
+		h.pendingWALID = 0
+		h.pendingIntent = ""
+		h.pendingParent = ""
 		h.emit(msg.Event{
 			Type:      msg.EventError,
 			Harness:   harness,
@@ -560,8 +654,18 @@ func (h *Harness) handleResume() error {
 		// Already running, nothing to do.
 		return nil
 	}
+	// Defensive: if h.sessionID was lost (e.g. bridge restart between
+	// start and resume), recover it from state.db. The persisted
+	// current_harness_id is the latest known UUID for this bridge_session_id.
+	resumeID := h.sessionID
+	if resumeID == "" && h.state != nil && h.bridgeSessionID != "" {
+		if row, err := h.state.GetSession(h.bridgeSessionID); err == nil && row.CurrentHarnessID != "" {
+			resumeID = row.CurrentHarnessID
+			h.sessionID = resumeID
+		}
+	}
 	return h.handleStart(StartParams{
-		HarnessSessionID: h.sessionID,
+		HarnessSessionID: resumeID,
 		Resume:           true,
 		WorkDir:          h.workDir,
 	})
@@ -688,33 +792,11 @@ func (h *Harness) drainUntilResult() {
 				}
 				if json.Unmarshal(raw, &init) == nil && init.SessionID != "" {
 					h.sessionID = init.SessionID
-					// Commit any pending WAL row opened by handleStart. The
-					// chain rotation only becomes durable here, once CC's
-					// init event delivers the new session UUID.
-					if h.state != nil && h.pendingWALID != 0 && h.bridgeSessionID != "" {
-						seq := h.nextSequence()
-						rolloutPath := findRolloutForUUID(init.SessionID)
-						if cErr := h.state.CommitWAL(h.pendingWALID, init.SessionID, rolloutPath); cErr != nil {
-							log.Printf("[harness] commit WAL: %v", cErr)
-						} else {
-							if iErr := h.state.InsertRollout(RolloutRow{
-								HarnessSessionID: init.SessionID,
-								BridgeSessionID:  h.bridgeSessionID,
-								RolloutPath:      rolloutPath,
-								Sequence:         seq,
-								ParentHarnessID:  h.pendingParent,
-								Kind:             h.pendingIntent,
-							}); iErr != nil {
-								log.Printf("[harness] insert rollout: %v", iErr)
-							}
-							if uErr := h.state.UpsertSession(h.bridgeSessionID, init.SessionID); uErr != nil {
-								log.Printf("[harness] upsert session: %v", uErr)
-							}
-						}
-						h.pendingWALID = 0
-						h.pendingIntent = ""
-						h.pendingParent = ""
-					}
+					// Apply staged chain rotation. Cold-start / fork commit
+					// the pending WAL and write a rollout row; resume bumps
+					// sessions.updated_at (and writes a kind='resume'
+					// rollout if CC unexpectedly rotated the UUID).
+					h.recordChainOnInit(init.SessionID, findRolloutForUUID(init.SessionID))
 				}
 				if info := parseInitInfo(raw); info != nil {
 					info.SystemPrompt = h.systemPrompt
@@ -744,14 +826,15 @@ func (h *Harness) drainUntilResult() {
 		// chain rotation — orphan the WAL row eagerly so it doesn't shadow
 		// the next start (boot recovery would also catch it, but this
 		// avoids leaking pending rows for the lifetime of this bridge).
+		// Resume has no WAL row but still needs pending state cleared.
 		if h.state != nil && h.pendingWALID != 0 {
 			if oErr := h.state.OrphanWAL(h.pendingWALID); oErr != nil {
 				log.Printf("[harness] orphan WAL after process died: %v", oErr)
 			}
-			h.pendingWALID = 0
-			h.pendingIntent = ""
-			h.pendingParent = ""
 		}
+		h.pendingWALID = 0
+		h.pendingIntent = ""
+		h.pendingParent = ""
 		h.emit(msg.Event{
 			Type:      msg.EventError,
 			Harness:   harness,
