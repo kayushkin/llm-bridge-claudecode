@@ -53,9 +53,17 @@ type ccControlRequest struct {
 }
 
 // spawnClaudeCode starts a new Claude Code process with stream-json I/O.
-// autoApprove controls permission mode: nil/true uses --dangerously-skip-permissions,
-// false uses --allowed-tools with the given tool list.
-func spawnClaudeCode(cfg *Config, sessionID string, autoApprove *bool, allowedTools []string, extraArgs ...string) (*CCProcess, error) {
+// Permission gating is always routed through the embedded MCP server +
+// CC's --permission-prompt-tool flag (wired by handleStart). The runtime
+// effective mode comes from --permission-mode set at start time and can
+// be flipped mid-session via set_permission_mode (bypassPermissions for
+// auto-approve, default to consult the bridge UI).
+//
+// allowedTools is forwarded as --allowed-tools when non-empty. Unlike the
+// previous behavior, it no longer doubles as a permission-skip mechanism;
+// it just narrows the tool surface. CC still consults the prompt tool for
+// any tool that isn't already on the allowlist.
+func spawnClaudeCode(cfg *Config, sessionID string, allowedTools []string, extraArgs ...string) (*CCProcess, error) {
 	args := []string{
 		"-p",
 		"--input-format", "stream-json",
@@ -63,9 +71,7 @@ func spawnClaudeCode(cfg *Config, sessionID string, autoApprove *bool, allowedTo
 		"--verbose",
 	}
 
-	if autoApprove == nil || *autoApprove {
-		args = append(args, "--dangerously-skip-permissions")
-	} else if len(allowedTools) > 0 {
+	if len(allowedTools) > 0 {
 		args = append(args, "--allowed-tools")
 		args = append(args, allowedTools...)
 	}

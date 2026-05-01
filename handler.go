@@ -546,19 +546,32 @@ func (h *Harness) handleStart(params StartParams) error {
 		extraArgs = append(extraArgs, "--debug-file", params.DebugFile)
 	}
 
-	// Restricted-permission mode wires our embedded MCP server so CC can
-	// consult --permission-prompt-tool for each tool call. Skip-permissions
-	// mode (autoApprove nil/true) bypasses the prompt entirely so there's no
-	// listener to start.
-	if h.autoApprove != nil && !*h.autoApprove {
-		permCfgPath, err := h.ensurePermissionMCP()
-		if err != nil {
-			return fmt.Errorf("ensure permission MCP: %w", err)
+	// Always wire the embedded MCP server so the auto_approve toggle can
+	// flip CC into / out of restricted mode mid-session via
+	// set_permission_mode without a respawn. The MCP only gets called when
+	// CC's runtime permission_mode is "default" (or anything other than
+	// bypassPermissions); listener overhead is one loopback TCP socket per
+	// session.
+	permCfgPath, err := h.ensurePermissionMCP()
+	if err != nil {
+		return fmt.Errorf("ensure permission MCP: %w", err)
+	}
+	extraArgs = append(extraArgs,
+		"--mcp-config", permCfgPath,
+		"--permission-prompt-tool", PermissionPromptToolSpec(),
+	)
+
+	// Map autoApprove → CC --permission-mode. The user can flip this at
+	// any time via set_permission_mode; at start we just pick the default
+	// matching the persisted preference. params.PermissionMode (if set
+	// explicitly upstream) wins — handled below.
+	hasExplicitMode := params.PermissionMode != ""
+	if !hasExplicitMode {
+		mode := "bypassPermissions"
+		if h.autoApprove != nil && !*h.autoApprove {
+			mode = "default"
 		}
-		extraArgs = append(extraArgs,
-			"--mcp-config", permCfgPath,
-			"--permission-prompt-tool", PermissionPromptToolSpec(),
-		)
+		extraArgs = append(extraArgs, "--permission-mode", mode)
 	}
 
 	// Use params.WorkDir if provided (for resumed sessions), otherwise fall back to config.
@@ -626,7 +639,7 @@ func (h *Harness) handleStart(params StartParams) error {
 		h.pendingParent = h.sessionID
 	}
 
-	proc, err := spawnClaudeCode(cfg, params.SessionID, h.autoApprove, h.allowedTools, extraArgs...)
+	proc, err := spawnClaudeCode(cfg, params.SessionID, h.allowedTools, extraArgs...)
 	if err != nil {
 		// Spawn failed before CC could mint a session UUID — the chain
 		// rotation never happened. Orphan any pending WAL row and clear
