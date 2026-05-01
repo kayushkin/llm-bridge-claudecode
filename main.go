@@ -87,13 +87,24 @@ func main() {
 		if len(os.Args) > 3 {
 			path = os.Args[3]
 		} else {
-			// Find session file by ID
-			sessions, _ := discoverSessions("")
-			for _, s := range sessions {
-				if s.ID == sessionID {
-					path = s.Path
-					break
+			// Resolve sessionID against state.db first: it may be a
+			// bridge_session_id (look up its latest rollout) or a harness
+			// UUID that was cold-imported as a synthetic single-rollout
+			// session (bridge_session_id == harness UUID).
+			if st, err := OpenState(DefaultStatePath()); err == nil {
+				if rs, err := st.ListRollouts(sessionID); err == nil && len(rs) > 0 {
+					path = rs[len(rs)-1].RolloutPath
+					if path == "" {
+						path = findRolloutForUUID(rs[len(rs)-1].HarnessSessionID)
+					}
 				}
+				st.Close()
+			}
+			// Fall through to a direct filesystem walk for harness UUIDs
+			// that aren't in state.db at all (legacy CC sessions, or
+			// brand-new files not yet cold-imported).
+			if path == "" {
+				path = findRolloutForUUID(sessionID)
 			}
 		}
 		if path == "" {

@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,93 +13,206 @@ import (
 	"github.com/kayushkin/llm-bridge/msg"
 )
 
-// discoverSessions scans Claude Code's on-disk session storage and returns
-// all sessions found for the given project directory (or all projects if empty).
+// discoverSessions returns one msg.StoredSession per bridge_session_id known
+// to state.db.
+//
+// Per the session-identity contract (ARCHITECTURE.md "Session Identity &
+// Resumption") state.db is the source of truth. The on-disk
+// `~/.claude/projects/<dir>/<uuid>.jsonl` tree is only used in two ways:
+//
+//  1. Cold import — any rollout file whose harness_session_id is NOT yet in
+//     state.db.rollouts (legacy data, or sessions started outside the
+//     bridge) is imported as a synthetic single-rollout session with
+//     bridge_session_id = harness_session_id, sequence=0, kind='start'.
+//     Lazy + idempotent: a second discover call sees the rows already
+//     present and skips them.
+//  2. Metadata extraction — for each emitted session we read the LATEST
+//     rollout's on-disk file to populate prompt / turns / created_at.
+//
+// StoredSession.ID is always the bridge_session_id, never the
+// harness_session_id. Frontend uses this to start sessions; bridge-server
+// looks up the chain in state.db on resume.
+//
+// projectDir filters the result to sessions whose latest rollout is under
+// `~/.claude/projects/<encoded(projectDir)>/`. Empty projectDir returns
+// every session.
 func discoverSessions(projectDir string) ([]msg.StoredSession, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, err
 	}
-
 	projectsDir := filepath.Join(home, ".claude", "projects")
 
-	var dirs []string
-	if projectDir != "" {
-		// Convert path to CC's directory name format: /home/user/repos → -home-user-repos
-		ccDirName := pathToCCProject(projectDir)
-		dirs = append(dirs, filepath.Join(projectsDir, ccDirName))
-	} else {
-		entries, err := os.ReadDir(projectsDir)
-		if err != nil {
-			return nil, err
-		}
-		for _, e := range entries {
-			if e.IsDir() {
-				dirs = append(dirs, filepath.Join(projectsDir, e.Name()))
-			}
-		}
+	st, err := OpenState(DefaultStatePath())
+	if err != nil {
+		return nil, err
+	}
+	defer st.Close()
+
+	if err := coldImportRollouts(st, projectsDir); err != nil {
+		return nil, err
 	}
 
-	var sessions []msg.StoredSession
-	for _, dir := range dirs {
-		project := ccProjectToPath(filepath.Base(dir))
-		found, err := scanProjectDir(dir, project)
-		if err != nil {
-			continue
-		}
-		sessions = append(sessions, found...)
-	}
-
-	return sessions, nil
-}
-
-// scanProjectDir scans a single CC project directory for session .jsonl files.
-func scanProjectDir(dir, project string) ([]msg.StoredSession, error) {
-	entries, err := os.ReadDir(dir)
+	all, err := st.AllSessions()
 	if err != nil {
 		return nil, err
 	}
 
-	var sessions []msg.StoredSession
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
-			continue
-		}
-
-		sessionID := strings.TrimSuffix(e.Name(), ".jsonl")
-		path := filepath.Join(dir, e.Name())
-
-		info, err := e.Info()
-		if err != nil {
-			continue
-		}
-
-		sess := msg.StoredSession{
-			ID:        sessionID,
-			Harness:   msg.HarnessClaudeCode,
-			Project:   project,
-			UpdatedAt: info.ModTime(),
-			Path:      path,
-		}
-
-		// Parse first line for metadata.
-		if prompt, ts, turns := parseSessionHead(path); prompt != "" {
-			sess.Prompt = prompt
-			if !ts.IsZero() {
-				sess.CreatedAt = ts
-			}
-			sess.TurnCount = turns
-		}
-
-		// Fall back to file mod time if no timestamp parsed.
-		if sess.CreatedAt.IsZero() {
-			sess.CreatedAt = info.ModTime()
-		}
-
-		sessions = append(sessions, sess)
+	var projectPrefix string
+	if projectDir != "" {
+		projectPrefix = filepath.Join(projectsDir, pathToCCProject(projectDir)) + string(filepath.Separator)
 	}
 
-	return sessions, nil
+	out := make([]msg.StoredSession, 0, len(all))
+	for _, sess := range all {
+		rollouts, err := st.ListRollouts(sess.BridgeSessionID)
+		if err != nil {
+			return nil, err
+		}
+		ss := buildStoredSession(sess, rollouts)
+		if projectPrefix != "" {
+			if ss.Path == "" || !strings.HasPrefix(ss.Path, projectPrefix) {
+				continue
+			}
+		}
+		out = append(out, ss)
+	}
+	return out, nil
+}
+
+// coldImportRollouts walks projectsDir (CC's per-project session tree) and
+// inserts a synthetic session + rollout row for every .jsonl file whose
+// harness_session_id is not already in state.db.rollouts. Idempotent:
+// re-running on the same tree produces no new rows.
+//
+// A missing or unreadable projectsDir is not an error — it just means there
+// is nothing to cold-import (fresh install, or no claude CLI history yet).
+func coldImportRollouts(st *State, projectsDir string) error {
+	known, err := loadKnownHarnessIDs(st)
+	if err != nil {
+		return err
+	}
+
+	walkErr := filepath.WalkDir(projectsDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			// Permission errors on subdirs shouldn't kill the whole import;
+			// keep walking.
+			if errors.Is(err, fs.ErrNotExist) || errors.Is(err, fs.ErrPermission) {
+				return nil
+			}
+			return err
+		}
+		if d.IsDir() || !strings.HasSuffix(d.Name(), ".jsonl") {
+			return nil
+		}
+
+		id := strings.TrimSuffix(d.Name(), ".jsonl")
+		if id == "" {
+			return nil
+		}
+		if _, ok := known[id]; ok {
+			return nil
+		}
+
+		info, _ := d.Info()
+		_, ts, _ := parseSessionHead(path)
+		created := ts
+		if created.IsZero() && info != nil {
+			created = info.ModTime()
+		}
+
+		// Synthetic chain: bridge_session_id = harness_session_id, single
+		// rollout at sequence 0 with kind 'start' and no parent. When the
+		// user later resumes via the bridge, recordChainOnInit will append
+		// a kind='resume' rollout (under the defensive UUID-rotation guard)
+		// or simply touch updated_at if CC keeps the same UUID.
+		if err := st.UpsertSession(id, id); err != nil {
+			return err
+		}
+		if err := st.InsertRollout(RolloutRow{
+			HarnessSessionID: id,
+			BridgeSessionID:  id,
+			RolloutPath:      path,
+			Sequence:         0,
+			Kind:             "start",
+			CreatedAt:        created,
+		}); err != nil {
+			return err
+		}
+		known[id] = struct{}{}
+		return nil
+	})
+	if walkErr != nil && !errors.Is(walkErr, fs.ErrNotExist) {
+		return walkErr
+	}
+	return nil
+}
+
+// loadKnownHarnessIDs returns the set of harness_session_ids already present
+// in state.db.rollouts across all sessions.
+func loadKnownHarnessIDs(st *State) (map[string]struct{}, error) {
+	known := map[string]struct{}{}
+	all, err := st.AllSessions()
+	if err != nil {
+		return nil, err
+	}
+	for _, sess := range all {
+		rs, err := st.ListRollouts(sess.BridgeSessionID)
+		if err != nil {
+			return nil, err
+		}
+		for _, r := range rs {
+			known[r.HarnessSessionID] = struct{}{}
+		}
+	}
+	return known, nil
+}
+
+// buildStoredSession projects a (session, rollouts) pair into a
+// msg.StoredSession. Metadata (prompt, turns, project, created_at, path)
+// comes from the LATEST rollout's on-disk file when available; if the file
+// is missing or rollouts are empty the StoredSession still ships with
+// whatever the state.db rows themselves carry.
+func buildStoredSession(sess SessionRow, rollouts []RolloutRow) msg.StoredSession {
+	out := msg.StoredSession{
+		ID:        sess.BridgeSessionID,
+		Harness:   msg.HarnessClaudeCode,
+		CreatedAt: sess.CreatedAt,
+		UpdatedAt: sess.UpdatedAt,
+	}
+
+	if len(rollouts) == 0 {
+		return out
+	}
+
+	// rollouts is ordered by sequence ASC (per ListRollouts), so the latest
+	// is the last element.
+	latest := rollouts[len(rollouts)-1]
+
+	// Backfill the rollout path if state.db has it empty (e.g. when init
+	// arrived before CC had created the .jsonl on disk).
+	path := latest.RolloutPath
+	if path == "" {
+		path = findRolloutForUUID(latest.HarnessSessionID)
+	}
+
+	if path != "" {
+		out.Path = path
+		// Project is encoded into the parent directory name.
+		out.Project = ccProjectToPath(filepath.Base(filepath.Dir(path)))
+		if info, err := os.Stat(path); err == nil {
+			out.UpdatedAt = info.ModTime()
+		}
+		if prompt, ts, turns := parseSessionHead(path); prompt != "" {
+			out.Prompt = prompt
+			out.TurnCount = turns
+			if !ts.IsZero() {
+				out.CreatedAt = ts
+			}
+		}
+	}
+
+	return out
 }
 
 // parseSessionHead scans a CC session JSONL file to extract the first user
