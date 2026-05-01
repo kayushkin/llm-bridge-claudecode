@@ -366,8 +366,29 @@ The harness exposes additional JSON-RPC methods that forward to CC's stream-json
 | `set_permission_mode` | `set_permission_mode` | `{mode}` | Change permission mode mid-session |
 | `control` | caller-supplied | `{subtype, payload}` | Generic pass-through for new CC subtypes |
 | `config:<json>` | derived from `subtype` field | JSON in method tail | Used by bridge-server's `handleConfigSession` route |
+| `resolve_hook` | (not a control_request) | `{request_id, behavior, updated_input?, message?, resolved_by?}` | Closes a parked permission-prompt MCP call (see Permission-prompt flow below) |
 
 `interrupt` is routed via SIGINT from the bridge-server (see `Harness.Interrupt`); the others require a live CC process.
+
+### Permission-prompt flow (restricted-mode only)
+
+When the harness is started with `auto_approve: false`, every tool call CC would otherwise auto-deny gets routed to a human-in-the-loop UI through CC's `--permission-prompt-tool` flag.
+
+How it works:
+
+1. The harness binds a fresh loopback HTTP MCP server (`PermissionMCP`) on a free `127.0.0.1` port and writes a temp `--mcp-config` file pointing at it. The server exposes a single tool, `approval_prompt`, under the MCP server name `bridge_perm`.
+2. The harness adds `--mcp-config <tmpfile>` and `--permission-prompt-tool mcp__bridge_perm__approval_prompt` to the CC argv.
+3. When CC needs permission, it POSTs to our MCP. The server mints a `request_id`, parks the in-flight HTTP call on a Go channel, and emits a canonical `HookEvent`:
+   ```
+   { source: "permission_prompt", event: "PreToolUse",
+     phase: "awaiting_resolution", request_id, tool_name, input }
+   ```
+4. Bridge-server tracks the awaiting_resolution event, exposes it via `GET /sessions/:id/hooks/pending`, and forwards `POST /sessions/:id/hooks/:request_id/resolve` to the harness as a `resolve_hook` JSON-RPC request.
+5. `handleResolveHook` looks up the parked HTTP call by `request_id`, replies to CC with `{behavior: "allow"|"deny", updatedInput?, message?}`, and emits `HookEvent{phase:"completed", resolution:{...}}` so subscribers can clear their banners.
+
+`auto_approve: true` (the default) skips all of the above: CC runs with `--dangerously-skip-permissions` and the MCP server is never started — listener overhead is zero unless the bridge opts in.
+
+Indefinite hold is the design: the parked HTTP call has no timeout. If CC drops the request (interrupt, process exit), the parked entry is reaped via the request's `Context().Done()`. On harness shutdown, every pending call is resolved as `deny: "harness shutting down"` so CC doesn't block.
 
 ## Error Handling
 
