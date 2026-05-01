@@ -531,8 +531,7 @@ func (h *Harness) handleStart(params StartParams) error {
 
 	// Cold-start chain rotation: open a WAL row before spawning CC. The init
 	// event delivered later in drainUntilResult commits this WAL with the new
-	// session UUID and writes the kind='start' rollout. Fork is wired in
-	// child 4.
+	// session UUID and writes the kind='start' rollout.
 	isColdStart := !params.Resume && params.Fork == ""
 	if isColdStart && h.state != nil && h.bridgeSessionID != "" {
 		if err := h.state.UpsertSession(h.bridgeSessionID, ""); err != nil {
@@ -548,6 +547,31 @@ func (h *Harness) handleStart(params StartParams) error {
 		h.pendingWALID = walID
 		h.pendingIntent = "start"
 		h.pendingParent = ""
+	}
+
+	// Fork chain rotation: same WAL machinery as cold-start, but intent='fork'
+	// and parent_harness_id stamped with the parent UUID. CC's --fork-session
+	// always mints a new UUID (verified via the init.SessionID overwrite at
+	// drainUntilResult below + CC's per-UUID `~/.claude/projects/<dir>/<uuid>.jsonl`
+	// file layout), so this is a real chain rotation: the post-init commit
+	// writes a kind='fork' rollout pointing at the parent UUID.
+	//
+	// params.Fork must be the parent's harness UUID, not the parent's
+	// bridge_session_id. Bridge-server's ForkSession handler is responsible
+	// for resolving that — see llm-bridge-server sessions.go handleForkSession
+	// where ParentID is now set to parent.HarnessSessionID.
+	if params.Fork != "" && h.state != nil && h.bridgeSessionID != "" {
+		walID, err := h.state.InsertWAL(WALRow{
+			BridgeSessionID: h.bridgeSessionID,
+			Intent:          "fork",
+			ParentHarnessID: params.Fork,
+		})
+		if err != nil {
+			return fmt.Errorf("insert WAL: %w", err)
+		}
+		h.pendingWALID = walID
+		h.pendingIntent = "fork"
+		h.pendingParent = params.Fork
 	}
 
 	// Resume chain rotation: CC's --resume keeps the same session UUID, so

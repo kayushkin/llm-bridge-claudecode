@@ -55,6 +55,25 @@ func stageResume(h *Harness, parentHarnessID string) {
 	h.sessionID = parentHarnessID
 }
 
+// stageFork simulates what handleStart's fork branch does (without actually
+// spawning CC). parentHarnessID is the harness UUID being forked from — the
+// same value handleStart receives in params.Fork.
+func stageFork(t *testing.T, h *Harness, parentHarnessID string) int64 {
+	t.Helper()
+	walID, err := h.state.InsertWAL(WALRow{
+		BridgeSessionID: h.bridgeSessionID,
+		Intent:          "fork",
+		ParentHarnessID: parentHarnessID,
+	})
+	if err != nil {
+		t.Fatalf("seed InsertWAL fork: %v", err)
+	}
+	h.pendingWALID = walID
+	h.pendingIntent = "fork"
+	h.pendingParent = parentHarnessID
+	return walID
+}
+
 // TestRecordChainOnInit_StartHappyPath confirms cold-start commits the WAL,
 // inserts a kind='start' rollout, and rotates current_harness_id.
 func TestRecordChainOnInit_StartHappyPath(t *testing.T) {
@@ -217,6 +236,100 @@ func TestRecordChainOnInit_NoPendingIntentIsNoOp(t *testing.T) {
 
 	if _, err := h.state.GetSession("bsid-1"); err == nil {
 		t.Fatalf("no-pending-intent init must not write a sessions row")
+	}
+}
+
+// TestRecordChainOnInit_ForkAppendsRollout exercises the post-init commit
+// path for fork: starting from a parent UUID, CC mints a new UUID; the chain
+// must record [start, fork] with the fork's parent_harness_id pointing at
+// the start's UUID.
+func TestRecordChainOnInit_ForkAppendsRollout(t *testing.T) {
+	h := newTestHarness(t, "bsid-1")
+
+	// Seed a cold-start so the chain has [start@uuid-a].
+	stageStart(t, h)
+	h.recordChainOnInit("uuid-a", "/tmp/a.jsonl")
+
+	// Fork from uuid-a; CC mints uuid-b.
+	stageFork(t, h, "uuid-a")
+	h.recordChainOnInit("uuid-b", "/tmp/b.jsonl")
+
+	rs, err := h.state.ListRollouts("bsid-1")
+	if err != nil {
+		t.Fatalf("ListRollouts: %v", err)
+	}
+	if len(rs) != 2 {
+		t.Fatalf("want 2 rollouts after fork, got %d (%+v)", len(rs), rs)
+	}
+	if rs[0].Kind != "start" || rs[0].HarnessSessionID != "uuid-a" || rs[0].Sequence != 0 || rs[0].ParentHarnessID != "" {
+		t.Fatalf("start rollout shape: %+v", rs[0])
+	}
+	if rs[1].Kind != "fork" || rs[1].HarnessSessionID != "uuid-b" || rs[1].ParentHarnessID != "uuid-a" || rs[1].Sequence != 1 {
+		t.Fatalf("fork rollout shape: %+v", rs[1])
+	}
+
+	row, err := h.state.GetSession("bsid-1")
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if row.CurrentHarnessID != "uuid-b" {
+		t.Fatalf("current_harness_id should rotate to uuid-b, got %q", row.CurrentHarnessID)
+	}
+
+	if pending, err := h.state.ListPendingWAL(); err != nil {
+		t.Fatalf("ListPendingWAL: %v", err)
+	} else if len(pending) != 0 {
+		t.Fatalf("fork must commit its WAL row: got %d pending", len(pending))
+	}
+
+	if h.pendingWALID != 0 || h.pendingIntent != "" || h.pendingParent != "" {
+		t.Fatalf("pending state must be cleared after fork init")
+	}
+}
+
+// TestForkCrashBeforeInitOrphansWAL covers the recovery path: the bridge
+// dies between staging the fork WAL row and CC's init event delivering the
+// new UUID. The pending row must survive the crash and be marked orphaned
+// on the next bridge boot — no spurious kind='fork' rollout should appear.
+func TestForkCrashBeforeInitOrphansWAL(t *testing.T) {
+	h := newTestHarness(t, "bsid-1")
+
+	// Cold-start landed in a previous bridge process.
+	stageStart(t, h)
+	h.recordChainOnInit("uuid-a", "/tmp/a.jsonl")
+
+	// Stage a fork, then "crash" — drop the harness without ever calling
+	// recordChainOnInit. The pending WAL row stays in state.db.
+	stageFork(t, h, "uuid-a")
+
+	// Simulate the next bridge boot.
+	if err := recoverOrphansOnBoot(h.state); err != nil {
+		t.Fatalf("recoverOrphansOnBoot: %v", err)
+	}
+
+	// No more pending rows.
+	if pending, err := h.state.ListPendingWAL(); err != nil {
+		t.Fatalf("ListPendingWAL: %v", err)
+	} else if len(pending) != 0 {
+		t.Fatalf("orphan recovery must clear pending: got %d", len(pending))
+	}
+
+	// Rollouts unchanged — still just the seed start row.
+	rs, err := h.state.ListRollouts("bsid-1")
+	if err != nil {
+		t.Fatalf("ListRollouts: %v", err)
+	}
+	if len(rs) != 1 || rs[0].Kind != "start" {
+		t.Fatalf("orphaned fork must not produce a rollout: got %+v", rs)
+	}
+
+	// current_harness_id stays on uuid-a; the failed fork did not rotate.
+	row, err := h.state.GetSession("bsid-1")
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if row.CurrentHarnessID != "uuid-a" {
+		t.Fatalf("orphaned fork must not rotate current_harness_id: got %q", row.CurrentHarnessID)
 	}
 }
 
