@@ -113,6 +113,13 @@ func main() {
 	cfg := loadConfig()
 	h := NewHarness(cfg)
 
+	// Open state.db once and orphan any pending WAL rows from a prior crash
+	// before the JSON-RPC read loop begins. Failure here is fatal — without
+	// state.db the chain contract silently regresses to in-memory IDs.
+	if err := h.openStateAndRecover(); err != nil {
+		log.Fatalf("open state.db: %v", err)
+	}
+
 	// Handle signals for graceful shutdown.
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)

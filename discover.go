@@ -145,6 +145,34 @@ func parseSessionHead(path string) (prompt string, ts time.Time, turns int) {
 	return prompt, ts, turns
 }
 
+// findRolloutForUUID does a best-effort scan of ~/.claude/projects/*/<uuid>.jsonl
+// for a file matching the given Claude Code session UUID. Returns "" if not
+// found — caller treats that as "rollout file not yet on disk" and proceeds
+// without the path. The path can be backfilled later by re-globbing.
+func findRolloutForUUID(uuid string) string {
+	if uuid == "" {
+		return ""
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	projectsDir := filepath.Join(home, ".claude", "projects")
+	target := uuid + ".jsonl"
+	var found string
+	_ = filepath.WalkDir(projectsDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if d.Name() == target {
+			found = path
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return found
+}
+
 // pathToCCProject converts a filesystem path to Claude Code's project directory name.
 // /home/user/repos → -home-user-repos
 func pathToCCProject(path string) string {
