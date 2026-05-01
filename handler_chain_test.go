@@ -333,6 +333,50 @@ func TestForkCrashBeforeInitOrphansWAL(t *testing.T) {
 	}
 }
 
+// TestStartCrashBeforeInitOrphansWAL covers cold-start's recovery path: the
+// bridge dies between staging the start WAL row and CC's init event
+// delivering the new UUID. The pending row must survive the crash and be
+// marked orphaned on the next bridge boot — no spurious kind='start'
+// rollout should appear, and current_harness_id must remain empty.
+func TestStartCrashBeforeInitOrphansWAL(t *testing.T) {
+	h := newTestHarness(t, "bsid-1")
+
+	// Stage a cold-start, then "crash" — drop the harness without ever
+	// calling recordChainOnInit. The pending WAL row stays in state.db.
+	stageStart(t, h)
+
+	// Simulate the next bridge boot.
+	if err := recoverOrphansOnBoot(h.state); err != nil {
+		t.Fatalf("recoverOrphansOnBoot: %v", err)
+	}
+
+	// No more pending rows.
+	if pending, err := h.state.ListPendingWAL(); err != nil {
+		t.Fatalf("ListPendingWAL: %v", err)
+	} else if len(pending) != 0 {
+		t.Fatalf("orphan recovery must clear pending: got %d", len(pending))
+	}
+
+	// No rollouts written — the start never landed.
+	rs, err := h.state.ListRollouts("bsid-1")
+	if err != nil {
+		t.Fatalf("ListRollouts: %v", err)
+	}
+	if len(rs) != 0 {
+		t.Fatalf("orphaned start must not produce a rollout: got %+v", rs)
+	}
+
+	// sessions row exists (stageStart upserted it) but current_harness_id
+	// stays empty because no init ever rotated it.
+	row, err := h.state.GetSession("bsid-1")
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if row.CurrentHarnessID != "" {
+		t.Fatalf("orphaned start must not set current_harness_id: got %q", row.CurrentHarnessID)
+	}
+}
+
 // TestRecordChainOnInit_ResumeWithEmptyParentTouchesOnly covers the corner
 // where pendingParent ended up empty (e.g. resume staged before any prior
 // session was recorded). Must still bump updated_at, not add a rollout.
