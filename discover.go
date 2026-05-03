@@ -29,9 +29,11 @@ import (
 //  2. Metadata extraction — for each emitted session we read the LATEST
 //     rollout's on-disk file to populate prompt / turns / created_at.
 //
-// StoredSession.ID is always the bridge_session_id, never the
-// harness_session_id. Frontend uses this to start sessions; bridge-server
-// looks up the chain in state.db on resume.
+// StoredSession.HarnessSessionID is the harness UUID (sessions.current_harness_id)
+// — the field bridge-server dedupes on. StoredSession.BridgeSessionID is the
+// chain head (sessions.bridge_session_id); for cold-imported sessions it
+// equals the harness UUID, for bridge-spawned sessions it's the `br_*` id
+// minted by bridge-server.
 //
 // projectDir filters the result to sessions whose latest rollout is under
 // `~/.claude/projects/<encoded(projectDir)>/`. Empty projectDir returns
@@ -175,10 +177,11 @@ func loadKnownHarnessIDs(st *State) (map[string]struct{}, error) {
 // whatever the state.db rows themselves carry.
 func buildStoredSession(sess SessionRow, rollouts []RolloutRow) msg.StoredSession {
 	out := msg.StoredSession{
-		ID:        sess.BridgeSessionID,
-		Harness:   msg.HarnessClaudeCode,
-		CreatedAt: sess.CreatedAt,
-		UpdatedAt: sess.UpdatedAt,
+		HarnessSessionID: sess.CurrentHarnessID,
+		BridgeSessionID:  sess.BridgeSessionID,
+		Harness:          msg.HarnessClaudeCode,
+		CreatedAt:        sess.CreatedAt,
+		UpdatedAt:        sess.UpdatedAt,
 	}
 
 	if len(rollouts) == 0 {

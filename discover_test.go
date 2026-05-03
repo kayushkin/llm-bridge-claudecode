@@ -52,13 +52,20 @@ func TestDiscover_ColdImportIdempotent(t *testing.T) {
 		t.Fatalf("first call: want 2 sessions, got %d (%+v)", len(got), got)
 	}
 
-	// IDs are bridge_session_ids; cold-import sets them = harness UUID.
+	// Cold-import: HarnessSessionID is the .jsonl UUID; BridgeSessionID is
+	// set equal to the same UUID by the synthetic chain.
 	ids := map[string]bool{}
 	for _, s := range got {
-		ids[s.ID] = true
+		if s.HarnessSessionID == "" {
+			t.Fatalf("cold-imported session missing HarnessSessionID: %+v", s)
+		}
+		if s.BridgeSessionID != s.HarnessSessionID {
+			t.Fatalf("cold-imported session must have BridgeSessionID == HarnessSessionID, got bsid=%q hsid=%q", s.BridgeSessionID, s.HarnessSessionID)
+		}
+		ids[s.HarnessSessionID] = true
 	}
 	if !ids["uuid-a"] || !ids["uuid-b"] {
-		t.Fatalf("want both uuid-a and uuid-b in IDs, got %v", ids)
+		t.Fatalf("want both uuid-a and uuid-b in HarnessSessionIDs, got %v", ids)
 	}
 
 	got2, err := discoverSessions("")
@@ -70,10 +77,11 @@ func TestDiscover_ColdImportIdempotent(t *testing.T) {
 	}
 }
 
-// TestDiscover_BridgeSessionUsesBridgeID confirms that a session opened via
-// the bridge surfaces its bridge_session_id as StoredSession.ID — not the
-// harness UUID.
-func TestDiscover_BridgeSessionUsesBridgeID(t *testing.T) {
+// TestDiscover_BridgeSessionPopulatesBothIDs confirms that a session opened
+// via the bridge surfaces BOTH its harness UUID (HarnessSessionID) and the
+// bridge_session_id (BridgeSessionID) — bridge-server needs both to dedupe
+// correctly.
+func TestDiscover_BridgeSessionPopulatesBothIDs(t *testing.T) {
 	projectsDir, home := withCCHome(t)
 
 	// Pre-seed state.db with a bridge-spawned session: bridge_id "bsid-1"
@@ -107,8 +115,11 @@ func TestDiscover_BridgeSessionUsesBridgeID(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("want 1 session (no cold-import double), got %d (%+v)", len(got), got)
 	}
-	if got[0].ID != "bsid-1" {
-		t.Fatalf("ID must be bridge_session_id, got %q", got[0].ID)
+	if got[0].BridgeSessionID != "bsid-1" {
+		t.Fatalf("BridgeSessionID want bsid-1, got %q", got[0].BridgeSessionID)
+	}
+	if got[0].HarnessSessionID != "uuid-x" {
+		t.Fatalf("HarnessSessionID want uuid-x, got %q", got[0].HarnessSessionID)
 	}
 	if got[0].Path != rolloutPath {
 		t.Fatalf("path mismatch: want %q got %q", rolloutPath, got[0].Path)
@@ -144,8 +155,8 @@ func TestDiscover_ProjectFilter(t *testing.T) {
 	if len(gotB) != 1 {
 		t.Fatalf("project filter B: want 1 session, got %d (%+v)", len(gotB), gotB)
 	}
-	if gotB[0].ID != "uuid-b" {
-		t.Fatalf("filter B wrong id: %s", gotB[0].ID)
+	if gotB[0].HarnessSessionID != "uuid-b" {
+		t.Fatalf("filter B wrong HarnessSessionID: %s", gotB[0].HarnessSessionID)
 	}
 
 	gotEmpty, err := discoverSessions("")
