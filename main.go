@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 )
@@ -153,8 +154,25 @@ func main() {
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 0, 1024*1024), 10*1024*1024)
 
+	// Methods that must NOT block the read loop. Without this, a long-running
+	// turn (handleMessage → drainUntilResult) holds the dispatcher and any
+	// resolve_hook the user clicks goes to the OS pipe buffer unread —
+	// deadlocking CC's parked approval_prompt forever. The harness's own
+	// internal locking (PermissionMCP mutex, atomic.Bool, proc mutex) makes
+	// these methods safe to run concurrently with whatever the read loop
+	// is doing on its own goroutine.
+	asyncMethods := map[string]bool{
+		"resolve_hook":            true,
+		"set_bypass_permissions":  true,
+		"set_model":               true,
+		"control":                 true,
+	}
+
 	for scanner.Scan() {
-		line := scanner.Bytes()
+		// scanner.Bytes() reuses its buffer on the next Scan, so copy the
+		// line before handing it to a goroutine that may outlive this loop
+		// iteration.
+		line := append([]byte(nil), scanner.Bytes()...)
 		if len(line) == 0 {
 			continue
 		}
@@ -166,6 +184,18 @@ func main() {
 		}
 
 		log.Printf("request: method=%s", req.Method)
+		// config:<json> wraps one of the async subtypes (set_model,
+		// set_bypass_permissions, interrupt), so route the whole prefix
+		// to the async path.
+		isAsync := asyncMethods[req.Method] || strings.HasPrefix(req.Method, "config:")
+		if isAsync {
+			go func(r Request) {
+				if err := h.HandleRequest(r); err != nil {
+					log.Printf("handler error: method=%s err=%v", r.Method, err)
+				}
+			}(req)
+			continue
+		}
 		if err := h.HandleRequest(req); err != nil {
 			log.Printf("handler error: method=%s err=%v", req.Method, err)
 		}

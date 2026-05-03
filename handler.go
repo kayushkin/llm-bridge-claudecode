@@ -902,8 +902,22 @@ func (h *Harness) handleResolveHook(p ResolveHookParams) error {
 		UpdatedInput: p.UpdatedInput,
 		Message:      p.Message,
 	})
+
+	// Always emit the matching phase=completed event so bridge-server's
+	// pendingHooks bucket clears even when the requestID is stale (the
+	// MCP was rebuilt on harness restart, the parked HTTP call is gone).
+	// The Decision field still reflects what the user wanted; the message
+	// is annotated when the resolve was a no-op so the UI can explain
+	// why the action didn't unstick anything.
+	resolution := &msg.HookResolution{
+		Behavior:     p.Behavior,
+		UpdatedInput: p.UpdatedInput,
+		Message:      p.Message,
+		ResolvedBy:   p.ResolvedBy,
+	}
 	if !ok {
-		return fmt.Errorf("resolve_hook: no pending request with id %q", p.RequestID)
+		resolution.Message = "stale request — MCP no longer has this parked (harness restart). The decision is recorded but won't unblock CC; the original tool call is dead."
+		log.Printf("resolve_hook: no pending request with id %q (stale)", p.RequestID)
 	}
 
 	h.emit(msg.Event{
@@ -911,17 +925,12 @@ func (h *Harness) handleResolveHook(p ResolveHookParams) error {
 		Harness:   harness,
 		Timestamp: time.Now(),
 		Hook: &msg.HookEvent{
-			Source:    "permission_prompt",
-			Event:     "PreToolUse",
-			Phase:     "completed",
-			RequestID: p.RequestID,
-			Decision:  p.Behavior,
-			Resolution: &msg.HookResolution{
-				Behavior:     p.Behavior,
-				UpdatedInput: p.UpdatedInput,
-				Message:      p.Message,
-				ResolvedBy:   p.ResolvedBy,
-			},
+			Source:     "permission_prompt",
+			Event:      "PreToolUse",
+			Phase:      "completed",
+			RequestID:  p.RequestID,
+			Decision:   p.Behavior,
+			Resolution: resolution,
 		},
 	})
 	return nil
