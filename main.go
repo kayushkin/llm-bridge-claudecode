@@ -108,8 +108,12 @@ func main() {
 			}
 		}
 		if path == "" {
-			fmt.Fprintf(os.Stderr, "import-history: session not found: %s\n", sessionID)
-			os.Exit(1)
+			// Idempotent no-op: a session id that resolves to no rollout on
+			// disk emits no events and exits 0. Mirrors -discover returning
+			// an empty array, and matches the conformance import contract
+			// (exit 0 = handled, exit 2 = unimplemented).
+			fmt.Fprintf(os.Stderr, "import-history: session not found: %s (no-op)\n", sessionID)
+			os.Exit(0)
 		}
 		if err := importHistory(sessionID, path); err != nil {
 			fmt.Fprintf(os.Stderr, "import-history: %v\n", err)
