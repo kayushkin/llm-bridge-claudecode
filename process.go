@@ -10,6 +10,8 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+
+	"github.com/kayushkin/llm-bridge/msg"
 )
 
 // CCProcess manages a single Claude Code subprocess using bidirectional
@@ -38,9 +40,22 @@ type ccMessage struct {
 	Content []ccContentBlock `json:"content"`
 }
 
+// ccContentBlock matches Anthropic's content-block wire shape that Claude
+// Code accepts on stdin. Exactly one of Text or Source is set, depending on
+// Type ("text" → Text; "image"/"document"/"audio"/"video" → Source).
 type ccContentBlock struct {
-	Type string `json:"type"`
-	Text string `json:"text,omitempty"`
+	Type   string         `json:"type"`
+	Text   string         `json:"text,omitempty"`
+	Source *ccMediaSource `json:"source,omitempty"`
+}
+
+// ccMediaSource is the wire shape for image/document/audio/video block sources.
+// Type is "base64" (Data + MediaType populated) or "url" (URL populated).
+type ccMediaSource struct {
+	Type      string `json:"type"`
+	MediaType string `json:"media_type,omitempty"`
+	Data      string `json:"data,omitempty"`
+	URL       string `json:"url,omitempty"`
 }
 
 // ccControlRequest is the JSON format for control commands sent to CC stdin.
@@ -121,20 +136,110 @@ func spawnClaudeCode(cfg *Config, sessionID string, allowedTools []string, extra
 	return p, nil
 }
 
-// WriteMessage sends a user message to Claude Code's stdin.
+// WriteMessage sends a text-only user message to Claude Code's stdin.
+// For multimodal input (images, documents, etc.), use WriteMessageBlocks.
 func (p *CCProcess) WriteMessage(content string) error {
-	msg := ccUserMessage{
+	return p.WriteMessageBlocks([]msg.ContentBlock{
+		{Type: msg.BlockText, Text: &msg.TextBlock{Text: content}},
+	})
+}
+
+// WriteMessageBlocks sends a user message composed of canonical content
+// blocks (text, image, document, audio, video) to Claude Code's stdin. The
+// blocks are translated into Anthropic's content-block wire format that CC
+// expects in stream-json input mode.
+//
+// Only block types valid in user input are accepted; passing tool_use,
+// tool_result, thinking, or other model-output kinds returns an error.
+// MediaFileID sources are not supported here — callers must resolve them
+// to base64 or URL upstream.
+func (p *CCProcess) WriteMessageBlocks(blocks []msg.ContentBlock) error {
+	wire, err := translateUserContentBlocks(blocks)
+	if err != nil {
+		return fmt.Errorf("translate user content: %w", err)
+	}
+	m := ccUserMessage{
 		Type: "user",
 		Message: ccMessage{
-			Role: "user",
-			Content: []ccContentBlock{
-				{Type: "text", Text: content},
-			},
+			Role:    "user",
+			Content: wire,
 		},
 		SessionID:       "",
 		ParentToolUseID: nil,
 	}
-	return p.writeJSON(msg)
+	return p.writeJSON(m)
+}
+
+// translateUserContentBlocks converts canonical user-input content blocks
+// into the wire format Claude Code expects. Returns an error if any block
+// is invalid or carries a type that isn't permitted in user input.
+func translateUserContentBlocks(blocks []msg.ContentBlock) ([]ccContentBlock, error) {
+	out := make([]ccContentBlock, 0, len(blocks))
+	for i, blk := range blocks {
+		if err := blk.Validate(); err != nil {
+			return nil, fmt.Errorf("block %d: %w", i, err)
+		}
+		switch blk.Type {
+		case msg.BlockText:
+			out = append(out, ccContentBlock{Type: "text", Text: blk.Text.Text})
+		case msg.BlockImage:
+			src, err := translateMediaSource(blk.Image.Source)
+			if err != nil {
+				return nil, fmt.Errorf("block %d (image): %w", i, err)
+			}
+			out = append(out, ccContentBlock{Type: "image", Source: src})
+		case msg.BlockDocument:
+			src, err := translateMediaSource(blk.Document.Source)
+			if err != nil {
+				return nil, fmt.Errorf("block %d (document): %w", i, err)
+			}
+			out = append(out, ccContentBlock{Type: "document", Source: src})
+		case msg.BlockAudio:
+			src, err := translateMediaSource(blk.Audio.Source)
+			if err != nil {
+				return nil, fmt.Errorf("block %d (audio): %w", i, err)
+			}
+			out = append(out, ccContentBlock{Type: "audio", Source: src})
+		case msg.BlockVideo:
+			src, err := translateMediaSource(blk.Video.Source)
+			if err != nil {
+				return nil, fmt.Errorf("block %d (video): %w", i, err)
+			}
+			out = append(out, ccContentBlock{Type: "video", Source: src})
+		default:
+			return nil, fmt.Errorf("block %d: type %q not valid in user input", i, blk.Type)
+		}
+	}
+	return out, nil
+}
+
+// translateMediaSource converts a canonical msg.MediaSource into Claude
+// Code's wire shape. file_id sources are rejected — resolve them to base64
+// or URL upstream.
+func translateMediaSource(src msg.MediaSource) (*ccMediaSource, error) {
+	switch src.Kind {
+	case msg.MediaBase64:
+		if src.Data == "" {
+			return nil, fmt.Errorf("base64 source: empty data")
+		}
+		return &ccMediaSource{
+			Type:      "base64",
+			MediaType: src.MediaType,
+			Data:      src.Data,
+		}, nil
+	case msg.MediaURL:
+		if src.Data == "" {
+			return nil, fmt.Errorf("url source: empty url")
+		}
+		return &ccMediaSource{
+			Type: "url",
+			URL:  src.Data,
+		}, nil
+	case msg.MediaFileID:
+		return nil, fmt.Errorf("file_id source not supported by claudecode adapter; resolve to base64 or url upstream")
+	default:
+		return nil, fmt.Errorf("unknown media source kind: %q", src.Kind)
+	}
 }
 
 // WriteInterrupt sends an interrupt control_request to Claude Code's stdin.

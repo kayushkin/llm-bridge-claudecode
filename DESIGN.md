@@ -208,8 +208,9 @@ type CCProcess struct {
 }
 
 func spawnClaudeCode(cfg *Config, sessionID string, args ...string) (*CCProcess, error)
-func (p *CCProcess) WriteMessage(content string) error      // user message
-func (p *CCProcess) WriteInterrupt(requestID string) error  // control_request
+func (p *CCProcess) WriteMessage(content string) error                       // text-only user message
+func (p *CCProcess) WriteMessageBlocks(blocks []msg.ContentBlock) error      // multimodal user message
+func (p *CCProcess) WriteInterrupt(requestID string) error                   // control_request
 func (p *CCProcess) ReadEvents(ctx context.Context) <-chan json.RawMessage
 func (p *CCProcess) Kill() error
 ```
