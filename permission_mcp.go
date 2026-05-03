@@ -11,32 +11,61 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 )
 
 // PermissionMCP is an embedded HTTP MCP server that implements the
 // approval_prompt tool Claude Code calls when --permission-prompt-tool
-// targets us. Each pending tools/call is parked on a per-RequestID channel
-// until the harness's resolve_hook handler delivers a decision; the parked
-// HTTP goroutine then writes the JSON-RPC response and unblocks CC.
+// targets us. It evaluates each tool call through the supplied Evaluator
+// (today: a permission-store HTTP client) and returns one of three outcomes
+// to CC: allow / deny / ask. Ask outcomes park the request on a per-RequestID
+// channel until the harness's resolve_hook handler delivers a decision; the
+// parked HTTP goroutine then writes the JSON-RPC response and unblocks CC.
 //
-// The transport is HTTP MCP (Streamable HTTP, but we never use streaming —
-// every response is a single JSON document). CC posts JSON-RPC requests to
-// our /mcp endpoint and we respond synchronously, parking long-running
-// tools/call requests on Go channels.
+// Bypass mode short-circuits the evaluator entirely — every call returns
+// allow without consulting the store. Used as the global "off switch" so a
+// broken permission-store doesn't lock up every running session.
 type PermissionMCP struct {
 	listener net.Listener
 	server   *http.Server
 	url      string
 
-	// emit is invoked when CC calls approval_prompt. The harness fires an
-	// awaiting_resolution HookEvent and is expected to call Resolve once a
-	// decision arrives.
-	emit func(toolName string, input json.RawMessage, requestID string)
+	// evaluator decides allow / deny / ask for a tool call. Wrapping the
+	// permission-store HTTP client in an interface keeps the MCP testable
+	// without spinning up the full service stack.
+	evaluator Evaluator
+
+	// onAsk fires only when the evaluator returns ask. The harness uses
+	// it to emit the canonical phase="awaiting_resolution" HookEvent.
+	onAsk AskCallback
+
+	bypassMode atomic.Bool
 
 	mu      sync.Mutex
 	pending map[string]chan permissionDecision
 	closed  bool
 }
+
+// Evaluator returns a verdict for a tool call. Implementations MUST NOT
+// block on user input — the ask outcome is what triggers the parked-call
+// flow inside PermissionMCP. On any error the implementation should return
+// EvaluateResult{Outcome: "ask", Message: <reason>} so the call surfaces to
+// a human rather than silently allowing.
+type Evaluator func(toolName string, input json.RawMessage) EvaluateResult
+
+// EvaluateResult is the verdict shape independent of how it was reached.
+type EvaluateResult struct {
+	Outcome       string          // "allow" | "deny" | "ask"
+	Message       string          // optional, surfaced on deny / ask
+	UpdatedInput  json.RawMessage // optional, on allow: rewrite the tool input
+	MatchedRuleID string          // optional, audit/debug
+}
+
+// AskCallback is invoked when the evaluator returns ask, immediately before
+// the MCP parks the call. It carries the tool name + input + the parked
+// request id so the caller (the harness) can emit the matching
+// awaiting_resolution HookEvent.
+type AskCallback func(toolName string, input json.RawMessage, requestID string)
 
 // permissionDecision is the resolver's answer to a parked approval_prompt.
 type permissionDecision struct {
@@ -46,15 +75,22 @@ type permissionDecision struct {
 }
 
 // NewPermissionMCP starts an HTTP MCP server on a free 127.0.0.1 port.
-func NewPermissionMCP(emit func(toolName string, input json.RawMessage, requestID string)) (*PermissionMCP, error) {
+func NewPermissionMCP(evaluator Evaluator, onAsk AskCallback) (*PermissionMCP, error) {
+	if evaluator == nil {
+		return nil, fmt.Errorf("permission MCP requires an evaluator")
+	}
+	if onAsk == nil {
+		return nil, fmt.Errorf("permission MCP requires an onAsk callback")
+	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, fmt.Errorf("listen: %w", err)
 	}
 	m := &PermissionMCP{
-		listener: ln,
-		emit:     emit,
-		pending:  make(map[string]chan permissionDecision),
+		listener:  ln,
+		evaluator: evaluator,
+		onAsk:     onAsk,
+		pending:   make(map[string]chan permissionDecision),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/mcp", m.handle)
@@ -70,6 +106,18 @@ func NewPermissionMCP(emit func(toolName string, input json.RawMessage, requestI
 
 // URL returns the MCP endpoint URL CC should connect to.
 func (m *PermissionMCP) URL() string { return m.url }
+
+// SetBypass flips the global bypass flag. When true, every tool call
+// resolves to allow without consulting the evaluator. Live sessions feel
+// the change on their next tool call (no respawn needed).
+func (m *PermissionMCP) SetBypass(enabled bool) {
+	m.bypassMode.Store(enabled)
+}
+
+// Bypass reports the current bypass-mode setting.
+func (m *PermissionMCP) Bypass() bool {
+	return m.bypassMode.Load()
+}
 
 // ServerName is the MCP server name CC sees in --mcp-config and the
 // --permission-prompt-tool flag (mcp__<server>__<tool>).
@@ -184,7 +232,7 @@ func (m *PermissionMCP) handle(w http.ResponseWriter, r *http.Request) {
 		writeJSONRPCResult(w, req.ID, map[string]any{
 			"tools": []map[string]any{{
 				"name":        PermissionMCPToolName,
-				"description": "Bridge permission prompt — defers to bridge-ui or configured resolver",
+				"description": "Bridge permission prompt — defers to permission-store rules and bridge-ui",
 				"inputSchema": map[string]any{
 					"type": "object",
 					"properties": map[string]any{
@@ -224,6 +272,33 @@ func (m *PermissionMCP) handleToolCall(w http.ResponseWriter, r *http.Request, r
 		return
 	}
 
+	// Bypass short-circuit — happens before evaluator so a broken
+	// permission-store can't lock up every session.
+	if m.bypassMode.Load() {
+		writePermissionResult(w, req.ID, permissionDecision{Behavior: "allow"})
+		return
+	}
+
+	result := m.evaluator(args.ToolName, args.Input)
+
+	switch result.Outcome {
+	case "allow":
+		writePermissionResult(w, req.ID, permissionDecision{
+			Behavior:     "allow",
+			UpdatedInput: result.UpdatedInput,
+		})
+		return
+	case "deny":
+		writePermissionResult(w, req.ID, permissionDecision{
+			Behavior: "deny",
+			Message:  result.Message,
+		})
+		return
+	}
+
+	// "ask" — park the call and notify the harness so it emits the
+	// awaiting_resolution HookEvent. Block until resolve_hook delivers a
+	// decision (or the request context is cancelled).
 	requestID := newRequestID()
 	ch := make(chan permissionDecision, 1)
 
@@ -236,12 +311,8 @@ func (m *PermissionMCP) handleToolCall(w http.ResponseWriter, r *http.Request, r
 	m.pending[requestID] = ch
 	m.mu.Unlock()
 
-	// Notify the harness so it emits the canonical awaiting_resolution event.
-	m.emit(args.ToolName, args.Input, requestID)
+	m.onAsk(args.ToolName, args.Input, requestID)
 
-	// Block until resolved. Hold indefinitely per design — no timeout.
-	// If CC drops the request (interrupt, process exit), drop our parked
-	// entry so a late Resolve doesn't deadlock.
 	select {
 	case d := <-ch:
 		writePermissionResult(w, req.ID, d)
@@ -305,9 +376,6 @@ func writeJSONRPCError(w http.ResponseWriter, id json.RawMessage, code int, mess
 func newRequestID() string {
 	b := make([]byte, 8)
 	if _, err := rand.Read(b); err != nil {
-		// crypto/rand failure is system-fatal; the harness will surface it
-		// when the parked call never resolves. Fall back to a timestamp-ish
-		// value just so we don't return an empty id.
 		return "hreq_unseeded"
 	}
 	return "hreq_" + hex.EncodeToString(b)

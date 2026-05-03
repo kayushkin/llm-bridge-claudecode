@@ -95,9 +95,15 @@ type SetModelParams struct {
 	Model string `json:"model"`
 }
 
-// SetPermissionModeParams are the parameters for the "set_permission_mode" method.
-type SetPermissionModeParams struct {
-	Mode string `json:"mode"`
+// SetBypassPermissionsParams are the parameters for the
+// "set_bypass_permissions" method. When Enabled is true, the embedded
+// permission MCP returns allow for every tool call without consulting the
+// permission-store rule engine. New sessions also start with
+// --permission-mode bypassPermissions when bridge-prefs has the global
+// bypass flag on; this method covers the live-flip case for already-running
+// sessions.
+type SetBypassPermissionsParams struct {
+	Enabled bool `json:"enabled"`
 }
 
 // ResolveHookParams are the parameters for the "resolve_hook" method.
@@ -155,6 +161,11 @@ type Harness struct {
 	// respawns within a harness lifetime.
 	permissionMCP     *PermissionMCP
 	permissionCfgPath string // tmp --mcp-config file path; removed on Shutdown
+
+	// pendingBypass holds a set_bypass_permissions request that arrived
+	// before the MCP was created. ensurePermissionMCP applies it on the
+	// MCP it just constructed, then clears this field.
+	pendingBypass *bool
 }
 
 // NewHarness creates a new harness instance.
@@ -352,12 +363,12 @@ func (h *Harness) HandleRequest(req Request) error {
 		}
 		return h.handleSetModel(params)
 
-	case "set_permission_mode":
-		var params SetPermissionModeParams
+	case "set_bypass_permissions":
+		var params SetBypassPermissionsParams
 		if err := json.Unmarshal(req.Params, &params); err != nil {
-			return fmt.Errorf("parse set_permission_mode params: %w", err)
+			return fmt.Errorf("parse set_bypass_permissions params: %w", err)
 		}
-		return h.handleSetPermissionMode(params)
+		return h.handleSetBypassPermissions(params)
 
 	case "control":
 		var params ControlParams
@@ -759,15 +770,19 @@ func (h *Harness) handleSetModel(params SetModelParams) error {
 	})
 }
 
-// handleSetPermissionMode forwards a set_permission_mode control_request to Claude Code.
-func (h *Harness) handleSetPermissionMode(params SetPermissionModeParams) error {
-	if params.Mode == "" {
-		return fmt.Errorf("set_permission_mode: mode is required")
+// handleSetBypassPermissions flips the embedded MCP into / out of bypass
+// mode at runtime. No CC respawn or control_request — the next tool call
+// just sees the new flag value. Returns nil if no MCP exists yet (the flag
+// will be applied when ensurePermissionMCP runs at the next start).
+func (h *Harness) handleSetBypassPermissions(params SetBypassPermissionsParams) error {
+	if h.permissionMCP == nil {
+		// MCP not yet wired (no session has started). Stash the desired
+		// state so the next ensurePermissionMCP picks it up.
+		h.pendingBypass = &params.Enabled
+		return nil
 	}
-	return h.handleControl(ControlParams{
-		Subtype: "set_permission_mode",
-		Payload: map[string]any{"mode": params.Mode},
-	})
+	h.permissionMCP.SetBypass(params.Enabled)
+	return nil
 }
 
 // ensurePermissionMCP starts the embedded MCP server (if not already running)
@@ -782,25 +797,36 @@ func (h *Harness) ensurePermissionMCP() (string, error) {
 		return h.permissionCfgPath, nil
 	}
 
-	pmcp, err := NewPermissionMCP(func(toolName string, input json.RawMessage, requestID string) {
-		h.emit(msg.Event{
-			Type:      msg.EventHook,
-			Harness:   harness,
-			Timestamp: time.Now(),
-			Hook: &msg.HookEvent{
-				Source:    "permission_prompt",
-				Event:     "PreToolUse",
-				ToolName:  toolName,
-				Phase:     "awaiting_resolution",
-				RequestID: requestID,
-				Input:     input,
-			},
-		})
-	})
+	client := newPermissionStoreClient(
+		func() string { return h.bridgeSessionID },
+		func() string { return "" }, // instance_id isn't propagated to the harness today
+	)
+	pmcp, err := NewPermissionMCP(
+		client.evaluate,
+		func(toolName string, input json.RawMessage, requestID string) {
+			h.emit(msg.Event{
+				Type:      msg.EventHook,
+				Harness:   harness,
+				Timestamp: time.Now(),
+				Hook: &msg.HookEvent{
+					Source:    "permission_prompt",
+					Event:     "PreToolUse",
+					ToolName:  toolName,
+					Phase:     "awaiting_resolution",
+					RequestID: requestID,
+					Input:     input,
+				},
+			})
+		},
+	)
 	if err != nil {
 		return "", fmt.Errorf("start permission MCP: %w", err)
 	}
 	h.permissionMCP = pmcp
+	if h.pendingBypass != nil {
+		pmcp.SetBypass(*h.pendingBypass)
+		h.pendingBypass = nil
+	}
 
 	cfgJSON, err := pmcp.MCPConfigJSON()
 	if err != nil {
@@ -900,12 +926,12 @@ func (h *Harness) handleConfig(raw json.RawMessage) error {
 			return fmt.Errorf("parse set_model: %w", err)
 		}
 		return h.handleSetModel(p)
-	case "set_permission_mode":
-		var p SetPermissionModeParams
+	case "set_bypass_permissions":
+		var p SetBypassPermissionsParams
 		if err := json.Unmarshal(raw, &p); err != nil {
-			return fmt.Errorf("parse set_permission_mode: %w", err)
+			return fmt.Errorf("parse set_bypass_permissions: %w", err)
 		}
-		return h.handleSetPermissionMode(p)
+		return h.handleSetBypassPermissions(p)
 	case "interrupt":
 		h.Interrupt()
 		return nil
