@@ -37,6 +37,10 @@ type StartParams struct {
 	DisplayName  string   `json:"display_name"`
 	AgentID      string   `json:"agent_id"`
 	Prompt       string   `json:"prompt"`
+	// Blocks is the multimodal alternative to Prompt: a canonical content-block
+	// array (text, image, document, audio, video) for the initial user message.
+	// Mutually exclusive with Prompt — setting both returns an error.
+	Blocks       []msg.ContentBlock `json:"blocks,omitempty"`
 	Resume       bool     `json:"resume"`
 	Fork         string   `json:"fork"`
 	AutoApprove  *bool    `json:"auto_approve,omitempty"`  // nil = true (default), false = restricted mode
@@ -83,6 +87,10 @@ type StartParams struct {
 // MessageParams are the parameters for the "message" method.
 type MessageParams struct {
 	Content string `json:"content"`
+	// Blocks is the multimodal alternative to Content: a canonical content-block
+	// array (text, image, document, audio, video). Mutually exclusive with
+	// Content — setting both returns an error.
+	Blocks []msg.ContentBlock `json:"blocks,omitempty"`
 }
 
 // CompactParams are the parameters for the "compact" method.
@@ -391,6 +399,11 @@ func (h *Harness) HandleRequest(req Request) error {
 
 // handleStart spawns a Claude Code process and begins streaming events.
 func (h *Harness) handleStart(params StartParams) error {
+	// Validate up-front, before any state mutation or subprocess spawn.
+	if params.Prompt != "" && len(params.Blocks) > 0 {
+		return fmt.Errorf("start: Prompt and Blocks are mutually exclusive")
+	}
+
 	// Prefer the explicit HarnessSessionID; fall back to legacy SessionID
 	// when older callers (or our own internal respawns) only set that field.
 	if params.HarnessSessionID != "" {
@@ -690,33 +703,53 @@ func (h *Harness) handleStart(params StartParams) error {
 		State:     &msg.StateEvent{State: msg.SessionRunning, Previous: msg.SessionIdle},
 	})
 
-	// Send the initial prompt as a user message.
-	if params.Prompt != "" {
+	// Send the initial user message — either as plain text (Prompt) or as a
+	// canonical content-block array (Blocks). Mutual-exclusion was checked
+	// at function entry.
+	switch {
+	case len(params.Blocks) > 0:
+		if err := proc.WriteMessageBlocks(params.Blocks); err != nil {
+			log.Printf("failed to write initial blocks: %v", err)
+			return err
+		}
+		h.drainUntilResult()
+	case params.Prompt != "":
 		if err := proc.WriteMessage(params.Prompt); err != nil {
 			log.Printf("failed to write initial prompt: %v", err)
 			return err
 		}
-		// Stream events from CC stdout until the turn completes.
 		h.drainUntilResult()
 	}
-	// If no prompt, just return — CC is ready and waiting for a message.
+	// If neither, just return — CC is ready and waiting for a message.
 	return nil
 }
 
 // handleMessage sends a follow-up message to the running Claude Code process.
 func (h *Harness) handleMessage(params MessageParams) error {
+	if params.Content != "" && len(params.Blocks) > 0 {
+		return fmt.Errorf("message: Content and Blocks are mutually exclusive")
+	}
+
 	if h.proc == nil || !h.proc.Alive() {
-		// Process died or was never started. Respawn with --resume.
+		// Process died or was never started. Respawn with --resume, forwarding
+		// whichever of Content/Blocks the caller provided.
 		return h.handleStart(StartParams{
 			HarnessSessionID: h.sessionID,
 			Prompt:           params.Content,
+			Blocks:           params.Blocks,
 			Resume:           true,
 			WorkDir:          h.workDir,
 		})
 	}
 
 	// Write user message to the existing CC process's stdin.
-	if err := h.proc.WriteMessage(params.Content); err != nil {
+	var err error
+	if len(params.Blocks) > 0 {
+		err = h.proc.WriteMessageBlocks(params.Blocks)
+	} else {
+		err = h.proc.WriteMessage(params.Content)
+	}
+	if err != nil {
 		return fmt.Errorf("write message: %w", err)
 	}
 
