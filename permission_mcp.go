@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // PermissionMCP is an embedded HTTP MCP server that implements the
@@ -333,9 +334,18 @@ func (m *PermissionMCP) handleToolCall(w http.ResponseWriter, r *http.Request, r
 		return
 	}
 
-	// "ask" — park the call and notify the harness so it emits the
-	// awaiting_resolution HookEvent. Block until resolve_hook delivers a
-	// decision (or the request context is cancelled).
+	// "ask" — park the call until the harness's resolve_hook delivers
+	// a decision. Two transport-layer hazards make this non-trivial:
+	//   1. CC's HTTP MCP transport closes the request body after ~60s of
+	//      silence even when MCP_TOOL_TIMEOUT permits a longer wait.
+	//   2. Any keepalive bytes have to ride a transport CC accepts.
+	// Per the MCP Streamable HTTP spec, a tools/call response can be
+	// either application/json (single payload) or text/event-stream (a
+	// stream that may carry progress notifications followed by the final
+	// result). Switching to SSE here lets us emit a JSON-RPC progress
+	// notification every ~25s as a keepalive, which both keeps the TCP
+	// connection from going idle and resets CC's onprogress watchdog
+	// (which arms `armedAt` on transport silence and aborts at 90s).
 	requestID := newRequestID()
 	ch := make(chan permissionDecision, 1)
 
@@ -350,15 +360,144 @@ func (m *PermissionMCP) handleToolCall(w http.ResponseWriter, r *http.Request, r
 
 	m.onAsk(args.ToolName, args.Input, requestID)
 
-	select {
-	case d := <-ch:
-		writePermissionResult(w, req.ID, d)
-	case <-r.Context().Done():
-		m.mu.Lock()
-		delete(m.pending, requestID)
-		m.mu.Unlock()
-		// CC already gave up on this request; nothing useful to write.
+	// Pull the progressToken out of the request _meta if the client sent
+	// one; including it on our progress notifications is what makes them
+	// route to onprogress for *this* parked tools/call.
+	progressToken := extractProgressToken(req.Params)
+
+	flusher, _ := w.(http.Flusher)
+	if flusher == nil {
+		// http.ResponseWriter must implement Flusher for SSE. Go's stdlib
+		// always does, but if a wrapper strips it we fall back to the
+		// blocking JSON path; CC will still time out at 60s on this path,
+		// but at least the call won't deadlock waiting for a flush that
+		// never happens.
+		select {
+		case d := <-ch:
+			writePermissionResult(w, req.ID, d)
+		case <-r.Context().Done():
+			m.mu.Lock()
+			delete(m.pending, requestID)
+			m.mu.Unlock()
+		}
+		return
 	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no") // hint to disable any reverse-proxy buffering
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	keepalive := time.NewTicker(25 * time.Second)
+	defer keepalive.Stop()
+
+	for {
+		select {
+		case d := <-ch:
+			sseSendResult(w, flusher, req.ID, d)
+			return
+		case <-keepalive.C:
+			sseSendKeepalive(w, flusher, progressToken)
+		case <-r.Context().Done():
+			m.mu.Lock()
+			delete(m.pending, requestID)
+			m.mu.Unlock()
+			// CC closed the request — nothing useful to write.
+			return
+		}
+	}
+}
+
+// extractProgressToken pulls _meta.progressToken from a JSON-RPC request's
+// params, returning "" if absent. Per MCP spec, clients that want to
+// receive progress notifications must include this token; including it on
+// our notifications is how the client routes them back to the right call.
+func extractProgressToken(params json.RawMessage) string {
+	var p struct {
+		Meta struct {
+			ProgressToken any `json:"progressToken"`
+		} `json:"_meta"`
+	}
+	if err := json.Unmarshal(params, &p); err != nil {
+		return ""
+	}
+	switch v := p.Meta.ProgressToken.(type) {
+	case string:
+		return v
+	case float64:
+		// JSON numbers decode as float64; re-encode as int-like string.
+		return fmt.Sprintf("%v", v)
+	}
+	return ""
+}
+
+// sseSendResult writes the final tools/call response as one SSE event and
+// closes the stream by returning to handleToolCall's caller (which lets
+// the response writer finalize). The wire format follows the MCP
+// Streamable HTTP "message" event shape.
+func sseSendResult(w http.ResponseWriter, flusher http.Flusher, id json.RawMessage, d permissionDecision) {
+	payload := map[string]any{"behavior": d.Behavior}
+	if len(d.UpdatedInput) > 0 {
+		payload["updatedInput"] = json.RawMessage(d.UpdatedInput)
+	}
+	if d.Message != "" {
+		payload["message"] = d.Message
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("[permission-mcp] sse marshal decision: %v", err)
+		return
+	}
+	resp := map[string]any{
+		"jsonrpc": "2.0",
+		"result": map[string]any{
+			"content": []map[string]any{{
+				"type": "text",
+				"text": string(body),
+			}},
+		},
+	}
+	if id != nil {
+		resp["id"] = json.RawMessage(id)
+	}
+	respJSON, err := json.Marshal(resp)
+	if err != nil {
+		log.Printf("[permission-mcp] sse marshal envelope: %v", err)
+		return
+	}
+	fmt.Fprintf(w, "event: message\ndata: %s\n\n", respJSON)
+	flusher.Flush()
+}
+
+// sseSendKeepalive emits a JSON-RPC progress notification (with the
+// client-supplied progressToken when present) so CC routes it through
+// onprogress and resets its transport watchdog. With no token we send an
+// SSE comment, which is harmless and keeps the TCP path warm but does
+// not reset onprogress.
+func sseSendKeepalive(w http.ResponseWriter, flusher http.Flusher, progressToken string) {
+	if progressToken == "" {
+		fmt.Fprint(w, ": waiting on resolver\n\n")
+		flusher.Flush()
+		return
+	}
+	notif := map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "notifications/progress",
+		"params": map[string]any{
+			"progressToken": progressToken,
+			"progress":      0,
+			"message":       "waiting on human approval",
+		},
+	}
+	body, err := json.Marshal(notif)
+	if err != nil {
+		log.Printf("[permission-mcp] sse marshal keepalive: %v", err)
+		return
+	}
+	fmt.Fprintf(w, "event: message\ndata: %s\n\n", body)
+	flusher.Flush()
 }
 
 // writePermissionResult writes the MCP tool/call response in the shape
