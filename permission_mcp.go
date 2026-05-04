@@ -451,24 +451,17 @@ func (m *PermissionMCP) handleToolCall(w http.ResponseWriter, r *http.Request, r
 	}
 }
 
-// handleGetStream binds the incoming GET as the session's server-push
-// channel. The connection stays open until the client closes it; while
-// open, deferred tools/call responses (and any other server-initiated
-// messages) get written here. If the session is unknown (no init has
-// run, or the id doesn't match) we 404.
+// handleGetStream binds the incoming GET as a server-push channel.
+// Per the MCP spec the client SHOULD include Mcp-Session-Id, but in
+// practice some clients (CC included, observed empirically) open the
+// GET before they've received the init response carrying the id.
+// We accept either way: if the session id is known, attach to its slot;
+// otherwise attach to a session-less "default" slot keyed by "" so a
+// subsequent POST without Mcp-Session-Id can still find it.
 func (m *PermissionMCP) handleGetStream(w http.ResponseWriter, r *http.Request) {
 	sessionID := r.Header.Get("Mcp-Session-Id")
-	if sessionID == "" {
-		http.Error(w, "Mcp-Session-Id header required", http.StatusBadRequest)
-		return
-	}
-	m.sessionsMu.Lock()
-	sess, ok := m.sessions[sessionID]
-	m.sessionsMu.Unlock()
-	if !ok {
-		http.Error(w, "unknown session", http.StatusNotFound)
-		return
-	}
+	log.Printf("[permission-mcp] GET /mcp opened: accept=%q session-id=%q", r.Header.Get("Accept"), sessionID)
+
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "GET stream requires flush support", http.StatusInternalServerError)
@@ -480,15 +473,25 @@ func (m *PermissionMCP) handleGetStream(w http.ResponseWriter, r *http.Request) 
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
+	m.sessionsMu.Lock()
+	sess, ok := m.sessions[sessionID]
+	if !ok {
+		// No init for this id (or no id at all) — bind a new session
+		// entry under whatever id the client sent. POSTs that arrive
+		// later under the same id (including "") will find this stream.
+		sess = &clientSession{}
+		m.sessions[sessionID] = sess
+	}
+	m.sessionsMu.Unlock()
+
 	sess.mu.Lock()
 	sess.writer = w
 	sess.flusher = flusher
 	sess.open = true
 	sess.mu.Unlock()
 
-	// Hold the connection until the client closes. Server-initiated
-	// messages are written by other goroutines via pushToSession.
 	<-r.Context().Done()
+	log.Printf("[permission-mcp] GET /mcp closed: session-id=%q", sessionID)
 
 	sess.mu.Lock()
 	sess.writer = nil
@@ -523,27 +526,25 @@ func (m *PermissionMCP) pushToSession(sessionID string, jsonRPCBody []byte) bool
 	return true
 }
 
-// extractProgressToken pulls _meta.progressToken from a JSON-RPC request's
-// params, returning "" if absent. Per MCP spec, clients that want to
-// receive progress notifications must include this token; including it on
-// our notifications is how the client routes them back to the right call.
-func extractProgressToken(params json.RawMessage) string {
+// extractProgressToken pulls _meta.progressToken from a JSON-RPC request
+// as a json.RawMessage so we can echo it back with the same JSON type
+// the client sent. Returns nil if absent. Per MCP spec, progressToken
+// can be a string or a number; converting between the two breaks the
+// client's schema validation (Zod rejects). nil signals "no token; use
+// SSE comment keepalives instead".
+func extractProgressToken(params json.RawMessage) json.RawMessage {
 	var p struct {
 		Meta struct {
-			ProgressToken any `json:"progressToken"`
+			ProgressToken json.RawMessage `json:"progressToken"`
 		} `json:"_meta"`
 	}
 	if err := json.Unmarshal(params, &p); err != nil {
-		return ""
+		return nil
 	}
-	switch v := p.Meta.ProgressToken.(type) {
-	case string:
-		return v
-	case float64:
-		// JSON numbers decode as float64; re-encode as int-like string.
-		return fmt.Sprintf("%v", v)
+	if len(p.Meta.ProgressToken) == 0 {
+		return nil
 	}
-	return ""
+	return p.Meta.ProgressToken
 }
 
 // sseSendResult writes the final tools/call response as one SSE event and
@@ -588,9 +589,11 @@ func sseSendResult(w http.ResponseWriter, flusher http.Flusher, id json.RawMessa
 // client-supplied progressToken when present) so CC routes it through
 // onprogress and resets its transport watchdog. With no token we send an
 // SSE comment, which is harmless and keeps the TCP path warm but does
-// not reset onprogress.
-func sseSendKeepalive(w http.ResponseWriter, flusher http.Flusher, progressToken string) {
-	if progressToken == "" {
+// not reset onprogress. progressToken is passed as raw JSON so we echo
+// the client's exact type (string vs number) — converting between them
+// trips Zod validation in CC's MCP SDK.
+func sseSendKeepalive(w http.ResponseWriter, flusher http.Flusher, progressToken json.RawMessage) {
+	if len(progressToken) == 0 {
 		fmt.Fprint(w, ": waiting on resolver\n\n")
 		flusher.Flush()
 		return
