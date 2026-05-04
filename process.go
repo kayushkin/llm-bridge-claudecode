@@ -97,9 +97,27 @@ func spawnClaudeCode(cfg *Config, sessionID string, allowedTools []string, extra
 	if cfg.WorkDir != "" {
 		cmd.Dir = cfg.WorkDir
 	}
-	if cfg.APIKey != "" {
-		cmd.Env = append(cmd.Environ(), "ANTHROPIC_API_KEY="+cfg.APIKey)
+
+	// Stretch CC's MCP timeouts to effectively unlimited. The bridge_perm
+	// permission-prompt tool parks each tools/call indefinitely waiting for
+	// the human resolver — CC's default MCP_TOOL_TIMEOUT (60s) cancels
+	// those parked calls and CC moves on without permission. Same story
+	// for MCP_TIMEOUT on the initial connect handshake. ~106 days in ms
+	// keeps both numerics inside JS safe-integer territory while being
+	// long enough that no human approval flow will ever hit it. Override
+	// via env if a session legitimately needs a tighter ceiling.
+	const unlimitedTimeoutMS = "9999999999" // ~115 days
+	env := cmd.Environ()
+	if os.Getenv("MCP_TOOL_TIMEOUT") == "" {
+		env = append(env, "MCP_TOOL_TIMEOUT="+unlimitedTimeoutMS)
 	}
+	if os.Getenv("MCP_TIMEOUT") == "" {
+		env = append(env, "MCP_TIMEOUT="+unlimitedTimeoutMS)
+	}
+	if cfg.APIKey != "" {
+		env = append(env, "ANTHROPIC_API_KEY="+cfg.APIKey)
+	}
+	cmd.Env = env
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
