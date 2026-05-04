@@ -396,7 +396,14 @@ func (m *PermissionMCP) handleToolCall(w http.ResponseWriter, r *http.Request, r
 	sessionID := r.Header.Get("Mcp-Session-Id")
 	if sessionID != "" && m.sessionHasOpenStream(sessionID) {
 		w.WriteHeader(http.StatusAccepted)
-		go m.deferToGetStream(sessionID, requestID, req.ID, ch, r.Context())
+		// Critical: do NOT pass r.Context() here. Go's http server
+		// cancels the request context the moment the handler returns
+		// (i.e. right after we WriteHeader 202). Using r.Context()
+		// would make the deferred goroutine exit and delete the
+		// pending entry before the user has a chance to resolve —
+		// every Allow click would then come in as "stale". The MCP's
+		// Shutdown path is what eventually drains pending entries.
+		go m.deferToGetStream(sessionID, requestID, req.ID, ch)
 		return
 	}
 
@@ -688,28 +695,30 @@ func (m *PermissionMCP) sessionHasOpenStream(sessionID string) bool {
 	return sess.open
 }
 
-// deferToGetStream waits for the parked decision and pushes the
-// JSON-RPC response via the session's GET SSE stream when ready. Falls
-// silently if the stream has closed in the meantime — CC will retry the
-// tools/call (same behavior as a transport drop), and handleResolveHook
-// always emits the matching completed HookEvent so bridge-server's
-// pendingHooks bucket clears either way.
-func (m *PermissionMCP) deferToGetStream(sessionID, parkedRequestID string, jsonRPCID json.RawMessage, ch chan permissionDecision, ctx context.Context) {
-	select {
-	case d := <-ch:
-		body, err := buildToolCallResponse(jsonRPCID, d)
-		if err != nil {
-			log.Printf("[permission-mcp] defer marshal: %v", err)
-			return
-		}
-		if !m.pushToSession(sessionID, body) {
-			log.Printf("[permission-mcp] defer push to session %s failed (stream closed)", sessionID)
-		}
-	case <-ctx.Done():
-		// 202 was already returned and CC has moved on. Drop the parked entry.
-		m.mu.Lock()
-		delete(m.pending, parkedRequestID)
-		m.mu.Unlock()
+// deferToGetStream waits indefinitely for the parked decision and pushes
+// the JSON-RPC response via the session's GET SSE stream when ready.
+// The goroutine has no per-request cancellation by design — using the
+// POST request's context would cancel us as soon as the 202 response is
+// written, which deletes pending entries before the user can resolve.
+//
+// The select drains on PermissionMCP.Shutdown, which feeds a deny
+// decision into every pending channel. Falls silently if the GET stream
+// has closed — CC will retry the tools/call (same behavior as a
+// transport drop), and handleResolveHook always emits the matching
+// completed HookEvent so bridge-server's pendingHooks bucket clears.
+func (m *PermissionMCP) deferToGetStream(sessionID, parkedRequestID string, jsonRPCID json.RawMessage, ch chan permissionDecision) {
+	d, ok := <-ch
+	if !ok {
+		// Channel closed without a value — caller cleaned up. Nothing to do.
+		return
+	}
+	body, err := buildToolCallResponse(jsonRPCID, d)
+	if err != nil {
+		log.Printf("[permission-mcp] defer marshal: %v", err)
+		return
+	}
+	if !m.pushToSession(sessionID, body) {
+		log.Printf("[permission-mcp] defer push to session %s failed (stream closed)", sessionID)
 	}
 }
 
