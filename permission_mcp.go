@@ -119,6 +119,39 @@ func (m *PermissionMCP) Bypass() bool {
 	return m.bypassMode.Load()
 }
 
+// supportedProtocolVersions lists every MCP revision our minimal server
+// is wire-compatible with. We only implement initialize, tools/list,
+// tools/call, notifications/initialized, and notifications/cancelled —
+// none of those JSON-RPC shapes have changed across the listed revisions.
+//
+// Order is newest-first so negotiateProtocolVersion picks the latest
+// mutually-supported version when the client asks for something we
+// recognize.
+//
+// Maintenance: if a future MCP revision changes the shape of any
+// endpoint we implement, drop the affected revisions here. Don't add
+// a revision to this list speculatively — the contract is "we promise
+// to behave correctly under this revision".
+var supportedProtocolVersions = []string{
+	"2025-11-25",
+	"2025-06-18",
+	"2025-03-26",
+}
+
+// negotiateProtocolVersion implements MCP's version handshake: prefer the
+// client's requested version when we support it, otherwise return our
+// latest. Per the MCP spec the client then decides whether to proceed
+// with the version we returned (it must terminate if it doesn't support
+// what we sent — that's a clean failure, not a silent mismatch).
+func negotiateProtocolVersion(clientVersion string) string {
+	for _, v := range supportedProtocolVersions {
+		if v == clientVersion {
+			return v
+		}
+	}
+	return supportedProtocolVersions[0]
+}
+
 // ServerName is the MCP server name CC sees in --mcp-config and the
 // --permission-prompt-tool flag (mcp__<server>__<tool>).
 const PermissionMCPServerName = "bridge_perm"
@@ -216,8 +249,12 @@ func (m *PermissionMCP) handle(w http.ResponseWriter, r *http.Request) {
 	}
 	switch req.Method {
 	case "initialize":
+		var initParams struct {
+			ProtocolVersion string `json:"protocolVersion"`
+		}
+		_ = json.Unmarshal(req.Params, &initParams)
 		writeJSONRPCResult(w, req.ID, map[string]any{
-			"protocolVersion": "2025-06-18",
+			"protocolVersion": negotiateProtocolVersion(initParams.ProtocolVersion),
 			"capabilities": map[string]any{
 				"tools": map[string]any{},
 			},
