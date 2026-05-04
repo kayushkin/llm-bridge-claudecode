@@ -45,6 +45,21 @@ type PermissionMCP struct {
 	mu      sync.Mutex
 	pending map[string]chan permissionDecision
 	closed  bool
+
+	// sessions tracks active MCP sessions keyed by Mcp-Session-Id, set
+	// at initialize time. Each session has at most one open server-push
+	// SSE stream (the GET request the client makes after init). When
+	// present, parked tools/call responses are delivered via the stream
+	// and the original POST returns 202 Accepted — no keepalives needed.
+	sessionsMu sync.Mutex
+	sessions   map[string]*clientSession
+}
+
+type clientSession struct {
+	mu      sync.Mutex
+	writer  http.ResponseWriter
+	flusher http.Flusher
+	open    bool // true iff a GET stream is currently bound
 }
 
 // Evaluator returns a verdict for a tool call. Implementations MUST NOT
@@ -92,6 +107,7 @@ func NewPermissionMCP(evaluator Evaluator, onAsk AskCallback) (*PermissionMCP, e
 		evaluator: evaluator,
 		onAsk:     onAsk,
 		pending:   make(map[string]chan permissionDecision),
+		sessions:  make(map[string]*clientSession),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/mcp", m.handle)
@@ -234,6 +250,10 @@ type jsonrpcRequest struct {
 }
 
 func (m *PermissionMCP) handle(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		m.handleGetStream(w, r)
+		return
+	}
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -254,6 +274,15 @@ func (m *PermissionMCP) handle(w http.ResponseWriter, r *http.Request) {
 			ProtocolVersion string `json:"protocolVersion"`
 		}
 		_ = json.Unmarshal(req.Params, &initParams)
+		// Mint a session id so the client routes its GET SSE stream and
+		// subsequent POSTs back to this state. Without this, we couldn't
+		// correlate a parked tools/call with the GET stream that should
+		// receive its eventual response.
+		sessionID := newRequestID()
+		m.sessionsMu.Lock()
+		m.sessions[sessionID] = &clientSession{}
+		m.sessionsMu.Unlock()
+		w.Header().Set("Mcp-Session-Id", sessionID)
 		writeJSONRPCResult(w, req.ID, map[string]any{
 			"protocolVersion": negotiateProtocolVersion(initParams.ProtocolVersion),
 			"capabilities": map[string]any{
@@ -360,9 +389,21 @@ func (m *PermissionMCP) handleToolCall(w http.ResponseWriter, r *http.Request, r
 
 	m.onAsk(args.ToolName, args.Input, requestID)
 
-	// Pull the progressToken out of the request _meta if the client sent
-	// one; including it on our progress notifications is what makes them
-	// route to onprogress for *this* parked tools/call.
+	// Preferred path: if the client opened a GET SSE stream for this
+	// session, respond 202 Accepted now and deliver the JSON-RPC
+	// response asynchronously via that stream when resolve_hook arrives.
+	// No keepalives needed — nothing is parked at the HTTP layer.
+	sessionID := r.Header.Get("Mcp-Session-Id")
+	if sessionID != "" && m.sessionHasOpenStream(sessionID) {
+		w.WriteHeader(http.StatusAccepted)
+		go m.deferToGetStream(sessionID, requestID, req.ID, ch, r.Context())
+		return
+	}
+
+	// Fallback path: no GET stream available (older client SDKs, or a
+	// race between init and the GET open). Stream the response on the
+	// POST itself with periodic progress-notification keepalives so CC's
+	// transport doesn't time out the body at ~60s.
 	progressToken := extractProgressToken(req.Params)
 
 	flusher, _ := w.(http.Flusher)
@@ -408,6 +449,78 @@ func (m *PermissionMCP) handleToolCall(w http.ResponseWriter, r *http.Request, r
 			return
 		}
 	}
+}
+
+// handleGetStream binds the incoming GET as the session's server-push
+// channel. The connection stays open until the client closes it; while
+// open, deferred tools/call responses (and any other server-initiated
+// messages) get written here. If the session is unknown (no init has
+// run, or the id doesn't match) we 404.
+func (m *PermissionMCP) handleGetStream(w http.ResponseWriter, r *http.Request) {
+	sessionID := r.Header.Get("Mcp-Session-Id")
+	if sessionID == "" {
+		http.Error(w, "Mcp-Session-Id header required", http.StatusBadRequest)
+		return
+	}
+	m.sessionsMu.Lock()
+	sess, ok := m.sessions[sessionID]
+	m.sessionsMu.Unlock()
+	if !ok {
+		http.Error(w, "unknown session", http.StatusNotFound)
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "GET stream requires flush support", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	sess.mu.Lock()
+	sess.writer = w
+	sess.flusher = flusher
+	sess.open = true
+	sess.mu.Unlock()
+
+	// Hold the connection until the client closes. Server-initiated
+	// messages are written by other goroutines via pushToSession.
+	<-r.Context().Done()
+
+	sess.mu.Lock()
+	sess.writer = nil
+	sess.flusher = nil
+	sess.open = false
+	sess.mu.Unlock()
+}
+
+// pushToSession writes an SSE message to the session's open GET stream.
+// Returns false when no stream is currently bound (caller should fall
+// back to delivering the response via the original POST).
+func (m *PermissionMCP) pushToSession(sessionID string, jsonRPCBody []byte) bool {
+	if sessionID == "" {
+		return false
+	}
+	m.sessionsMu.Lock()
+	sess, ok := m.sessions[sessionID]
+	m.sessionsMu.Unlock()
+	if !ok {
+		return false
+	}
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	if !sess.open || sess.writer == nil || sess.flusher == nil {
+		return false
+	}
+	if _, err := fmt.Fprintf(sess.writer, "event: message\ndata: %s\n\n", jsonRPCBody); err != nil {
+		log.Printf("[permission-mcp] push to session %s: %v", sessionID, err)
+		return false
+	}
+	sess.flusher.Flush()
+	return true
 }
 
 // extractProgressToken pulls _meta.progressToken from a JSON-RPC request's
@@ -555,4 +668,74 @@ func newRequestID() string {
 		return "hreq_unseeded"
 	}
 	return "hreq_" + hex.EncodeToString(b)
+}
+
+// sessionHasOpenStream reports whether the session has an active GET SSE
+// stream we can push to. Used to decide between 202+GET (preferred) and
+// SSE-on-POST keepalive (fallback).
+func (m *PermissionMCP) sessionHasOpenStream(sessionID string) bool {
+	m.sessionsMu.Lock()
+	sess, ok := m.sessions[sessionID]
+	m.sessionsMu.Unlock()
+	if !ok {
+		return false
+	}
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	return sess.open
+}
+
+// deferToGetStream waits for the parked decision and pushes the
+// JSON-RPC response via the session's GET SSE stream when ready. Falls
+// silently if the stream has closed in the meantime — CC will retry the
+// tools/call (same behavior as a transport drop), and handleResolveHook
+// always emits the matching completed HookEvent so bridge-server's
+// pendingHooks bucket clears either way.
+func (m *PermissionMCP) deferToGetStream(sessionID, parkedRequestID string, jsonRPCID json.RawMessage, ch chan permissionDecision, ctx context.Context) {
+	select {
+	case d := <-ch:
+		body, err := buildToolCallResponse(jsonRPCID, d)
+		if err != nil {
+			log.Printf("[permission-mcp] defer marshal: %v", err)
+			return
+		}
+		if !m.pushToSession(sessionID, body) {
+			log.Printf("[permission-mcp] defer push to session %s failed (stream closed)", sessionID)
+		}
+	case <-ctx.Done():
+		// 202 was already returned and CC has moved on. Drop the parked entry.
+		m.mu.Lock()
+		delete(m.pending, parkedRequestID)
+		m.mu.Unlock()
+	}
+}
+
+// buildToolCallResponse renders a permissionDecision as the JSON-RPC
+// response shape MCP's --permission-prompt-tool expects: result.content
+// is a single text block whose text is the {behavior, ...} payload.
+func buildToolCallResponse(id json.RawMessage, d permissionDecision) ([]byte, error) {
+	payload := map[string]any{"behavior": d.Behavior}
+	if len(d.UpdatedInput) > 0 {
+		payload["updatedInput"] = json.RawMessage(d.UpdatedInput)
+	}
+	if d.Message != "" {
+		payload["message"] = d.Message
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	resp := map[string]any{
+		"jsonrpc": "2.0",
+		"result": map[string]any{
+			"content": []map[string]any{{
+				"type": "text",
+				"text": string(body),
+			}},
+		},
+	}
+	if id != nil {
+		resp["id"] = json.RawMessage(id)
+	}
+	return json.Marshal(resp)
 }
