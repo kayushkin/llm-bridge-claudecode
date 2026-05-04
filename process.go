@@ -102,11 +102,14 @@ func spawnClaudeCode(cfg *Config, sessionID string, allowedTools []string, extra
 	// permission-prompt tool parks each tools/call indefinitely waiting for
 	// the human resolver — CC's default MCP_TOOL_TIMEOUT (60s) cancels
 	// those parked calls and CC moves on without permission. Same story
-	// for MCP_TIMEOUT on the initial connect handshake. ~106 days in ms
-	// keeps both numerics inside JS safe-integer territory while being
-	// long enough that no human approval flow will ever hit it. Override
-	// via env if a session legitimately needs a tighter ceiling.
-	const unlimitedTimeoutMS = "9999999999" // ~115 days
+	// for MCP_TIMEOUT on the initial connect handshake.
+	//
+	// Value is Node's setTimeout maximum (2^31 - 1 = 2147483647ms ≈ 24.8d).
+	// Larger values get silently clamped to 1ms by V8/Node — we hit that
+	// trap once with 9999999999, which made every initial MCP probe
+	// "time out" in 30ms and CC mark our server as failed. Override via
+	// env if a session legitimately needs a tighter ceiling.
+	const unlimitedTimeoutMS = "2147483647" // ~24.8 days, JS setTimeout max
 	env := cmd.Environ()
 	if os.Getenv("MCP_TOOL_TIMEOUT") == "" {
 		env = append(env, "MCP_TOOL_TIMEOUT="+unlimitedTimeoutMS)
