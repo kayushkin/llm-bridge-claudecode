@@ -156,16 +156,12 @@ func main() {
 
 	// Methods that must NOT block the read loop. Without this, a long-running
 	// turn (handleMessage → drainUntilResult) holds the dispatcher and any
-	// resolve_hook the user clicks goes to the OS pipe buffer unread —
-	// deadlocking CC's parked approval_prompt forever. The harness's own
-	// internal locking (PermissionMCP mutex, atomic.Bool, proc mutex) makes
-	// these methods safe to run concurrently with whatever the read loop
-	// is doing on its own goroutine.
+	// mid-session control (set_model, interrupt) goes to the OS pipe buffer
+	// unread. Handler-internal locking (proc mutex) keeps these safe to run
+	// concurrently with whatever the read loop is doing on its own goroutine.
 	asyncMethods := map[string]bool{
-		"resolve_hook":            true,
-		"set_bypass_permissions":  true,
-		"set_model":               true,
-		"control":                 true,
+		"set_model": true,
+		"control":   true,
 	}
 
 	for scanner.Scan() {
@@ -184,9 +180,8 @@ func main() {
 		}
 
 		log.Printf("request: method=%s", req.Method)
-		// config:<json> wraps one of the async subtypes (set_model,
-		// set_bypass_permissions, interrupt), so route the whole prefix
-		// to the async path.
+		// config:<json> wraps mid-session control subtypes (set_model,
+		// interrupt) — route the whole prefix to the async path.
 		isAsync := asyncMethods[req.Method] || strings.HasPrefix(req.Method, "config:")
 		if isAsync {
 			go func(r Request) {

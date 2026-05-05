@@ -68,16 +68,14 @@ type ccControlRequest struct {
 }
 
 // spawnClaudeCode starts a new Claude Code process with stream-json I/O.
-// Permission gating is always routed through the embedded MCP server +
-// CC's --permission-prompt-tool flag (wired by handleStart). The runtime
-// effective mode comes from --permission-mode set at start time and can
-// be flipped mid-session via set_permission_mode (bypassPermissions for
-// auto-approve, default to consult the bridge UI).
+// Permission gating runs as a PreToolUse HTTP hook injected via --settings
+// by bridge-server (see internal/server/hook_settings.go). CC's own
+// permission system stays off — handleStart hardcodes
+// --permission-mode bypassPermissions so CC never consults a
+// --permission-prompt-tool we no longer wire.
 //
-// allowedTools is forwarded as --allowed-tools when non-empty. Unlike the
-// previous behavior, it no longer doubles as a permission-skip mechanism;
-// it just narrows the tool surface. CC still consults the prompt tool for
-// any tool that isn't already on the allowlist.
+// allowedTools is forwarded as --allowed-tools when non-empty. It just
+// narrows the tool surface; the permission gate still fires on every call.
 func spawnClaudeCode(cfg *Config, sessionID string, allowedTools []string, extraArgs ...string) (*CCProcess, error) {
 	args := []string{
 		"-p",
@@ -98,25 +96,7 @@ func spawnClaudeCode(cfg *Config, sessionID string, allowedTools []string, extra
 		cmd.Dir = cfg.WorkDir
 	}
 
-	// Stretch CC's MCP timeouts to effectively unlimited. The bridge_perm
-	// permission-prompt tool parks each tools/call indefinitely waiting for
-	// the human resolver — CC's default MCP_TOOL_TIMEOUT (60s) cancels
-	// those parked calls and CC moves on without permission. Same story
-	// for MCP_TIMEOUT on the initial connect handshake.
-	//
-	// Value is Node's setTimeout maximum (2^31 - 1 = 2147483647ms ≈ 24.8d).
-	// Larger values get silently clamped to 1ms by V8/Node — we hit that
-	// trap once with 9999999999, which made every initial MCP probe
-	// "time out" in 30ms and CC mark our server as failed. Override via
-	// env if a session legitimately needs a tighter ceiling.
-	const unlimitedTimeoutMS = "2147483647" // ~24.8 days, JS setTimeout max
 	env := cmd.Environ()
-	if os.Getenv("MCP_TOOL_TIMEOUT") == "" {
-		env = append(env, "MCP_TOOL_TIMEOUT="+unlimitedTimeoutMS)
-	}
-	if os.Getenv("MCP_TIMEOUT") == "" {
-		env = append(env, "MCP_TIMEOUT="+unlimitedTimeoutMS)
-	}
 	if cfg.APIKey != "" {
 		env = append(env, "ANTHROPIC_API_KEY="+cfg.APIKey)
 	}
