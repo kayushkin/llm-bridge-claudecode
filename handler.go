@@ -570,32 +570,28 @@ func (h *Harness) handleStart(params StartParams) error {
 		extraArgs = append(extraArgs, "--debug-file", params.DebugFile)
 	}
 
-	// Always wire the embedded MCP server so the auto_approve toggle can
-	// flip CC into / out of restricted mode mid-session via
-	// set_permission_mode without a respawn. The MCP only gets called when
-	// CC's runtime permission_mode is "default" (or anything other than
-	// bypassPermissions); listener overhead is one loopback TCP socket per
-	// session.
-	permCfgPath, err := h.ensurePermissionMCP()
-	if err != nil {
-		return fmt.Errorf("ensure permission MCP: %w", err)
-	}
-	extraArgs = append(extraArgs,
-		"--mcp-config", permCfgPath,
-		"--permission-prompt-tool", PermissionPromptToolSpec(),
-	)
+	// Permission gating moved to bridge-server's PreToolUse HTTP hook
+	// (--settings injects the permission/cc-prehook entry). The embedded
+	// bridge_perm MCP code stays in the binary for one more deploy cycle
+	// — step 4 of the migration deletes it. Don't spawn it, don't pass
+	// --permission-prompt-tool, don't pass --mcp-config for it.
+	//
+	// We still need --permission-mode bypassPermissions so CC skips its
+	// own internal permission prompt logic (which would otherwise try
+	// to consult a --permission-prompt-tool we no longer wire). Hooks
+	// run regardless of permission mode, so our PreToolUse gate fires
+	// either way.
 
-	// Map autoApprove → CC --permission-mode. The user can flip this at
-	// any time via set_permission_mode; at start we just pick the default
-	// matching the persisted preference. params.PermissionMode (if set
+	// Map autoApprove → CC --permission-mode. params.PermissionMode (if set
 	// explicitly upstream) wins — handled below.
 	hasExplicitMode := params.PermissionMode != ""
 	if !hasExplicitMode {
-		mode := "bypassPermissions"
-		if h.autoApprove != nil && !*h.autoApprove {
-			mode = "default"
-		}
-		extraArgs = append(extraArgs, "--permission-mode", mode)
+		// Always bypassPermissions: CC's own permission system stays off,
+		// and the PreToolUse HTTP hook injected via --settings is the
+		// sole permission gate. The autoApprove flag and bridge-prefs
+		// bypass toggle now influence what bridge-server returns from
+		// /permission/cc-prehook — the harness no longer cares.
+		extraArgs = append(extraArgs, "--permission-mode", "bypassPermissions")
 	}
 
 	// Use params.WorkDir if provided (for resumed sessions), otherwise fall back to config.
