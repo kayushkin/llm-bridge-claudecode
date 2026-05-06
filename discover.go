@@ -201,8 +201,17 @@ func buildStoredSession(sess SessionRow, rollouts []RolloutRow) msg.StoredSessio
 
 	if path != "" {
 		out.Path = path
-		// Project is encoded into the parent directory name.
-		out.Project = ccProjectToPath(filepath.Base(filepath.Dir(path)))
+		parent := filepath.Base(filepath.Dir(path))
+		if parent == "subagents" {
+			// Task()-spawned subagent: <projects>/<encoded-cwd>/<parent-uuid>/subagents/agent-*.jsonl
+			// Tag structurally so bridge-server buckets it via SOURCE_FOLDERS instead
+			// of surfacing as a top-level chat. Project comes from the grandparent.
+			out.Source = "subagent"
+			out.Project = ccProjectToPath(filepath.Base(filepath.Dir(filepath.Dir(filepath.Dir(path)))))
+		} else {
+			// Project is encoded into the parent directory name.
+			out.Project = ccProjectToPath(parent)
+		}
 		if info, err := os.Stat(path); err == nil {
 			out.UpdatedAt = info.ModTime()
 		}

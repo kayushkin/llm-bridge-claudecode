@@ -278,3 +278,32 @@ func TestColdImport_BackfillPathOnEmpty(t *testing.T) {
 		t.Fatalf("prompt should come from backfilled file, got %q", ss.Prompt)
 	}
 }
+
+// TestDiscover_SubagentSourceTag confirms that sessions whose rollout path
+// lives under <session>/subagents/agent-*.jsonl — the layout Claude Code uses
+// for Task()-spawned subagents — are tagged Source="subagent" so bridge-server
+// can bucket them via LLMBRIDGE_SOURCE_FOLDERS instead of surfacing them as
+// top-level interactive sessions.
+func TestDiscover_SubagentSourceTag(t *testing.T) {
+	projectsDir, _ := withCCHome(t)
+
+	// Top-level interactive session — should NOT be tagged.
+	writeJSONL(t, filepath.Join(projectsDir, "-tmp-proj", "uuid-top.jsonl"), "regular chat")
+	// Task subagent — sibling subagents/ dir under the parent UUID dir.
+	writeJSONL(t, filepath.Join(projectsDir, "-tmp-proj", "uuid-top", "subagents", "agent-abc.jsonl"), "Find the inber project")
+
+	got, err := discoverSessions("")
+	if err != nil {
+		t.Fatalf("discoverSessions: %v", err)
+	}
+	bySource := map[string]string{}
+	for _, s := range got {
+		bySource[s.HarnessSessionID] = s.Source
+	}
+	if bySource["uuid-top"] != "" {
+		t.Fatalf("top-level session must not carry Source, got %q", bySource["uuid-top"])
+	}
+	if bySource["agent-abc"] != "subagent" {
+		t.Fatalf("subagent session must be Source=subagent, got %q (full map: %v)", bySource["agent-abc"], bySource)
+	}
+}
