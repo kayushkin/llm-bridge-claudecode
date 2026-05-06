@@ -128,11 +128,9 @@ func translateSystem(ev ccStreamEvent, sid string, raw json.RawMessage) []msg.Ev
 
 	switch ev.Subtype {
 	case "init":
-		// Emit both a state change and a system event.
-		events = append(events, makeEvent(sid, msg.EventSessionState, raw, func(e *msg.Event) {
-			e.State = &msg.StateEvent{State: msg.SessionRunning, Previous: msg.SessionIdle}
-		}))
-		// Extract model from init for the system event message.
+		// Extract model from init for the system event message. Session
+		// state on init is derived centrally by llm-bridge-server from
+		// the raw event stream — harnesses no longer emit SessionState.
 		var init struct {
 			Model string `json:"model"`
 			CWD   string `json:"cwd"`
@@ -384,9 +382,6 @@ func translateResult(ev ccStreamEvent, sid string, raw json.RawMessage, agg *Usa
 				Message: errMsg,
 			}
 		}))
-		events = append(events, makeEvent(sid, msg.EventSessionState, raw, func(e *msg.Event) {
-			e.State = &msg.StateEvent{State: msg.SessionError, Previous: msg.SessionRunning, Reason: ev.Subtype}
-		}))
 	} else {
 		events = append(events, makeEvent(sid, msg.EventResult, raw, func(e *msg.Event) {
 			e.Result = &msg.ResultEvent{
@@ -401,9 +396,6 @@ func translateResult(ev ccStreamEvent, sid string, raw json.RawMessage, agg *Usa
 				Model:         model,
 				APICallUsages: agg.APICallUsages(),
 			}
-		}))
-		events = append(events, makeEvent(sid, msg.EventSessionState, raw, func(e *msg.Event) {
-			e.State = &msg.StateEvent{State: msg.SessionIdle, Previous: msg.SessionRunning}
 		}))
 	}
 

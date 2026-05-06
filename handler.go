@@ -629,17 +629,6 @@ func (h *Harness) handleStart(params StartParams) error {
 	// Start a single event reader for the lifetime of this process.
 	h.events = proc.ReadEvents(h.ctx)
 
-	// Announce that the session is running. The CC subprocess also emits a
-	// system:init event that translates to SessionRunning, but that only
-	// fires after CC starts processing — so without an explicit emission
-	// here, a no-prompt start would leave clients waiting indefinitely.
-	h.emit(msg.Event{
-		Type:      msg.EventSessionState,
-		Harness:   harness,
-		Timestamp: time.Now(),
-		State:     &msg.StateEvent{State: msg.SessionRunning, Previous: msg.SessionIdle},
-	})
-
 	// Send the initial user message — either as plain text (Prompt) or as a
 	// canonical content-block array (Blocks). Mutual-exclusion was checked
 	// at function entry.
@@ -884,12 +873,6 @@ func (h *Harness) drainUntilResult() {
 				Code:    "PROCESS_DIED",
 				Message: fmt.Sprintf("Claude Code process exited unexpectedly: %v", h.proc.Err()),
 			},
-		})
-		h.emit(msg.Event{
-			Type:      msg.EventSessionState,
-			Harness:   harness,
-			Timestamp: time.Now(),
-			State:     &msg.StateEvent{State: msg.SessionError, Previous: msg.SessionRunning, Reason: "process_died"},
 		})
 	}
 }
