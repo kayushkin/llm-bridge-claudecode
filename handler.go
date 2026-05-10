@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kayushkin/llm-bridge/identity"
 	"github.com/kayushkin/llm-bridge/msg"
 )
 
@@ -128,6 +129,15 @@ type Harness struct {
 	// state is the per-bridge persistent chain (sessions/rollouts/wal).
 	// Opened once at boot via openStateAndRecover.
 	state *State
+
+	// tracker maps Claude Code's per-message ids (am.ID from the
+	// stream-json assistant_message events) to canonical bridge
+	// message_ids. The adapter pre-stamps Event.MessageID so bridge-server
+	// can stop owning the assignAssistantID logic (Phase III.B). Lazy:
+	// constructed on first event needing it because bridgeSessionID isn't
+	// known at NewHarness() time — it arrives via the JSON-RPC start
+	// request. See identity_store.go.
+	tracker *identity.Tracker
 
 	// pendingWALID/Intent/Parent track an in-flight chain rotation. handleStart
 	// (cold-start) opens a WAL row before spawning CC; drainUntilResult commits
@@ -374,6 +384,14 @@ func (h *Harness) handleStart(params StartParams) error {
 		h.bridgeSessionID = params.BridgeSessionID
 	} else if !params.Resume && h.bridgeSessionID == "" {
 		h.bridgeSessionID = params.SessionID
+	}
+
+	// Tracker becomes available once bridgeSessionID is known. State must
+	// already be open (openStateAndRecover runs at boot before the JSON-RPC
+	// loop). One Tracker per session — survives across CC respawns since
+	// state.db persists.
+	if h.tracker == nil && h.state != nil && h.bridgeSessionID != "" {
+		h.tracker = newSessionTracker(h.state, h.bridgeSessionID)
 	}
 
 	// Persist permission config for respawns. Only update if explicitly set.
@@ -810,7 +828,7 @@ func (h *Harness) Shutdown() {
 // The channel persists across turns — only one goroutine reads from it.
 func (h *Harness) drainUntilResult() {
 	for raw := range h.events {
-		translated := translateEvent(raw, h.sessionID, &h.agg)
+		translated := translateEvent(raw, h.sessionID, &h.agg, h.tracker)
 		for _, ev := range translated {
 			h.emit(ev)
 

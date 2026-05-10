@@ -9,7 +9,7 @@ import (
 
 func TestTranslateHook_Started(t *testing.T) {
 	raw := json.RawMessage(`{"type":"system","subtype":"hook_started","hook_id":"abc","hook_name":"PreToolUse:0","hook_event":"PreToolUse","tool_name":"Bash","session_id":"s1"}`)
-	events := translateEvent(raw, "s1", &UsageAggregator{})
+	events := translateEvent(raw, "s1", &UsageAggregator{}, nil)
 	if len(events) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(events))
 	}
@@ -36,7 +36,7 @@ func TestTranslateHook_Started(t *testing.T) {
 
 func TestTranslateHook_ResponseWithJSONDecision(t *testing.T) {
 	raw := json.RawMessage(`{"type":"system","subtype":"hook_response","hook_id":"abc","hook_name":"PreToolUse:0","hook_event":"PreToolUse","stdout":"{\"decision\":\"deny\",\"reason\":\"nope\"}","stderr":"","exit_code":0,"outcome":"success","session_id":"s1"}`)
-	events := translateEvent(raw, "s1", &UsageAggregator{})
+	events := translateEvent(raw, "s1", &UsageAggregator{}, nil)
 	if len(events) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(events))
 	}
@@ -63,7 +63,7 @@ func TestTranslateHook_ResponseWithJSONDecision(t *testing.T) {
 
 func TestTranslateHook_ResponseWithFailureOutcome(t *testing.T) {
 	raw := json.RawMessage(`{"type":"system","subtype":"hook_response","hook_id":"abc","hook_name":"PostToolUse:0","hook_event":"PostToolUse","stdout":"","stderr":"command not found","exit_code":127,"outcome":"error","session_id":"s1"}`)
-	events := translateEvent(raw, "s1", &UsageAggregator{})
+	events := translateEvent(raw, "s1", &UsageAggregator{}, nil)
 	if len(events) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(events))
 	}
@@ -81,7 +81,7 @@ func TestTranslateHook_ResponseWithFailureOutcome(t *testing.T) {
 
 func TestTranslateHook_NonJSONStdout(t *testing.T) {
 	raw := json.RawMessage(`{"type":"system","subtype":"hook_response","hook_id":"abc","hook_name":"SessionStart:startup","hook_event":"SessionStart","stdout":"started\n","stderr":"","exit_code":0,"outcome":"success","session_id":"s1"}`)
-	events := translateEvent(raw, "s1", &UsageAggregator{})
+	events := translateEvent(raw, "s1", &UsageAggregator{}, nil)
 	if len(events) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(events))
 	}
@@ -96,7 +96,7 @@ func TestTranslateHook_NonJSONStdout(t *testing.T) {
 
 func TestTranslateAssistant_TextBlock(t *testing.T) {
 	raw := json.RawMessage(`{"type":"assistant","session_id":"s1","message":{"id":"msg_abc","role":"assistant","content":[{"type":"text","text":"hello world"}],"usage":{"input_tokens":1,"output_tokens":2}}}`)
-	events := translateEvent(raw, "s1", &UsageAggregator{})
+	events := translateEvent(raw, "s1", &UsageAggregator{}, nil)
 	if len(events) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(events))
 	}
@@ -120,7 +120,7 @@ func TestTranslateAssistant_TextBlock(t *testing.T) {
 
 func TestTranslateAssistant_ThinkingBlock(t *testing.T) {
 	raw := json.RawMessage(`{"type":"assistant","session_id":"s1","message":{"id":"msg_def","role":"assistant","content":[{"type":"thinking","thinking":"reasoning text","signature":"sigblob"}],"usage":{"input_tokens":1,"output_tokens":2}}}`)
-	events := translateEvent(raw, "s1", &UsageAggregator{})
+	events := translateEvent(raw, "s1", &UsageAggregator{}, nil)
 	if len(events) != 1 {
 		t.Fatalf("expected 1 event (no fan-out), got %d", len(events))
 	}
@@ -144,7 +144,7 @@ func TestTranslateAssistant_ThinkingBlock(t *testing.T) {
 
 func TestTranslateAssistant_ToolUseAndResultUnchanged(t *testing.T) {
 	raw := json.RawMessage(`{"type":"assistant","session_id":"s1","message":{"id":"msg_ghi","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"cmd":"ls"}}],"usage":{"input_tokens":1,"output_tokens":2}}}`)
-	events := translateEvent(raw, "s1", &UsageAggregator{})
+	events := translateEvent(raw, "s1", &UsageAggregator{}, nil)
 	if len(events) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(events))
 	}

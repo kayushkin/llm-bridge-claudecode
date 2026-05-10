@@ -132,6 +132,19 @@ CREATE TABLE IF NOT EXISTS wal (
     committed_at         DATETIME
 );
 CREATE INDEX IF NOT EXISTS idx_wal_status ON wal(status);
+
+-- Phase III.B: per-session harness_message_id -> bridge_message_id
+-- mapping that the adapter maintains so it can pre-stamp Event.MessageID
+-- before the event reaches bridge-server. PRIMARY KEY (bridge_session_id,
+-- harness_message_id) — same harness id reappearing in a different bridge
+-- session must mint a fresh bridge id (sessions are isolated).
+CREATE TABLE IF NOT EXISTS harness_messages (
+    bridge_session_id    TEXT NOT NULL,
+    harness_message_id   TEXT NOT NULL,
+    bridge_message_id    TEXT NOT NULL,
+    created_at           DATETIME NOT NULL,
+    PRIMARY KEY (bridge_session_id, harness_message_id)
+);
 `)
 	if err != nil {
 		return fmt.Errorf("state.db migrate: %w", err)
@@ -335,6 +348,36 @@ WHERE id = ? AND status = 'pending'`, tsNow(), id)
 		return fmt.Errorf("wal row %d not pending or missing", id)
 	}
 	return nil
+}
+
+// LookupHarnessMessage returns the bridge message id previously bound to
+// (bridgeSessionID, harnessMessageID), or ("", false, nil) if none.
+// Implements identity.Store.Lookup for the adapter's session-scoped
+// Tracker (see translate.go).
+func (s *State) LookupHarnessMessage(bridgeSessionID, harnessMessageID string) (string, bool, error) {
+	var bridgeMessageID string
+	err := s.db.QueryRow(`
+SELECT bridge_message_id FROM harness_messages
+WHERE bridge_session_id = ? AND harness_message_id = ?`,
+		bridgeSessionID, harnessMessageID).Scan(&bridgeMessageID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	return bridgeMessageID, true, nil
+}
+
+// PutHarnessMessage records a (bridgeSessionID, harnessMessageID) ->
+// bridgeMessageID binding. Idempotent on repeat with the same triple.
+func (s *State) PutHarnessMessage(bridgeSessionID, harnessMessageID, bridgeMessageID string) error {
+	_, err := s.db.Exec(`
+INSERT INTO harness_messages (bridge_session_id, harness_message_id, bridge_message_id, created_at)
+VALUES (?, ?, ?, ?)
+ON CONFLICT(bridge_session_id, harness_message_id) DO NOTHING`,
+		bridgeSessionID, harnessMessageID, bridgeMessageID, tsNow())
+	return err
 }
 
 // ListPendingWAL returns every WAL row whose status is still 'pending'.

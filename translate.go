@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"log"
 	"time"
 
+	"github.com/kayushkin/llm-bridge/identity"
 	"github.com/kayushkin/llm-bridge/msg"
 )
 
@@ -49,7 +51,14 @@ type ccAssistantBlock struct {
 
 // translateEvent converts a raw CC stream-json event into canonical msg.Event(s).
 // Returns nil for events that should be consumed internally (keep_alive, control_response).
-func translateEvent(raw json.RawMessage, sessionID string, agg *UsageAggregator) []msg.Event {
+//
+// tracker, when non-nil, is used to map CC's per-message id (am.ID from
+// assistant_message events) to a canonical bridge MessageID — the
+// adapter pre-stamps Event.MessageID so bridge-server doesn't need to
+// own assignAssistantID (Phase III.B). nil tracker is the legacy path
+// that puts the harness id in BlockEvent.MessageID and lets bridge-server
+// do the mapping; both paths emit the same Event shape.
+func translateEvent(raw json.RawMessage, sessionID string, agg *UsageAggregator, tracker *identity.Tracker) []msg.Event {
 	var ev ccStreamEvent
 	if err := json.Unmarshal(raw, &ev); err != nil {
 		return nil
@@ -65,9 +74,13 @@ func translateEvent(raw json.RawMessage, sessionID string, agg *UsageAggregator)
 	case "system":
 		return translateSystem(ev, sid, raw)
 	case "assistant":
-		return translateAssistant(ev, sid, raw, agg)
+		return translateAssistant(ev, sid, raw, agg, tracker)
 	case "result":
-		return translateResult(ev, sid, raw, agg)
+		out := translateResult(ev, sid, raw, agg)
+		if tracker != nil {
+			tracker.EndTurn()
+		}
+		return out
 	case "rate_limit_event":
 		return translateRateLimit(sid, raw)
 	case "tool_progress":
@@ -284,7 +297,7 @@ func translateHook(ev ccStreamEvent, sid string, raw json.RawMessage) []msg.Even
 	})}
 }
 
-func translateAssistant(ev ccStreamEvent, sid string, raw json.RawMessage, agg *UsageAggregator) []msg.Event {
+func translateAssistant(ev ccStreamEvent, sid string, raw json.RawMessage, agg *UsageAggregator, tracker *identity.Tracker) []msg.Event {
 	var am ccAssistantMessage
 	if err := json.Unmarshal(ev.Message, &am); err != nil {
 		return nil
@@ -292,14 +305,48 @@ func translateAssistant(ev ccStreamEvent, sid string, raw json.RawMessage, agg *
 
 	agg.AddAPICall(am.Usage)
 
+	// blockMessageID is what we put in BlockEvent.MessageID and
+	// ToolCall/ToolResult.MessageID. With the Tracker (Phase III.B), this
+	// is the canonical bridge MessageID — pre-stamped here so bridge-server
+	// honors it instead of re-running assignAssistantID. Without the
+	// Tracker (legacy path), we leave the harness id in place and let
+	// bridge-server do the mapping. Both paths produce the same wire shape;
+	// only the value of the id field differs.
+	blockMessageID := am.ID
+	var bridgeMessageID string
+	if tracker != nil {
+		assigned, err := tracker.AssignMessageID(am.ID)
+		if err != nil {
+			// Tracker failure is local to this adapter's state.db; log and
+			// fall back to the harness id so bridge-server's legacy
+			// assignAssistantID can still produce a working bubble.
+			log.Printf("[claudecode] tracker assign for am.id=%s: %v", am.ID, err)
+		} else {
+			blockMessageID = assigned
+			bridgeMessageID = assigned
+		}
+	}
+
+	stamp := func(e *msg.Event) {
+		// Pre-stamping Event.MessageID lets bridge-server's
+		// assignAssistantID short-circuit (commit e743f86). Bare am.ID
+		// in HarnessMessageID preserves the harness-side correlation
+		// for diagnostics and for any consumer that still looks at it.
+		if bridgeMessageID != "" {
+			e.MessageID = bridgeMessageID
+		}
+		e.HarnessMessageID = am.ID
+	}
+
 	var events []msg.Event
 	for i, block := range am.Content {
 		switch block.Type {
 		case "text":
 			events = append(events, makeEvent(sid, msg.EventBlock, raw, func(e *msg.Event) {
+				stamp(e)
 				e.Block = &msg.BlockEvent{
 					Index:     i,
-					MessageID: am.ID,
+					MessageID: blockMessageID,
 					Block: &msg.ContentBlock{
 						Type: msg.BlockText,
 						Text: &msg.TextBlock{Text: block.Text},
@@ -309,9 +356,10 @@ func translateAssistant(ev ccStreamEvent, sid string, raw json.RawMessage, agg *
 
 		case "thinking":
 			events = append(events, makeEvent(sid, msg.EventBlock, raw, func(e *msg.Event) {
+				stamp(e)
 				e.Block = &msg.BlockEvent{
 					Index:     i,
-					MessageID: am.ID,
+					MessageID: blockMessageID,
 					Block: &msg.ContentBlock{
 						Type: msg.BlockThinking,
 						Thinking: &msg.ThinkingBlock{
@@ -325,22 +373,24 @@ func translateAssistant(ev ccStreamEvent, sid string, raw json.RawMessage, agg *
 		case "tool_use":
 			agg.AddToolCall()
 			events = append(events, makeEvent(sid, msg.EventToolCall, raw, func(e *msg.Event) {
+				stamp(e)
 				e.ToolCall = &msg.ToolCallEvent{
 					ToolID:    block.ID,
 					Name:      block.Name,
 					Input:     block.Input,
-					MessageID: am.ID,
+					MessageID: blockMessageID,
 				}
 			}))
 
 		case "tool_result":
 			events = append(events, makeEvent(sid, msg.EventToolResult, raw, func(e *msg.Event) {
+				stamp(e)
 				e.ToolResult = &msg.ToolResultEvent{
 					ToolID:    block.ID,
 					Name:      block.Name,
 					Output:    block.Content,
 					IsError:   block.IsError,
-					MessageID: am.ID,
+					MessageID: blockMessageID,
 				}
 			}))
 		}
