@@ -13,6 +13,23 @@ import (
 	"github.com/kayushkin/llm-bridge/msg"
 )
 
+// translateCanonicalPermissionMode maps the canonical bridge mode values
+// (ask/auto/bypass) to Claude Code's --permission-mode flag values. Any
+// other value passes through unchanged so direct CC-vocab callers (using
+// acceptEdits / plan / dontAsk / etc.) keep working without modification.
+// Empty input returns empty so the caller can decide whether to default.
+func translateCanonicalPermissionMode(m string) string {
+	switch m {
+	case msg.PermissionModeAsk:
+		return "default"
+	case msg.PermissionModeAuto:
+		return "auto"
+	case msg.PermissionModeBypass:
+		return "bypassPermissions"
+	}
+	return m
+}
+
 // Request is the JSON-RPC request format from llm-bridge.
 type Request struct {
 	Method string          `json:"method"`
@@ -448,8 +465,12 @@ func (h *Harness) handleStart(params StartParams) error {
 	if params.FallbackModel != "" {
 		extraArgs = append(extraArgs, "--fallback-model", params.FallbackModel)
 	}
-	if params.PermissionMode != "" {
-		extraArgs = append(extraArgs, "--permission-mode", params.PermissionMode)
+	// PermissionMode accepts either the canonical bridge values
+	// (ask/auto/bypass) or CC-native values (default/acceptEdits/auto/plan/
+	// bypassPermissions/dontAsk). Canonical values get translated; anything
+	// else passes through unchanged so direct CC-vocab callers keep working.
+	if ccMode := translateCanonicalPermissionMode(params.PermissionMode); ccMode != "" {
+		extraArgs = append(extraArgs, "--permission-mode", ccMode)
 	}
 	if params.Worktree != "" {
 		if params.Worktree == "true" {
@@ -543,12 +564,10 @@ func (h *Harness) handleStart(params StartParams) error {
 
 	// Permission gating runs as a PreToolUse HTTP hook injected by
 	// bridge-server via --settings (see internal/server/hook_settings.go,
-	// /permission/cc-prehook/<bridge_id>). CC's own permission system
-	// stays off — we hardcode --permission-mode bypassPermissions so it
-	// doesn't try to consult a --permission-prompt-tool we no longer
-	// wire. Hooks fire regardless of mode, so the gate still runs on
-	// every tool call. params.PermissionMode (if set explicitly
-	// upstream) wins.
+	// /permission/cc-prehook/<bridge_id>). Hooks fire regardless of CC's
+	// --permission-mode, so the gate still runs on every tool call. When
+	// the caller didn't set a mode, default to bypassPermissions so CC's
+	// own UI never tries to prompt — the hook is the sole gate.
 	if params.PermissionMode == "" {
 		extraArgs = append(extraArgs, "--permission-mode", "bypassPermissions")
 	}
