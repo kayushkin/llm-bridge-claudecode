@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"time"
 
 	"github.com/kayushkin/llm-bridge/msg"
 )
@@ -24,7 +25,11 @@ type CCProcess struct {
 
 	sessionID string
 	done      chan struct{} // closed when process exits
-	err       error        // exit error, set before done is closed
+	err       error         // exit error, set before done is closed
+
+	// otelRecv is the per-process OTLP receiver, if telemetry was enabled
+	// at spawn. The exit goroutine shuts it down after CC exits.
+	otelRecv *OTelReceiver
 }
 
 // ccUserMessage is the JSON format Claude Code expects on stdin for user messages.
@@ -76,7 +81,13 @@ type ccControlRequest struct {
 //
 // allowedTools is forwarded as --allowed-tools when non-empty. It just
 // narrows the tool surface; the permission gate still fires on every call.
-func spawnClaudeCode(cfg *Config, sessionID string, allowedTools []string, extraArgs ...string) (*CCProcess, error) {
+//
+// otelRecv, when non-nil, is wired into CC's environment so per-API-call
+// telemetry (model, tokens, cost, duration, including auxiliary calls
+// invisible to stream-json) flows back as EventAPICall events. The
+// returned CCProcess takes ownership and shuts the receiver down after
+// the subprocess exits.
+func spawnClaudeCode(cfg *Config, sessionID string, allowedTools []string, otelRecv *OTelReceiver, extraArgs ...string) (*CCProcess, error) {
 	args := []string{
 		"-p",
 		"--input-format", "stream-json",
@@ -99,6 +110,9 @@ func spawnClaudeCode(cfg *Config, sessionID string, allowedTools []string, extra
 	env := cmd.Environ()
 	if cfg.APIKey != "" {
 		env = append(env, "ANTHROPIC_API_KEY="+cfg.APIKey)
+	}
+	if otelRecv != nil {
+		env = append(env, otelRecv.Env()...)
 	}
 	cmd.Env = env
 
@@ -126,11 +140,23 @@ func spawnClaudeCode(cfg *Config, sessionID string, allowedTools []string, extra
 		stdout:    stdout,
 		sessionID: sessionID,
 		done:      make(chan struct{}),
+		otelRecv:  otelRecv,
 	}
 
-	// Monitor process exit in background.
+	// Monitor process exit in background. OTel exporter batches with a 1s
+	// interval; give it a short flush window after the subprocess exits
+	// before tearing the receiver down so trailing batches land as
+	// EventAPICall msg.Events rather than getting dropped.
 	go func() {
 		p.err = cmd.Wait()
+		if p.otelRecv != nil {
+			time.Sleep(2 * time.Second)
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			if err := p.otelRecv.Stop(shutdownCtx); err != nil {
+				log.Printf("[otel] shutdown after process exit: %v", err)
+			}
+			cancel()
+		}
 		close(p.done)
 	}()
 

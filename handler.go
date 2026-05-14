@@ -658,7 +658,18 @@ func (h *Harness) handleStart(params StartParams) error {
 		h.pendingParent = h.sessionID
 	}
 
-	proc, err := spawnClaudeCode(cfg, params.SessionID, h.allowedTools, extraArgs...)
+	// Start the per-process OTLP receiver before spawning so the listening
+	// port exists by the time CC's exporter dials it. Telemetry is always
+	// on for claudecode harnesses — it surfaces auxiliary API calls
+	// (session-title, prompt-suggestion) that stream-json hides, which
+	// the cost/usage views depend on.
+	otelRecv, err := NewOTelReceiver(h.emit)
+	if err != nil {
+		return fmt.Errorf("otel receiver: %w", err)
+	}
+	otelRecv.Start()
+
+	proc, err := spawnClaudeCode(cfg, params.SessionID, h.allowedTools, otelRecv, extraArgs...)
 	if err != nil {
 		// Spawn failed before CC could mint a session UUID — the chain
 		// rotation never happened. Orphan any pending WAL row and clear
