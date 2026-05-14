@@ -199,6 +199,14 @@ func writeOTLPSuccess(w http.ResponseWriter) {
 // based on the event.name body or attribute. Unknown event names are
 // logged for visibility but don't produce a msg.Event — better to skip
 // than to fabricate.
+//
+// Several event types are critical for PTY-mode visibility: claude in
+// PTY mode renders the conversation directly to the pty fd, so the only
+// way bridge-server learns "the user typed X" or "tool Y was decided
+// upon" is via OTel. These translations are no-ops in -p mode (where
+// stream-json already carries the same data) but they're the sole
+// signal for PTY sessions. Provenance is tagged so consumers can dedupe
+// against stream-json equivalents.
 func (r *OTelReceiver) dispatchLogRecord(lr otlpLogRecord) {
 	name := otlpString(lr.Body)
 	attrs := flattenAttrs(lr.Attributes)
@@ -213,10 +221,18 @@ func (r *OTelReceiver) dispatchLogRecord(lr otlpLogRecord) {
 		r.emit(translateAPIRequest(attrs, ts))
 	case "claude_code.internal_error":
 		r.emit(translateInternalError(attrs, ts))
-	case "claude_code.user_prompt", "claude_code.tool_decision", "claude_code.tool_result":
-		// Deferred — stream-json (and the bridge's own prehook for tool_decision)
-		// already cover these in -p mode; full TUI-mode synthesis is a separate
-		// phase. Log at debug so we know they're flowing without spamming.
+	case "claude_code.tool_decision":
+		r.emit(translateToolDecision(attrs, ts))
+	case "claude_code.tool_result":
+		r.emit(translateToolResult(attrs, ts))
+	case "claude_code.user_prompt":
+		if ev, ok := translateUserPrompt(attrs, ts); ok {
+			r.emit(ev)
+		}
+	case "claude_code.hook_registered", "claude_code.hook_execution_start", "claude_code.hook_execution_complete":
+		// Lifecycle bookkeeping for the PreToolUse / PostToolUse hooks
+		// we install via --settings. Already surfaced as bridge HookEvents
+		// via the prehook HTTP path; emitting again here would duplicate.
 	default:
 		log.Printf("[otel] unhandled event.name=%q attrs=%v", name, attrs)
 	}
@@ -256,6 +272,78 @@ func translateInternalError(attrs map[string]string, ts time.Time) msg.Event {
 	}
 	tagOTelSource(&ev)
 	return ev
+}
+
+// translateToolDecision maps the OTel `claude_code.tool_decision` event
+// (the outcome of claude's PreToolUse permission gate) into a SystemEvent
+// with a tool_decision subtype. In -p mode this duplicates information
+// already carried by tool_call + the prehook HookEvent; in PTY mode it's
+// the only signal a tool was considered.
+//
+// SystemEvent (not Approval) on purpose — the bridge's EventApproval slot
+// is reserved for the prehook's permission *requests*; this is the
+// downstream *outcome* the model saw.
+func translateToolDecision(attrs map[string]string, ts time.Time) msg.Event {
+	ev := msg.Event{
+		Type:      msg.EventSystem,
+		Timestamp: ts,
+		System: &msg.SystemEvent{
+			Subtype: "tool_decision",
+			Message: attrs["tool_name"] + " → " + attrs["decision"],
+		},
+	}
+	tagOTelSource(&ev)
+	return ev
+}
+
+// translateToolResult maps the OTel `claude_code.tool_result` event into
+// a canonical EventToolResult. OTel carries only metadata (tool name,
+// success bool, duration); no args or output bodies, which is why this
+// is a useful-but-partial signal for PTY mode. To get the bodies we'd
+// need to tail claude's rollout JSONL (deferred follow-up).
+//
+// ToolID is left empty: OTel doesn't surface claude's internal toolu_*
+// id on this event, so we can't pair these results to their tool_calls
+// — they render as standalone rows in the chat view. Acceptable for
+// PTY-mode visibility; not as nice as the paired -p mode display.
+func translateToolResult(attrs map[string]string, ts time.Time) msg.Event {
+	success := attrs["success"] == "true"
+	ev := msg.Event{
+		Type:      msg.EventToolResult,
+		Timestamp: ts,
+		ToolResult: &msg.ToolResultEvent{
+			Name:    attrs["tool_name"],
+			IsError: !success,
+		},
+	}
+	tagOTelSource(&ev)
+	return ev
+}
+
+// translateUserPrompt maps the OTel `claude_code.user_prompt` event into
+// an EventUserMessage. The prompt body is only present when
+// OTEL_LOG_USER_PROMPTS=1 is set in the env (which the harness/sidecar
+// always sets). Returns ok=false when the body is missing — without it
+// there's no content to emit and a content-less user_message would
+// confuse downstream consumers.
+//
+// In PTY mode this is the only way bridge-server learns what the user
+// typed (the keystrokes go through the pty fd directly to claude, not
+// through bridge-server's /send endpoint).
+func translateUserPrompt(attrs map[string]string, ts time.Time) (msg.Event, bool) {
+	body := attrs["prompt"]
+	if body == "" {
+		return msg.Event{}, false
+	}
+	ev := msg.Event{
+		Type:      msg.EventUserMessage,
+		Timestamp: ts,
+		Result: &msg.ResultEvent{
+			Text: body,
+		},
+	}
+	tagOTelSource(&ev)
+	return ev, true
 }
 
 // tagOTelSource marks the event as OTel-derived so consumers can dedupe

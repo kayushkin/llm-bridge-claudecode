@@ -236,3 +236,169 @@ func TestOTelReceiver_EnvIncludesEndpoint(t *testing.T) {
 // drainAll is a small helper not strictly used in the tests above but
 // useful when promoting these to an e2e flow that spawns the binary.
 var _ = json.Marshal
+
+func TestOTelReceiver_ToolDecisionAndResult(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		events []msg.Event
+	)
+	emit := func(e msg.Event) {
+		mu.Lock()
+		defer mu.Unlock()
+		events = append(events, e)
+	}
+	recv, err := NewOTelReceiver(emit)
+	if err != nil {
+		t.Fatalf("new receiver: %v", err)
+	}
+	recv.Start()
+	defer recv.Stop(context.Background())
+
+	payload := `{
+		"resourceLogs": [{
+			"scopeLogs": [{
+				"logRecords": [
+					{
+						"timeUnixNano": "1778796549000000000",
+						"body": {"stringValue": "claude_code.tool_decision"},
+						"attributes": [
+							{"key": "event.name", "value": {"stringValue": "tool_decision"}},
+							{"key": "tool_name",  "value": {"stringValue": "Bash"}},
+							{"key": "decision",   "value": {"stringValue": "accept"}}
+						]
+					},
+					{
+						"timeUnixNano": "1778796549050000000",
+						"body": {"stringValue": "claude_code.tool_result"},
+						"attributes": [
+							{"key": "event.name",  "value": {"stringValue": "tool_result"}},
+							{"key": "tool_name",   "value": {"stringValue": "Bash"}},
+							{"key": "success",     "value": {"stringValue": "true"}}
+						]
+					},
+					{
+						"timeUnixNano": "1778796549100000000",
+						"body": {"stringValue": "claude_code.tool_result"},
+						"attributes": [
+							{"key": "event.name", "value": {"stringValue": "tool_result"}},
+							{"key": "tool_name",  "value": {"stringValue": "Read"}},
+							{"key": "success",    "value": {"stringValue": "false"}}
+						]
+					}
+				]
+			}]
+		}]
+	}`
+	resp, err := http.Post(recv.EndpointURL()+"/v1/logs", "application/json", bytes.NewBufferString(payload))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	resp.Body.Close()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(events) != 3 {
+		t.Fatalf("expected 3 events, got %d", len(events))
+	}
+
+	dec := events[0]
+	if dec.Type != msg.EventSystem || dec.System == nil ||
+		dec.System.Subtype != "tool_decision" || dec.System.Message != "Bash → accept" {
+		t.Errorf("tool_decision: %+v / %+v", dec.Type, dec.System)
+	}
+
+	ok := events[1]
+	if ok.Type != msg.EventToolResult || ok.ToolResult == nil ||
+		ok.ToolResult.Name != "Bash" || ok.ToolResult.IsError {
+		t.Errorf("tool_result success: %+v / %+v", ok.Type, ok.ToolResult)
+	}
+
+	bad := events[2]
+	if bad.Type != msg.EventToolResult || bad.ToolResult == nil ||
+		bad.ToolResult.Name != "Read" || !bad.ToolResult.IsError {
+		t.Errorf("tool_result failure: %+v / %+v", bad.Type, bad.ToolResult)
+	}
+
+	for i, ev := range events {
+		if string(ev.Extensions["source"]) != `"otel"` {
+			t.Errorf("event[%d] missing otel source tag: %v", i, ev.Extensions)
+		}
+	}
+}
+
+func TestOTelReceiver_UserPrompt(t *testing.T) {
+	var got msg.Event
+	var skipped int
+	var mu sync.Mutex
+	emit := func(e msg.Event) {
+		mu.Lock()
+		defer mu.Unlock()
+		got = e
+	}
+	recv, err := NewOTelReceiver(emit)
+	if err != nil {
+		t.Fatalf("new receiver: %v", err)
+	}
+	recv.Start()
+	defer recv.Stop(context.Background())
+
+	// With prompt body present → emits a user_message.
+	with := `{
+		"resourceLogs": [{
+			"scopeLogs": [{
+				"logRecords": [{
+					"timeUnixNano": "1778796549000000000",
+					"body": {"stringValue": "claude_code.user_prompt"},
+					"attributes": [
+						{"key": "event.name",    "value": {"stringValue": "user_prompt"}},
+						{"key": "prompt_length", "value": {"intValue": 5}},
+						{"key": "prompt",        "value": {"stringValue": "hello"}}
+					]
+				}]
+			}]
+		}]
+	}`
+	resp, _ := http.Post(recv.EndpointURL()+"/v1/logs", "application/json", bytes.NewBufferString(with))
+	resp.Body.Close()
+
+	mu.Lock()
+	if got.Type != msg.EventUserMessage || got.Result == nil || got.Result.Text != "hello" {
+		t.Fatalf("user_prompt with body: %+v", got)
+	}
+	mu.Unlock()
+
+	// Without prompt body → no emission (count via a fresh receiver).
+	recv2, err := NewOTelReceiver(func(msg.Event) {
+		mu.Lock()
+		skipped++
+		mu.Unlock()
+	})
+	if err != nil {
+		t.Fatalf("new receiver: %v", err)
+	}
+	recv2.Start()
+	defer recv2.Stop(context.Background())
+
+	without := `{
+		"resourceLogs": [{
+			"scopeLogs": [{
+				"logRecords": [{
+					"timeUnixNano": "1778796549000000000",
+					"body": {"stringValue": "claude_code.user_prompt"},
+					"attributes": [
+						{"key": "event.name",    "value": {"stringValue": "user_prompt"}},
+						{"key": "prompt_length", "value": {"intValue": 5}}
+					]
+				}]
+			}]
+		}]
+	}`
+	resp2, _ := http.Post(recv2.EndpointURL()+"/v1/logs", "application/json", bytes.NewBufferString(without))
+	resp2.Body.Close()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if skipped != 0 {
+		t.Errorf("user_prompt without body should be skipped, got %d emissions", skipped)
+	}
+}
