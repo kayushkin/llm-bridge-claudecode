@@ -50,6 +50,11 @@ func runOTelSidecar() {
 		fmt.Fprintln(os.Stderr, "otel-sidecar: LLMBRIDGE_BRIDGE_SERVER_URL is required")
 		os.Exit(2)
 	}
+	// Rollout-tailer inputs. Both optional: cwd defaults to "/" (the
+	// PTY child inherits bridge-server's cwd today), resumeID is only
+	// set on resume. Without these the tailer just won't find content.
+	rolloutCwd := os.Getenv("LLMBRIDGE_PTY_CWD")
+	rolloutResume := os.Getenv("LLMBRIDGE_PTY_RESUME_ID")
 
 	emit := newSidecarEmitter(bridgeServerURL, bridgeSessionID)
 
@@ -59,6 +64,13 @@ func runOTelSidecar() {
 		os.Exit(1)
 	}
 	recv.Start()
+
+	// Tail claude's per-session JSONL rollout in a parallel goroutine.
+	// This is the only source of message bodies / tool args / tool
+	// outputs for PTY-mode sessions — OTel carries metadata only.
+	rolloutDone := make(chan struct{})
+	go runRolloutTailer(emit, rolloutCwd, rolloutResume, rolloutDone)
+	defer close(rolloutDone)
 
 	// Hand the endpoint URL to bridge-server before doing anything else.
 	// bridge-server blocks on this read, so any delay here delays the PTY
