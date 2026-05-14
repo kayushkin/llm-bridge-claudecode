@@ -13,11 +13,17 @@ import (
 	"github.com/kayushkin/llm-bridge/msg"
 )
 
-// translateCanonicalPermissionMode maps the canonical bridge mode values
-// (ask/auto/bypass) to Claude Code's --permission-mode flag values. Any
-// other value passes through unchanged so direct CC-vocab callers (using
-// acceptEdits / plan / dontAsk / etc.) keep working without modification.
-// Empty input returns empty so the caller can decide whether to default.
+// translateCanonicalPermissionMode maps canonical bridge mode values to
+// Claude Code's --permission-mode flag values. Any unrecognized value
+// passes through unchanged so direct CC-vocab callers (using acceptEdits /
+// dontAsk / etc.) keep working without modification. Empty input returns
+// empty so the caller can decide whether to default.
+//
+// The bridge prehook is the universal gate — for every mode except `plan`,
+// we want CC running with maximum native permission so the prehook's
+// allow/deny is the sole decision point. `plan` is the exception: it has
+// a native CC analog that filters the tool surface CC offers to the
+// model, defense-in-depth on top of the prehook's planning-whitelist.
 func translateCanonicalPermissionMode(m string) string {
 	switch m {
 	case msg.PermissionModeAsk:
@@ -25,6 +31,21 @@ func translateCanonicalPermissionMode(m string) string {
 	case msg.PermissionModeAuto:
 		return "auto"
 	case msg.PermissionModeBypass:
+		return "bypassPermissions"
+	case msg.PermissionModePlan:
+		// CC native plan mode — filters CC's tool surface to planning
+		// tools, prevents CC from spawning shell/edit calls in the first
+		// place. The bridge prehook adds a second-line whitelist check.
+		return "plan"
+	case msg.PermissionModeBlockAll,
+		msg.PermissionModeRead,
+		msg.PermissionModeAskAll,
+		msg.PermissionModeCustom:
+		// All bridge-side gating modes. Run CC as `bypassPermissions` so
+		// CC never short-circuits with its own prompts — the prehook's
+		// allow/deny is the sole gate. Block All denies everything,
+		// Read denies writes, Ask All parks every call, Custom runs
+		// permission-store rules.
 		return "bypassPermissions"
 	}
 	return m
