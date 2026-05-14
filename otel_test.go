@@ -36,6 +36,9 @@ func TestOTelReceiver_APIRequestTranslation(t *testing.T) {
 	recv.Start()
 	defer recv.Stop(context.Background())
 
+	// Mix bare-number and quoted-string intValue forms in the same payload
+	// — the Node OTel SDK (what Claude Code ships) emits bare numbers,
+	// while OTLP/JSON spec defines quoted strings. Both must decode.
 	payload := `{
 		"resourceLogs": [{
 			"scopeLogs": [{
@@ -44,11 +47,11 @@ func TestOTelReceiver_APIRequestTranslation(t *testing.T) {
 					"body": {"stringValue": "claude_code.api_request"},
 					"attributes": [
 						{"key": "event.name",           "value": {"stringValue": "api_request"}},
-						{"key": "event.sequence",      "value": {"intValue": "2"}},
+						{"key": "event.sequence",      "value": {"intValue": 2}},
 						{"key": "model",                "value": {"stringValue": "claude-opus-4-7"}},
-						{"key": "input_tokens",        "value": {"intValue": "6"}},
-						{"key": "output_tokens",       "value": {"intValue": "6"}},
-						{"key": "cache_read_tokens",   "value": {"intValue": "17913"}},
+						{"key": "input_tokens",        "value": {"intValue": 6}},
+						{"key": "output_tokens",       "value": {"intValue": 6}},
+						{"key": "cache_read_tokens",   "value": {"intValue": 17913}},
 						{"key": "cache_creation_tokens","value": {"intValue": "9268"}},
 						{"key": "cost_usd",             "value": {"doubleValue": 0.0670615}},
 						{"key": "duration_ms",          "value": {"intValue": "2829"}},

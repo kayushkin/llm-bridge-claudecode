@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -112,9 +113,40 @@ type otlpLogRecord struct {
 
 type otlpAnyValue struct {
 	StringValue *string  `json:"stringValue,omitempty"`
-	IntValue    *string  `json:"intValue,omitempty"` // OTLP/JSON encodes int64 as string
+	// IntValue is int64. The OTLP/JSON spec encodes it as a quoted string
+	// (to avoid JS Number precision loss for >2^53 values), but the Node
+	// OTel SDK that ships with Claude Code emits a bare JSON number.
+	// otlpInt handles both forms via custom UnmarshalJSON.
+	IntValue    *otlpInt `json:"intValue,omitempty"`
 	DoubleValue *float64 `json:"doubleValue,omitempty"`
 	BoolValue   *bool    `json:"boolValue,omitempty"`
+}
+
+// otlpInt accepts either a quoted-string-encoded int64 (OTLP/JSON spec)
+// or a bare JSON number (what Node's OTel SDK actually emits). Without
+// this, the receiver fails to decode real payloads from Claude Code.
+type otlpInt int64
+
+func (o *otlpInt) UnmarshalJSON(b []byte) error {
+	b = bytes.TrimSpace(b)
+	if len(b) > 0 && b[0] == '"' {
+		var s string
+		if err := json.Unmarshal(b, &s); err != nil {
+			return err
+		}
+		v, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			return fmt.Errorf("otlpInt: parse quoted %q: %w", s, err)
+		}
+		*o = otlpInt(v)
+		return nil
+	}
+	var v int64
+	if err := json.Unmarshal(b, &v); err != nil {
+		return fmt.Errorf("otlpInt: parse bare number %q: %w", b, err)
+	}
+	*o = otlpInt(v)
+	return nil
 }
 
 type otlpKeyValue struct {
@@ -254,7 +286,7 @@ func flattenAttrs(kvs []otlpKeyValue) map[string]string {
 		case kv.Value.StringValue != nil:
 			out[kv.Key] = *kv.Value.StringValue
 		case kv.Value.IntValue != nil:
-			out[kv.Key] = *kv.Value.IntValue
+			out[kv.Key] = strconv.FormatInt(int64(*kv.Value.IntValue), 10)
 		case kv.Value.DoubleValue != nil:
 			out[kv.Key] = strconv.FormatFloat(*kv.Value.DoubleValue, 'f', -1, 64)
 		case kv.Value.BoolValue != nil:
