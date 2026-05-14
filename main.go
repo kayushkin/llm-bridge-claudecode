@@ -68,6 +68,15 @@ func main() {
 		return
 	}
 
+	// OTel-sidecar mode. PTY sessions exec straight into claude with no Go
+	// process left to host an in-process OTLP receiver. bridge-server
+	// spawns this sidecar before launching the PTY child so claude's
+	// telemetry has somewhere to land. See sidecar.go.
+	if len(os.Args) > 1 && os.Args[1] == "-otel-sidecar" {
+		runOTelSidecar()
+		return
+	}
+
 	if len(os.Args) > 1 && os.Args[1] == "-discover" {
 		project := ""
 		if len(os.Args) > 2 {
