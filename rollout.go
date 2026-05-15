@@ -245,9 +245,11 @@ func translateRolloutEntry(stored ccStoredEvent) []msg.Event {
 			}
 		}
 	case "assistant":
+		var finalText strings.Builder
 		for i, b := range message.Content {
 			switch b.Type {
 			case "text":
+				finalText.WriteString(b.Text)
 				if b.Text == "" {
 					continue
 				}
@@ -295,6 +297,37 @@ func translateRolloutEntry(stored ccStoredEvent) []msg.Event {
 				})
 			}
 		}
+
+		// Synthesize the per-turn EventResult terminator. bridge-server's
+		// derivation pipeline keys off EventResult for UsageTotal,
+		// TurnComplete, and the turn→idle SessionState transition; without
+		// it PTY turns never close. An assistant message with
+		// stop_reason=tool_use is NOT terminal — the model wants a tool
+		// and the turn continues with a tool_result + another assistant
+		// message. Only end_turn / stop_sequence / max_tokens end the turn.
+		//
+		// Usage here is the final API call's only (CC writes per-call
+		// usage on each assistant entry, not a turn cumulative), so it
+		// under-counts multi-roundtrip turns. That's acceptable: the
+		// canonical cost signal for PTY is OTel api_call / api_spend_total;
+		// this EventResult exists to drive the state machine, not billing.
+		if isTerminalStopReason(message.StopReason) {
+			out = append(out, msg.Event{
+				Type:             msg.EventResult,
+				HarnessSessionID: stored.SessionID,
+				HarnessMessageID: stored.UUID,
+				Timestamp:        ts,
+				Result: &msg.ResultEvent{
+					Text:  finalText.String(),
+					Model: message.Model,
+					Usage: msg.TokenUsage{
+						InputTokens:  message.Usage.InputTokens,
+						OutputTokens: message.Usage.OutputTokens,
+						TotalTokens:  message.Usage.InputTokens + message.Usage.OutputTokens,
+					},
+				},
+			})
+		}
 	}
 
 	for i := range out {
@@ -305,4 +338,18 @@ func translateRolloutEntry(stored ccStoredEvent) []msg.Event {
 	}
 
 	return out
+}
+
+// isTerminalStopReason reports whether an assistant message's stop_reason
+// ends the turn. tool_use means the model wants a tool and the turn
+// continues (tool_result → another assistant message); the empty string
+// is treated as non-terminal (defensive — shouldn't appear on a
+// finalized rollout entry).
+func isTerminalStopReason(sr string) bool {
+	switch sr {
+	case "end_turn", "stop_sequence", "max_tokens":
+		return true
+	default:
+		return false
+	}
 }

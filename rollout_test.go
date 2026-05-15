@@ -182,6 +182,102 @@ func TestTranslateRolloutEntry_UnknownTypeSkipped(t *testing.T) {
 	}
 }
 
+func TestTranslateRolloutEntry_TerminalStopReasonSynthesizesResult(t *testing.T) {
+	// Assistant turn that ends normally: blocks first, then a
+	// synthesized EventResult so bridge-server's derivation closes the
+	// turn (UsageTotal / TurnComplete / state→idle).
+	stored := storedFrom(t, `{
+		"type": "assistant",
+		"uuid": "msg_done",
+		"sessionId": "sess-ddd",
+		"timestamp": "2026-05-15T10:00:00Z",
+		"message": {
+			"role": "assistant",
+			"model": "claude-opus-4-7",
+			"content": [{"type": "text", "text": "All done."}],
+			"usage": {"input_tokens": 120, "output_tokens": 8},
+			"stop_reason": "end_turn"
+		}
+	}`)
+	out := translateRolloutEntry(stored)
+	if len(out) != 2 {
+		t.Fatalf("expected block + result, got %d events", len(out))
+	}
+	if out[0].Type != msg.EventBlock {
+		t.Errorf("out[0] = %q; want block", out[0].Type)
+	}
+	res := out[1]
+	if res.Type != msg.EventResult || res.Result == nil {
+		t.Fatalf("out[1] = %q / %+v; want result", res.Type, res.Result)
+	}
+	if res.Result.Text != "All done." {
+		t.Errorf("result text = %q", res.Result.Text)
+	}
+	if res.Result.Model != "claude-opus-4-7" {
+		t.Errorf("result model = %q", res.Result.Model)
+	}
+	if res.Result.Usage.InputTokens != 120 || res.Result.Usage.OutputTokens != 8 ||
+		res.Result.Usage.TotalTokens != 128 {
+		t.Errorf("result usage = %+v; want in=120 out=8 total=128", res.Result.Usage)
+	}
+	if string(res.Extensions["source"]) != `"rollout"` {
+		t.Errorf("result missing rollout source tag")
+	}
+}
+
+func TestTranslateRolloutEntry_ToolUseStopReasonNoResult(t *testing.T) {
+	// stop_reason=tool_use → the turn continues; do NOT synthesize an
+	// EventResult or bridge-server would close the turn prematurely
+	// (state flips to idle while the tool is still running).
+	stored := storedFrom(t, `{
+		"type": "assistant",
+		"uuid": "msg_mid",
+		"timestamp": "2026-05-15T10:00:01Z",
+		"message": {
+			"role": "assistant",
+			"content": [{"type": "tool_use", "id": "toolu_z", "name": "Bash", "input": {"cmd": "ls"}}],
+			"usage": {"input_tokens": 50, "output_tokens": 12},
+			"stop_reason": "tool_use"
+		}
+	}`)
+	out := translateRolloutEntry(stored)
+	if len(out) != 1 {
+		t.Fatalf("expected only the tool_call, got %d events", len(out))
+	}
+	if out[0].Type != msg.EventToolCall {
+		t.Errorf("out[0] = %q; want tool_call", out[0].Type)
+	}
+	for _, ev := range out {
+		if ev.Type == msg.EventResult {
+			t.Error("tool_use turn must not synthesize an EventResult")
+		}
+	}
+}
+
+func TestTranslateRolloutEntry_MaxTokensIsTerminal(t *testing.T) {
+	stored := storedFrom(t, `{
+		"type": "assistant",
+		"uuid": "msg_trunc",
+		"timestamp": "2026-05-15T10:00:02Z",
+		"message": {
+			"role": "assistant",
+			"content": [{"type": "text", "text": "partial..."}],
+			"usage": {"input_tokens": 9000, "output_tokens": 4096},
+			"stop_reason": "max_tokens"
+		}
+	}`)
+	out := translateRolloutEntry(stored)
+	var sawResult bool
+	for _, ev := range out {
+		if ev.Type == msg.EventResult {
+			sawResult = true
+		}
+	}
+	if !sawResult {
+		t.Error("max_tokens should synthesize a terminal EventResult")
+	}
+}
+
 func TestTranslateRolloutEntry_ToolUseEmptyInputDefaultsToObject(t *testing.T) {
 	// CC may emit tool_use with no input (zero-arg tools). The
 	// translator stamps "{}" so downstream ToolCallEvent.Input remains

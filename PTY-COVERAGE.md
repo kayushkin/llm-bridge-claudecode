@@ -21,7 +21,7 @@ Sources for PTY:
 | `EventBlock` thinking → `EventThinking`   | ✅ rollout                                       | Mapped to `EventThinking`.                                                           |
 | `EventToolCall`                           | ✅ rollout (full args) + OTel (name+decision)    | Rollout gives args; OTel gives accept/deny decision.                                 |
 | `EventToolResult`                         | ✅ rollout (full output) + OTel (success flag)   | Rollout pairs ToolID; OTel doesn't, so OTel rows render standalone.                  |
-| `EventResult` terminal (per turn)         | **gap**                                         | Could synthesize from rollout `stop_reason: end_turn` — follow-up.                   |
+| `EventResult` terminal (per turn)         | ✅ rollout (synthesized)                         | Emitted when assistant `stop_reason` ∈ end_turn/stop_sequence/max_tokens.            |
 | `EventError`                              | ✅ OTel `internal_error`                         | Plus EventError from any `claude_code.api_error` (would need translator extension).  |
 | `user_message`                            | ✅ rollout + OTel `user_prompt`                  | Both fire; overlap is the dedup target.                                              |
 | Per-API-call usage (auxiliary calls!)     | ✅ OTel `api_call` + derived `api_spend_total`   | TUI **surfaces more** than `-p` here — auxiliary calls are visible.                  |
@@ -29,11 +29,13 @@ Sources for PTY:
 
 ## Known gaps after this round
 
-1. **No `EventResult` per turn.** bridge-server's derivation pipeline keys
-   off `EventResult` for `UsageTotal` + `TurnComplete` + state-machine
-   transitions. PTY turns won't close cleanly without one. Fix:
-   synthesize from rollout assistant entries whose `stop_reason` is
-   `end_turn` / `stop_sequence` / `max_tokens`.
+1. ~~No `EventResult` per turn.~~ **Closed.** translateRolloutEntry
+   synthesizes an `EventResult` after the block events when the
+   assistant message's `stop_reason` is terminal (end_turn /
+   stop_sequence / max_tokens). Usage is the final API call's only
+   (under-counts multi-roundtrip turns) — acceptable since OTel
+   api_spend_total is the canonical PTY cost signal; this exists to
+   drive the derivation state machine.
 2. **No session `init` info.** Rollout's first entry is metadata
    (working dir, model, tools, MCP servers). Translator should
    recognize it and emit `EventSessionInfo`.
