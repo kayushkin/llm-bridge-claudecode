@@ -7,7 +7,7 @@
 ## Design Goals
 
 1. **Pure pass-through** - No formatting, truncation, or transformation of content. Tool outputs, text, and thinking blocks are forwarded exactly as Claude Code emits them.
-2. **Stateless between turns** - All session state lives in Claude Code's own session history and in llm-bridge's SQLite store. This binary holds no persistent state.
+2. **No content persistence** - Conversation *content* lives in Claude Code's own rollout files and in llm-bridge's store. This binary persists only the session-id chain + message-id identity map in a small local `state.db` (see AD-3); it holds no message bodies.
 3. **Single responsibility** - Manage one Claude Code process, translate events, forward messages. Nothing else.
 4. **Crash-safe** - If this process dies, llm-bridge can re-spawn it and resume via `--resume`.
 
@@ -49,11 +49,30 @@
 - Clean process tree (llm-bridge -> llm-bridge-claudecode -> claude)
 - ~15MB Go overhead per instance is negligible vs. CC's ~100MB Node.js
 
-### AD-3: No Internal Session Tracking
+### AD-3: Local `state.db` for the session-id chain (no content)
 
-**Decision**: Do not maintain a sessions map or persist sessions to disk.
+**Decision**: Keep a small local SQLite `state.db` that tracks the
+`bridge_session_id ↔ harness_session_id` chain (sessions / rollouts / WAL) and
+the harness→canonical message-id identity map. Do **not** store conversation
+*content* — that still lives in llm-bridge and in Claude Code's own rollout
+files.
 
-**Rationale**: llm-bridge handles session persistence in SQLite. Claude Code maintains its own session history. This binary just holds a reference to the running `exec.Cmd` and its stdin/stdout pipes.
+**Rationale**: Resumes and forks rotate the Claude Code session UUID, and
+bridge-server needs a stable `bridge_session_id` to map them back to one
+logical conversation. The harness is the only component that sees CC's
+`system:init` UUID, so it owns the chain. A write-ahead-log row is opened
+before spawn and committed once init delivers the new UUID, making chain
+rotation crash-safe (orphaned WAL rows are reclaimed on boot — see
+`recoverOrphansOnBoot`). The identity map lets the harness pre-stamp
+`Event.MessageID` so bridge-server no longer owns assistant-id assignment
+(Phase III.B). `state.db` lives at
+`~/.local/share/llm-bridge-claudecode/state.db`; the pool is pinned to a
+single connection (modernc sqlite leaks `SQLITE_BUSY` under concurrent writers
+even with WAL + busy_timeout). See `state.go` and `identity_store.go`.
+
+> This supersedes the original "no internal session tracking" design: the
+> binary still holds the running `exec.Cmd` + pipes for the live turn, but it
+> is no longer stateless across restarts.
 
 ### AD-4: Forward Raw Events
 
@@ -74,6 +93,14 @@
 This is more reliable than summing ourselves. We still track per-assistant-event usage for the `api_call_usages` array.
 
 ## Data Flow
+
+> **Diagram note.** The sequence diagrams below are schematic and predate two
+> changes: (1) the harness no longer emits `state(running)`/`state(idle)` —
+> bridge-server derives session state centrally from the init/result/error
+> stream, so read those `state(...)` arrows as "bridge-server infers this
+> transition," not as events on the wire; and (2) the spawn line shows
+> `--dangerously-skip-perms`, but the harness actually spawns with
+> `--permission-mode bypassPermissions` and relies on the PreToolUse hook.
 
 ### Happy Path: Start -> Multi-turn -> Complete
 
@@ -165,79 +192,141 @@ llm-bridge                    llm-bridge-claudecode              claude CLI
 
 ```go
 func main() {
+    // 1. Mode/subcommand selection (mutually exclusive, checked first):
+    //    -version            → print version, exit
+    //    LLMBRIDGE_PTY_MODE=1 → execClaudePTY(): syscall.Exec into `claude`, no flags
+    //    -otel-sidecar       → runOTelSidecar() (PTY telemetry + rollout tailer)
+    //    -discover [project]  → discoverSessions(), print JSON, exit
+    //    -import-history ...  → importHistory(), print NDJSON, exit
+
+    // 2. JSON-RPC harness mode (the default):
     cfg := loadConfig()
-    
-    // Read JSON-RPC requests from llm-bridge on our stdin
-    scanner := bufio.Scanner(os.Stdin)
-    for scanner.Scan() {
-        req := parseRequest(scanner.Bytes())
-        handleRequest(cfg, req)
+    h := NewHarness(cfg)
+    if err := h.openStateAndRecover(); err != nil { // open state.db, reclaim orphan WAL rows
+        log.Fatalf(...)
     }
-    // stdin closed = llm-bridge done with us
-    cleanup()
+    // SIGINT → h.Interrupt(); SIGTERM → h.Shutdown()
+
+    scanner := bufio.NewScanner(os.Stdin) // 10MB max line
+    for scanner.Scan() {
+        req := parse(scanner.Bytes())
+        // set_model / control / config:* run on their own goroutine so a
+        // long streaming turn can't starve mid-session control.
+        if isAsync(req.Method) { go h.HandleRequest(req); continue }
+        h.HandleRequest(req)
+    }
+    h.Shutdown() // stdin closed = llm-bridge done with us
 }
 ```
 
-- Parse environment config
-- Enter blocking stdin read loop (reads from llm-bridge)
-- Dispatch to handler based on `method`
-- Clean up Claude Code process on exit
+- Select mode: PTY exec / OTel sidecar / one-shot subcommand / JSON-RPC loop
+- In JSON-RPC mode: load config, build the `Harness`, open `state.db` and
+  recover orphaned WAL rows from a prior crash (fatal on failure)
+- Enter the blocking stdin read loop; dispatch via `h.HandleRequest`, running
+  async methods on a goroutine so they don't block a streaming turn
+- Interrupt on SIGINT, clean shutdown (interrupt CC, close `state.db`) on
+  SIGTERM or stdin EOF
 
-### `handler.go` - Request Handlers
+### `handler.go` - Harness + Request Handlers
+
+All handlers are methods on `*Harness`, which owns the live `*CCProcess`, the
+shared event channel, the `*State` (state.db), the `*identity.Tracker`, the
+`UsageAggregator`, and the persisted-across-respawn fields (workDir,
+permission config, system prompts).
 
 ```go
-func handleStart(cfg *Config, params StartParams) error
-func handleMessage(cfg *Config, params MessageParams) error
-func handleCompact(cfg *Config, params CompactParams) error
-func handleResume(cfg *Config, params ResumeParams) error
+type Harness struct { /* cfg, proc, events, state, tracker, agg, ... */ }
+
+func NewHarness(cfg *Config) *Harness
+func (h *Harness) openStateAndRecover() error   // open state.db, reclaim orphan WAL
+func (h *Harness) HandleRequest(req Request) error // dispatch on req.Method
+func (h *Harness) handleStart(params StartParams) error
+func (h *Harness) handleMessage(params MessageParams) error
+func (h *Harness) handleCompact(params CompactParams) error
+func (h *Harness) handleResume() error
+func (h *Harness) handleSetModel(params SetModelParams) error
+func (h *Harness) handleControl(params ControlParams) error
+func (h *Harness) handleConfig(raw json.RawMessage) error // "config:<json>" route
+func (h *Harness) Interrupt()
+func (h *Harness) Shutdown()
 ```
 
-- `handleStart`: Spawns Claude Code process, writes initial user message to CC stdin
-- `handleMessage`: Writes user message JSON to existing CC stdin pipe
-- `handleCompact`: Emits system event (CC handles compaction internally)
-- `handleResume`: Spawns new CC process with `--resume` (only if process died)
+- `handleStart`: Builds the CC flag list from `StartParams`, stages the chain
+  rotation in `state.db` (cold-start/fork open a WAL row; resume stages intent
+  only), starts the OTel receiver, spawns CC, then writes the initial user
+  message (text `Prompt` or multimodal `Blocks` — mutually exclusive)
+- `handleMessage`: Writes a user message to the live CC stdin; if the process
+  died, transparently respawns via `handleStart{Resume:true}`
+- `handleCompact`: Emits a `compact_ack` system event (CC compacts internally)
+- `handleResume`: Respawns with `--resume` only if the process isn't alive,
+  recovering the harness UUID from `state.db` if it was lost
+- `handleSetModel` / `handleControl` / `handleConfig`: Forward a
+  `control_request` to CC stdin (no respawn). `handleConfig` inspects the
+  payload `subtype` and routes to `set_model` / `interrupt` / generic control
+- `recordChainOnInit` (called from `drainUntilResult` on CC's `system:init`):
+  commits the pending WAL + writes the rollout row, or bumps the resume
+  timestamp; also emits an `EventSessionInfo` carrying the init metadata +
+  persisted system prompts
 
 ### `process.go` - Claude Code Process Management
 
 ```go
 type CCProcess struct {
-    cmd    *exec.Cmd
-    stdin  io.WriteCloser  // write user messages + control_requests
-    stdout io.ReadCloser   // read stream-json events
-    mu     sync.Mutex      // guards stdin writes
+    cmd       *exec.Cmd
+    stdin     io.WriteCloser  // write user messages + control_requests
+    stdout    io.ReadCloser   // read stream-json events
+    mu        sync.Mutex      // guards stdin writes
+    sessionID string
+    done      chan struct{}   // closed when process exits
+    err       error           // exit error, set before done closes
+    otelRecv  *OTelReceiver   // per-process OTLP receiver; shut down after exit
 }
 
-func spawnClaudeCode(cfg *Config, sessionID string, args ...string) (*CCProcess, error)
+func spawnClaudeCode(cfg *Config, sessionID string, allowedTools []string, otelRecv *OTelReceiver, extraArgs ...string) (*CCProcess, error)
 func (p *CCProcess) WriteMessage(content string) error                       // text-only user message
 func (p *CCProcess) WriteMessageBlocks(blocks []msg.ContentBlock) error      // multimodal user message
-func (p *CCProcess) WriteInterrupt(requestID string) error                   // control_request
+func (p *CCProcess) WriteInterrupt(requestID string) error                   // control_request: interrupt
+func (p *CCProcess) WriteControl(requestID, subtype string, payload map[string]any) error // generic control_request
 func (p *CCProcess) ReadEvents(ctx context.Context) <-chan json.RawMessage
+func (p *CCProcess) Done() <-chan struct{}
+func (p *CCProcess) Err() error
+func (p *CCProcess) Alive() bool
 func (p *CCProcess) Kill() error
 ```
 
-- Spawn `exec.Command` for Claude Code with stream-json flags
-- Pipe stdin for writing, stdout for reading
-- Mutex-protected writes (message and interrupt can race)
-- ReadEvents returns a channel of raw JSON lines from CC stdout
-- No `CommandContext` - process outlives individual turns
+- Spawn `exec.Command` for Claude Code with the always-on stream-json flags
+  (`-p --input-format stream-json --output-format stream-json --verbose`),
+  `--allowed-tools` when non-empty, then the caller's `extraArgs`
+- Wire the OTel receiver's endpoint into CC's env (`otelRecv.Env()`); the exit
+  goroutine drains and shuts the receiver down ~2s after CC exits
+- Pipe stdin for writing, stdout for reading; forward CC stderr to ours
+- Mutex-protected writes (message and control can race)
+- `ReadEvents` returns a channel of raw JSON lines from CC stdout
+- No `CommandContext` — process outlives individual turns; lifecycle is
+  tracked via `done`/`err`/`Alive()`
 
 ### `translate.go` - Event Translation
 
 ```go
-func translateEvent(raw json.RawMessage, sessionID string, agg *UsageAggregator) []msg.Event
+func translateEvent(raw json.RawMessage, sessionID string, agg *UsageAggregator, tracker *identity.Tracker) []msg.Event
 ```
 
 Single entry point that inspects the `type` field and dispatches:
 
 | CC type | Handler |
 |---------|---------|
-| `system` | `translateSystemEvent` - maps subtype to canonical system event |
-| `assistant` | `translateAssistantEvent` - iterates content blocks, emits stream/tool/thinking |
-| `result` | `translateResultEvent` - extracts usage/cost, emits result + state |
-| `rate_limit_event` | `translateRateLimitEvent` - emits as system event |
+| `system` | `translateSystem` - maps subtype to canonical event (init/api_retry/task_*/etc → `system`; `hook_*` → `hook`) |
+| `assistant` | `translateAssistant` - iterates content blocks, emits stream/tool/thinking; pre-stamps `Event.MessageID` via the tracker |
+| `result` | `translateResult` - extracts usage/cost, emits `result` (no session_state) |
+| `rate_limit_event` | `translateRateLimit` - emits as `system` event |
+| `user` | consumed internally (echo of synthetic interrupt message) |
 | `control_response` | consumed internally, not forwarded |
 | `keep_alive` | consumed internally, not forwarded |
-| `tool_progress` | `translateToolProgress` - emits as system event |
+| `tool_progress` | `translateToolProgress` - emits as `system` event |
+| *(unknown)* | forwarded as a `system` event for visibility |
+
+Session state is **not** emitted — bridge-server derives it centrally from
+the init / result / error stream.
 
 One CC event may produce multiple canonical events (e.g., an `assistant` with text + tool_use blocks produces both a `stream` and a `tool_call` event).
 
@@ -249,13 +338,16 @@ type UsageAggregator struct {
     toolCalls int
 }
 
-func (a *UsageAggregator) AddAPICall(usage json.RawMessage)
+func (a *UsageAggregator) AddAPICall(usage ccAssistantUsage)
 func (a *UsageAggregator) AddToolCall()
-func (a *UsageAggregator) Finalize(resultEvent json.RawMessage) (msg.TokenUsage, *msg.Cost)
+func (a *UsageAggregator) Finalize(raw json.RawMessage) (msg.TokenUsage, *msg.Cost)
+func (a *UsageAggregator) APICallUsages() []msg.TokenUsage
+func (a *UsageAggregator) ToolCalls() int
+func (a *UsageAggregator) Reset()
 ```
 
-- `AddAPICall`: Extracts token counts from assistant event usage
-- `Finalize`: Uses result event's aggregate `usage`, `modelUsage`, and `total_cost_usd` as source of truth. Attaches per-call breakdown from `calls`.
+- `AddAPICall`: Accumulates per-API-call token counts from assistant event usage
+- `Finalize`: Uses the result event's aggregate `usage`, `modelUsage`, and `total_cost_usd` as source of truth. Attaches the per-call breakdown from `calls`.
 
 ### `config.go` - Configuration
 
@@ -272,6 +364,57 @@ func loadConfig() *Config
 
 Reads from environment variables. No flags, no config files.
 
+### `state.go` - Session-id chain (state.db)
+
+SQLite store of the `bridge_session_id ↔ harness_session_id` chain. Three
+tables: `sessions` (current harness UUID per bridge id), `rollouts` (one row
+per CC session UUID in the chain, with `sequence` / `parent_harness_id` /
+`kind` ∈ start|resume|fork), and `wal` (pending chain mutations). Opened once
+at boot via `OpenState(DefaultStatePath())`; the pool is pinned to a single
+connection (modernc sqlite leaks `SQLITE_BUSY` under concurrent writers). Path:
+`~/.local/share/llm-bridge-claudecode/state.db`.
+
+### `identity_store.go` - Message-id identity map
+
+Bridges `*State` to `identity.Store` so an `identity.Tracker` can map CC's
+per-message ids to canonical `msg_<ulid>` ids. Lets the harness pre-stamp
+`Event.MessageID` (Phase III.B) instead of bridge-server assigning it.
+
+### `otel.go` - In-process OTLP receiver
+
+`OTelReceiver` is an OTLP/HTTP-JSON listener on `127.0.0.1:<random>`. CC exports
+to it via `OTEL_EXPORTER_OTLP_ENDPOINT` (`Env()`); it translates `/v1/logs` and
+`/v1/metrics` records into `EventAPICall` (and related) events handed to the
+harness `emit` callback. One receiver per CC process — cross-session
+correlation is impossible by construction. Always on, because it surfaces
+auxiliary API calls (session-title, prompt-suggestion) that stream-json hides.
+
+### `sidecar.go` - PTY-mode OTel sidecar (`-otel-sidecar`)
+
+Standalone process bridge-server spawns *alongside* a PTY-mode `claude` (which
+has no Go host process). Starts an `OTelReceiver` + a rollout tailer, prints the
+receiver URL on stdout line 1 (for the PTY child's
+`OTEL_EXPORTER_OTLP_ENDPOINT`), and POSTs each translated event to
+`<LLMBRIDGE_BRIDGE_SERVER_URL>/sidecar/event/<bridge_id>`. Exits on stdin close
+or SIGTERM after a short OTel flush window.
+
+### `rollout.go` - PTY-mode content tailer
+
+Tails CC's per-session JSONL rollout under
+`~/.claude/projects/<encoded(cwd)>/<uuid>.jsonl` and emits granular content
+events (user/assistant text, thinking, tool args + outputs) tagged
+`Extensions["source"]="rollout"`. This is the only content source for PTY
+sessions — OTel carries metadata only. See `PTY-COVERAGE.md` for the full
+coverage matrix versus stream-json mode.
+
+### `discover.go` / `import_history.go` - Out-of-band subcommands
+
+- `discover.go` (`-discover [project]`): lists one `msg.StoredSession` per
+  `bridge_session_id` in `state.db`. On-disk rollout files not yet in the chain
+  are cold-imported as synthetic single-rollout sessions (idempotent).
+- `import_history.go` (`-import-history <id> [path]`): reads a CC session
+  `.jsonl` and replays it as translated `msg.Event` NDJSON on stdout.
+
 ## Claude Code CLI Flags
 
 ### Always used
@@ -281,9 +424,13 @@ claude \
   -p \                                   # Print mode (non-interactive)
   --input-format stream-json \           # Bidirectional stdin messaging
   --output-format stream-json \          # NDJSON streaming output
-  --verbose \                            # Include system events
-  --dangerously-skip-permissions         # No interactive approval prompts
+  --verbose                              # Include system events
 ```
+
+`--allowed-tools <t...>` is also appended at spawn whenever the caller passed a
+non-empty allowlist. Permission gating is **not** `--dangerously-skip-permissions`;
+it defaults to `--permission-mode bypassPermissions` plus the bridge-server
+PreToolUse hook (see *Permission-prompt flow* below).
 
 ### Conditional flags
 
@@ -353,21 +500,27 @@ Modes / observability:
 Interactive-only flags have no role in a headless subprocess:
 
 - `--ide`, `--tmux`, `--chrome` / `--no-chrome`
-- `--allow-dangerously-skip-permissions` (we pass `--dangerously-skip-permissions` directly when needed)
+- `--dangerously-skip-permissions` / `--allow-dangerously-skip-permissions` (permission gating is the PreToolUse hook + `--permission-mode bypassPermissions`)
 - `--remote-control-session-name-prefix` (niche remote-control feature)
 - `--mcp-debug` (deprecated; use `--debug`)
 
 ### Mid-session control_request subtypes
 
-The harness exposes additional JSON-RPC methods that forward to CC's stream-json `control_request` channel on stdin:
+These forward to CC's stream-json `control_request` channel on stdin. Only
+`set_model`, `control`, and `config:<json>` are dispatched JSON-RPC *methods*
+(see `HandleRequest` in `handler.go`); `set_permission_mode` and `interrupt`
+have **no** dedicated method — they ride the generic `control` / `config:`
+route by `subtype`.
 
 | Method | control_request subtype | Params | Purpose |
 |---|---|---|---|
 | `set_model` | `set_model` | `{model}` | Change model mid-session |
-| `set_permission_mode` | `set_permission_mode` | `{mode}` | Change permission mode mid-session |
-| `control` | caller-supplied | `{subtype, payload}` | Generic pass-through for new CC subtypes |
-| `config:<json>` | derived from `subtype` field | JSON in method tail | Used by bridge-server's `handleConfigSession` route |
-`interrupt` is routed via SIGINT from the bridge-server (see `Harness.Interrupt`); the others require a live CC process.
+| `control` | caller-supplied | `{subtype, payload}` | Generic pass-through (e.g. `set_permission_mode`, or any new CC subtype) |
+| `config:<json>` | derived from `subtype` field | JSON in method tail | Used by bridge-server's `handleConfigSession` route; dispatches `set_model` / `interrupt` / generic control |
+
+`interrupt` is routed either via `config:` with `subtype:"interrupt"` or via a
+process SIGINT from bridge-server (see `Harness.Interrupt`); the control
+subtypes require a live CC process.
 
 ### Permission-prompt flow
 
@@ -394,9 +547,10 @@ The harness no longer ships a `bridge_perm` MCP, no longer takes a `resolve_hook
 ### Claude Code Process Death
 
 If the Claude Code process exits unexpectedly:
-- Emit `error` event with exit code info
-- Emit `session_state` (error)
-- On next `message` or `resume` request, respawn with `--resume`
+- Emit an `error` event (`PROCESS_DIED`, or `SPAWN_ERROR` if it never started) with exit info
+- Orphan any pending WAL chain row so it doesn't shadow the next start
+- (bridge-server derives the `error` session state centrally — the harness emits no `session_state`)
+- On the next `message` or `resume` request, respawn with `--resume`
 
 ### Interrupt Response
 
@@ -425,9 +579,15 @@ When llm-bridge closes our stdin:
 
 ### Unit Tests
 
-- `translate_test.go` - Test each CC event type maps to correct canonical events
-- `usage_test.go` - Test aggregation with real CC output samples
-- `config_test.go` - Test env var parsing with defaults
+- `translate_test.go` - Each CC event type maps to the correct canonical events
+- `handler_chain_test.go` - state.db chain rotation (start / resume / fork, WAL commit + orphan recovery)
+- `handler_blocks_test.go` / `process_blocks_test.go` - multimodal `Blocks` validation + wire translation
+- `otel_test.go` - OTLP record → `EventAPICall` translation (incl. bare-number `intValue`)
+- `rollout_test.go` - rollout JSONL → granular content events; terminal `EventResult` synthesis
+- `state_test.go` - state.db storage layer (sessions / rollouts / WAL)
+- `discover_test.go` - session discovery + cold import
+
+There is no `usage_test.go` / `config_test.go`.
 
 ### Integration Tests
 
@@ -455,4 +615,11 @@ done
 ## Dependencies
 
 - `github.com/kayushkin/llm-bridge/msg` - Canonical event types
-- Standard library only for everything else
+- `github.com/kayushkin/llm-bridge/identity` - Message-id `Tracker` / `Store`
+- `modernc.org/sqlite` - Pure-Go SQLite driver for `state.db` (no cgo)
+- `github.com/oklog/ulid/v2` - ULID minting for canonical message ids
+- Standard library for everything else (the OTLP receiver is hand-rolled on
+  `net/http` + `encoding/json` — no OpenTelemetry SDK dependency)
+
+> `go.mod` carries `replace github.com/kayushkin/llm-bridge => ../llm-bridge`
+> for local development; see the README's *OSS publish blockers* section.

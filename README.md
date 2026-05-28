@@ -8,7 +8,7 @@ Claude Code harness subprocess for [llm-bridge](https://github.com/kayushkin/llm
 
 llm-bridge spawns `llm-bridge-claudecode` as a child process. Communication is bidirectional over stdio:
 
-- **stdin** - llm-bridge sends JSON-RPC requests (start, message, compact, resume, set_model, set_permission_mode, control, config:&lt;json&gt;)
+- **stdin** - llm-bridge sends JSON-RPC requests (start, message, compact, resume, set_model, control, config:&lt;json&gt;)
 - **stdout** - this binary emits NDJSON `msg.Event` objects (stream, tool_call, tool_result, result, etc.)
 - **signals** - llm-bridge sends SIGINT for pause/interrupt
 
@@ -29,6 +29,24 @@ llm-bridge-claudecode (this binary)
 claude --input-format stream-json --output-format stream-json
   (single long-lived process per session)
 ```
+
+### Operating Modes
+
+The binary runs in one of two modes, selected by llm-bridge-server:
+
+- **stream-json mode (default).** The flow described above: the harness spawns
+  `claude -p --input-format stream-json --output-format stream-json` and
+  translates its NDJSON output into `msg.Event`. This is what the rest of this
+  document describes unless noted otherwise.
+- **PTY mode.** When llm-bridge-server launches the harness with
+  `LLMBRIDGE_PTY_MODE=1` (inside a pseudoterminal), `main` immediately
+  `exec`s into the upstream `claude` CLI with **no flags** so the pty fd is
+  wired straight to Claude Code's native TUI. There is no JSON-RPC channel and
+  no event translation in the harness process itself. Conversation content and
+  telemetry are instead captured out-of-band by the **OTel sidecar**
+  (`-otel-sidecar`, see `sidecar.go`) and the **rollout tailer** (`rollout.go`).
+  See [PTY-COVERAGE.md](PTY-COVERAGE.md) for exactly which events each path
+  produces versus stream-json mode.
 
 ### Persistent Bidirectional Process
 
@@ -51,9 +69,9 @@ This eliminates per-turn process startup overhead and keeps the Node.js runtime 
 4. Read stream-json events from Claude Code's stdout in a goroutine
 5. Translate each event to canonical `msg.Event` and write to our stdout
 6. On `result` event, aggregate usage and emit canonical result
-7. Wait for next JSON-RPC request from llm-bridge (message, compact, set_model, set_permission_mode, control, config:&lt;json&gt;, etc.)
+7. Wait for next JSON-RPC request from llm-bridge (message, compact, resume, set_model, control, config:&lt;json&gt;)
 8. For `message` requests, write a new user message to Claude Code's stdin (no new process)
-9. For mid-session control requests (`set_model`, `set_permission_mode`, `control`, `config:<json>`), write a `control_request` JSON to Claude Code's stdin without respawning
+9. For mid-session control requests (`set_model`, `control`, `config:<json>`), write a `control_request` JSON to Claude Code's stdin without respawning. `set_model` and `control` (and `config:` requests) run on their own goroutine so they don't block the read loop while a turn is streaming (see the `asyncMethods` set in `main.go`).
 
 ### Key Responsibilities
 
@@ -65,12 +83,18 @@ This eliminates per-turn process startup overhead and keeps the Node.js runtime 
 | **Interrupt forwarding** | Send `control_request` interrupts to Claude Code's stdin |
 | **Usage aggregation** | Track per-API-call token usage across a multi-turn agentic run |
 | **Session continuity** | Support `--resume` and `--fork-session` for session management |
+| **Chain persistence** | Maintain `state.db`: the bridge↔harness session-id chain (sessions/rollouts/WAL) and the harness→canonical message-id identity map |
+| **Telemetry capture** | Run an in-process OTLP receiver so per-API-call usage/cost (including auxiliary calls hidden from stream-json) flows out as `api_call` events |
 | **Config application** | Apply model, effort, budget, and tool restrictions at session start |
 
 ### What This Binary Does NOT Do
 
-- No HTTP server (llm-bridge handles that)
-- No SQLite persistence (llm-bridge handles session storage)
+- No client-facing HTTP API (llm-bridge handles that). It *does* run a private
+  in-process OTLP receiver on `127.0.0.1:<random>` for Claude Code's telemetry
+  (`otel.go`), and the `-otel-sidecar` mode runs one standalone.
+- No session *content* storage (llm-bridge handles message history). It *does*
+  keep a small local `state.db` for the bridge↔harness session-id chain and
+  message-id identity map (`state.go`, `identity_store.go`).
 - No NATS integration (llm-bridge can optionally bridge to NATS)
 - No SSE streaming (llm-bridge handles client-facing streams)
 
@@ -78,16 +102,23 @@ This eliminates per-turn process startup overhead and keeps the Node.js runtime 
 
 ```
 llm-bridge-claudecode/
-├── main.go              # Entry point: stdin reader, dispatch loop, CLI subcommands
-├── handler.go           # JSON-RPC method handlers (start, message, compact, resume, set_model, set_permission_mode, control, config:<json>)
-├── process.go           # Claude Code subprocess: spawn, stdin writes, stdout reader
+├── main.go              # Entry point: mode select (PTY / otel-sidecar / subcommands), stdin dispatch loop
+├── handler.go           # Harness struct + JSON-RPC handlers (start, message, compact, resume, set_model, control, config:<json>)
+├── process.go           # Claude Code subprocess: spawn, stdin writes, stdout reader, OTel env wiring
 ├── translate.go         # CC stream-json event -> msg.Event translation
-├── translate_test.go    # Unit tests for translation
 ├── usage.go             # Token usage aggregation and cost calculation
-├── config.go            # Environment config and per-session overrides
-├── discover.go          # `-discover` mode: list CC sessions on disk
-├── import_history.go    # `-import-history` mode: replay a CC session as NDJSON
+├── config.go            # Environment config (CLAUDE_PATH / CLAUDE_MODEL / CLAUDE_WORKDIR / ANTHROPIC_API_KEY)
+├── state.go             # state.db: bridge_session_id <-> harness_session_id chain (sessions/rollouts/WAL)
+├── identity_store.go    # state.db-backed identity.Tracker for pre-stamping Event.MessageID
+├── otel.go              # In-process OTLP/HTTP receiver -> EventAPICall (telemetry, always on)
+├── sidecar.go           # `-otel-sidecar` mode: standalone OTLP receiver + rollout tailer for PTY sessions
+├── rollout.go           # Tails CC's per-session JSONL rollout for PTY-mode content events
+├── discover.go          # `-discover` mode: list sessions from state.db (cold-imports disk sessions)
+├── import_history.go    # `-import-history` mode: replay a CC session .jsonl as NDJSON
+├── scripts/             # smoke-telemetry.sh and other dev helpers
+├── *_test.go            # Unit tests (translate, handler chain/blocks, process blocks, otel, rollout, state)
 ├── DESIGN.md            # Design notes
+├── PTY-COVERAGE.md      # PTY-mode vs stream-json event coverage matrix
 ├── LICENSE              # Apache 2.0
 └── go.mod
 ```
@@ -102,6 +133,22 @@ All configuration comes from environment variables set by llm-bridge or the syst
 | `CLAUDE_MODEL` | *(none)* | Default model override (e.g. `claude-sonnet-4-20250514`) |
 | `CLAUDE_WORKDIR` | *(cwd)* | Working directory for Claude Code processes |
 | `ANTHROPIC_API_KEY` | *(none)* | API key (if not set, Claude Code uses its own OAuth) |
+
+`state.db` lives at `~/.local/share/llm-bridge-claudecode/state.db` (see
+`DefaultStatePath` in `state.go`).
+
+### PTY-mode environment
+
+Set by llm-bridge-server when launching the harness in PTY mode or its
+`-otel-sidecar` companion — not user-facing:
+
+| Variable | Used by | Description |
+|----------|---------|-------------|
+| `LLMBRIDGE_PTY_MODE=1` | `main` | Switches the harness into PTY mode: `exec` straight into `claude` with no flags. |
+| `LLMBRIDGE_BRIDGE_SESSION_ID` | `-otel-sidecar` | Canonical `bridge_session_id` stamped on emitted events. Required. |
+| `LLMBRIDGE_BRIDGE_SERVER_URL` | `-otel-sidecar` | Base URL the sidecar POSTs translated events to (`/sidecar/event/<id>`). Required. |
+| `LLMBRIDGE_PTY_CWD` | `-otel-sidecar` | Working dir the rollout tailer maps to `~/.claude/projects/<encoded>`. Defaults to `/`. |
+| `LLMBRIDGE_PTY_RESUME_ID` | `-otel-sidecar` | Harness UUID to short-circuit the rollout file lookup on resume. |
 
 ## JSON-RPC Protocol (stdin from llm-bridge)
 
@@ -164,20 +211,28 @@ Context compaction happens automatically within Claude Code when needed. This em
 
 If the Claude Code process was killed (e.g. after SIGTERM), spawns a new process with `--resume <session_id>`.
 
-### `set_model` / `set_permission_mode` / `control` / `config:<json>` - Mid-session control
+### `set_model` / `control` / `config:<json>` - Mid-session control
 
-These methods all surface as a `control_request` written to Claude Code's stdin without respawning the process (see the *Claude Code stdin Protocol* section below). The JSON-RPC payloads:
+These methods surface as a `control_request` written to Claude Code's stdin without respawning the process (see the *Claude Code stdin Protocol* section below). The dispatched JSON-RPC methods are:
 
 ```jsonc
 {"method":"set_model","params":{"model":"sonnet"}}
-{"method":"set_permission_mode","params":{"mode":"acceptEdits"}}
 {"method":"control","params":{"subtype":"some_new_subtype","payload":{"k":"v"}}}
-// "config:<json>" — the method name itself carries an inline JSON blob, used as
-// a generic pass-through when the bridge wants to forward an opaque CC config
-// override without a dedicated JSON-RPC method.
+// "config:<json>" — the method name itself carries an inline JSON blob whose
+// "subtype" drives the dispatch (set_model / interrupt / generic control).
+// This is the route bridge-server's handleConfigSession uses.
 ```
 
-`control` is the generic forward — use it to ship new CC `control_request` subtypes without a code change here.
+`control` is the generic forward — use it (or `config:<json>` with the matching
+`subtype`) to ship new CC `control_request` subtypes without a code change here.
+
+> **Note.** There is **no** dedicated `set_model`-style method for permission
+> mode. To change permission mode mid-session, send `control` (or `config:`)
+> with `subtype: "set_permission_mode"` — it falls through to the generic
+> control forward (see `handleControl` / `handleConfig` in `handler.go`). The
+> dispatched method set is exactly: `start`, `message`, `compact`, `resume`,
+> `set_model`, `control`, and `config:<json>`. `interrupt` arrives either as
+> `config:` with `subtype:"interrupt"` or as a process SIGINT.
 
 ## CLI subcommands (out-of-band)
 
@@ -186,8 +241,9 @@ In addition to the JSON-RPC dispatch loop, the binary supports a few one-shot su
 | Flag | Purpose |
 |------|---------|
 | `-version` | Print the harness version (currently `0.1.0`) and exit. |
-| `-discover [project]` | List Claude Code sessions found on disk (under `~/.claude/projects/<project>`) as JSON. |
-| `-import-history <session_id> [path]` | Replay an existing CC session file as NDJSON `msg.Event` lines on stdout. If `path` is omitted, looks the session up via `-discover`. |
+| `-discover [project]` | List known sessions as JSON. Source of truth is `state.db`; on-disk `~/.claude/projects/<project>/*.jsonl` files not yet in `state.db` are cold-imported as synthetic single-rollout sessions. `project` filters to one project dir. |
+| `-import-history <session_id> [path]` | Replay a CC session `.jsonl` as NDJSON `msg.Event` lines on stdout. If `path` is omitted, resolves `session_id` via `state.db` (latest rollout in the chain), falling back to a direct filesystem walk for a harness UUID. Exits 0 as a no-op when nothing resolves. |
+| `-otel-sidecar` | PTY-mode companion. Starts a standalone OTLP receiver + rollout tailer, prints the receiver URL on stdout line 1 (for `OTEL_EXPORTER_OTLP_ENDPOINT`), and POSTs translated events to `<LLMBRIDGE_BRIDGE_SERVER_URL>/sidecar/event/<bridge_id>`. Exits when its stdin closes. Spawned by bridge-server, not invoked by hand. |
 
 ## Claude Code stdin Protocol (stream-json input)
 
@@ -251,7 +307,8 @@ Triggered by the `set_model` JSON-RPC method or the `config:<json>` pass-through
 }
 ```
 
-Triggered by the `set_permission_mode` JSON-RPC method or the `config:<json>` pass-through.
+Triggered by a generic `control` (or `config:<json>`) request carrying
+`subtype: "set_permission_mode"` — there is no dedicated JSON-RPC method for it.
 
 ### Generic Control (control_request)
 
@@ -312,19 +369,37 @@ All events are NDJSON (one JSON object per line) following the `msg.Event` envel
 
 ### Event Types Emitted
 
-#### `session_state` - State transitions
+> **Note on session state.** This harness does *not* emit `session_state`
+> events. Session lifecycle (idle / running / completed / error) is derived
+> centrally by llm-bridge-server from the raw event stream (init, result,
+> error). See `translate.go` — `translateSystem`'s `init` case is explicit
+> about this.
+
+#### `session_info` - Session metadata (emitted after each init)
 
 ```json
 {
-  "type": "session_state",
-  "state": {
-    "state": "running",
-    "previous": "idle"
+  "type": "session_info",
+  "info": {
+    "working_dir": "/home/user/repo",
+    "model": "claude-sonnet-4-20250514",
+    "permission_mode": "bypassPermissions",
+    "tools": [{"name": "Edit"}, {"name": "Bash"}],
+    "slash_commands": ["/review"],
+    "agents": ["dagda"],
+    "skills": ["frontend-design"],
+    "mcp_servers": [{"name": "tool-store", "status": "connected"}],
+    "system_prompt": "...",
+    "append_system_prompt": "..."
   }
 }
 ```
 
-States: `idle` -> `running` -> `completed` | `error` | `aborted`
+Emitted right after Claude Code's `system`/`init` event. Most fields come
+from CC's init payload (it is the canonical source for tools / slash_commands
+/ agents / skills / mcp_servers / model); `system_prompt` and
+`append_system_prompt` are backfilled from the `start` request's `StartParams`
+because CC never echoes them back. See `parseInitInfo` in `translate.go`.
 
 #### `stream` - Text and thinking deltas
 
@@ -394,7 +469,7 @@ Delta types: `text_delta`, `thinking_delta`
 }
 ```
 
-Subtypes: `init`, `compact_boundary`, `api_retry`, `hook_started`, `hook_progress`, `hook_response`, `status`, `task_notification`, `task_started`
+Subtypes: `init`, `compact_boundary`, `api_retry`, `status`, `task_notification`, `task_started`, `task_progress`, `compact_ack`, and any other CC system subtype forwarded as-is. (CC `hook_*` subtypes are emitted as `hook` events, not `system` — see above.)
 
 #### `result` - Turn completion
 
@@ -432,33 +507,82 @@ Subtypes: `init`, `compact_boundary`, `api_retry`, `hook_started`, `hook_progres
 {
   "type": "error",
   "error": {
-    "code": "EXECUTION_ERROR",
-    "message": "Claude Code process exited with code 1",
-    "retryable": false
+    "code": "SPAWN_ERROR",
+    "message": "Claude Code process exited with code 1"
   }
 }
 ```
+
+Error codes emitted by the harness: `SPAWN_ERROR` (CC failed to start) and
+`PROCESS_DIED` (CC exited mid-turn without delivering a result).
+
+#### `hook` - Hook lifecycle (with `--include-hook-events`)
+
+```json
+{
+  "type": "hook",
+  "hook": {
+    "event": "PreToolUse",
+    "tool_name": "Bash",
+    "phase": "completed",
+    "exit_code": 0,
+    "decision": "allow"
+  }
+}
+```
+
+Translated from CC's `system`/`hook_started|hook_progress|hook_response`
+events. `phase` is `started` / `progress` / `completed`. These are CC-native
+hooks observed in the stream — distinct from the bridge-server PreToolUse
+permission hook (see *Permission gating* below).
+
+#### `api_call` - Per-API-call telemetry (via OTel)
+
+```json
+{
+  "type": "api_call",
+  "api_call": {
+    "model": "claude-sonnet-4-20250514",
+    "input_tokens": 1200,
+    "output_tokens": 80,
+    "cost_usd": 0.004,
+    "duration_ms": 900
+  }
+}
+```
+
+Sourced from the in-process OTLP receiver (`otel.go`), not from stream-json.
+Surfaces auxiliary API calls (session-title, prompt-suggestion) that
+stream-json hides, which the cost/usage views depend on. Always on for
+claudecode harnesses.
 
 ## Claude Code stream-json -> msg.Event Mapping
 
 | CC Event Type | CC Subtype/Block | Maps To |
 |---------------|-----------------|---------|
-| `system` | `init` | `session_state` (running) + `system` (init) |
+| `system` | `init` | `system` (init) + `session_info` |
 | `system` | `compact_boundary` | `system` (compact_boundary) |
 | `system` | `api_retry` | `system` (api_retry) |
-| `system` | `hook_*` | `system` (forwarded) |
-| `system` | `task_notification` | `system` (forwarded) |
-| `system` | `status` | `system` (forwarded) |
+| `system` | `hook_*` | `hook` (EventHook) |
+| `system` | `task_started` / `task_progress` | `system` (forwarded, with correlator fields) |
+| `system` | `task_notification` / `status` / other | `system` (forwarded) |
 | `assistant` | text block | `stream` (text_delta) |
 | `assistant` | thinking block | `thinking` + `stream` (thinking_delta) |
 | `assistant` | tool_use block | `tool_call` |
 | `assistant` | tool_result block | `tool_result` |
-| `result` | `success` | `result` + `session_state` (completed) |
-| `result` | `error_*` | `error` + `session_state` (error) |
+| `result` | `success` | `result` |
+| `result` | `error_*` | `error` |
 | `rate_limit_event` | | `system` (rate_limit) |
+| `user` | | consumed internally (echo of synthetic interrupt message) |
 | `control_response` | | consumed internally (not forwarded) |
 | `keep_alive` | | consumed internally (not forwarded) |
 | `tool_progress` | | `system` (tool_progress) |
+| *(unknown type)* | | `system` (forwarded for visibility) |
+
+Session state (`running` / `completed` / `error`) is **not** emitted here —
+llm-bridge-server derives it centrally from the `init` / `result` / `error`
+events above. Per-API-call telemetry (`api_call`) arrives out-of-band via the
+OTLP receiver, not from this table.
 
 ### Usage Aggregation
 
@@ -481,12 +605,20 @@ Always-on flags:
 | `--output-format stream-json` | NDJSON streaming output |
 | `--verbose` | Include system events in output |
 
-Permission mode (mutually exclusive):
+Permission gating:
 
 | Flag | When |
 |------|------|
-| `--dangerously-skip-permissions` | `auto_approve` is unset or `true` (default) |
-| `--allowed-tools <t...>` | `auto_approve` is `false` and `allowed_tools` is non-empty |
+| `--permission-mode bypassPermissions` | default — added whenever `permission_mode` is empty, so CC never prompts and the bridge-server PreToolUse hook is the sole gate |
+| `--permission-mode <translated>` | `permission_mode` is set (canonical bridge values are mapped to CC vocab; `plan` maps to CC native plan mode, all other bridge-gating modes map to `bypassPermissions`) |
+| `--allowed-tools <t...>` | `allowed_tools` is non-empty — narrows the tool surface; the permission hook still fires on every call |
+
+> **Note.** `--dangerously-skip-permissions` is **not** used. Permission
+> gating lives in bridge-server as a PreToolUse HTTP hook injected via
+> `--settings`; CC runs with `bypassPermissions` so the hook is the only
+> decision point. The legacy `auto_approve` field on `StartParams` is still
+> accepted and persisted but no longer selects a flag — use `permission_mode`
+> and `allowed_tools` instead. See *Permission gating* in `DESIGN.md`.
 
 Resume / fork:
 
@@ -557,8 +689,8 @@ Claude Code responds with:
 
 | Signal | Behavior |
 |--------|----------|
-| SIGINT | Send interrupt control_request to CC stdin. If CC doesn't respond, fall back to process SIGINT. |
-| SIGTERM | Terminate Claude Code process. Emit `session_state` (aborted). Exit. |
+| SIGINT | `Harness.Interrupt`: send an interrupt control_request to CC stdin. If the write fails, fall back to killing the process. |
+| SIGTERM | `Harness.Shutdown`: cancel the context, interrupt CC and wait up to 3s (then kill), close `state.db`, exit. No `session_state` event is emitted — bridge-server derives the terminal state. |
 
 ## Building
 
