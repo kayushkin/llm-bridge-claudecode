@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"strings"
 
 	"github.com/kayushkin/llm-bridge/msg"
 )
@@ -73,8 +74,14 @@ func (a *UsageAggregator) Finalize(raw json.RawMessage) (msg.TokenUsage, *msg.Co
 	}
 
 	// ContextLimit: model's context window from modelUsage (last entry wins if multi-model).
-	for _, mu := range result.ModelUsage {
-		usage.ContextLimit = mu.ContextWindow
+	// CC reports the base 200k window even for the 1M extended-context beta, so when the
+	// model id advertises the [1m] variant we use its true 1M limit instead.
+	for model, mu := range result.ModelUsage {
+		limit := mu.ContextWindow
+		if strings.Contains(model, "[1m]") && limit < 1_000_000 {
+			limit = 1_000_000
+		}
+		usage.ContextLimit = limit
 	}
 
 	// ContextTokens: snapshot of the final API call's input (input + cache read + cache write).

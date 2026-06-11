@@ -753,14 +753,40 @@ func (h *Harness) handleMessage(params MessageParams) error {
 	return nil
 }
 
-// handleCompact acknowledges a compact request. CC manages compaction internally.
+// handleCompact triggers Claude Code's context compaction by injecting the
+// /compact slash command into the running process. CC compacts the transcript
+// and emits a system event with subtype "compact_boundary" once it finishes.
+//
+// The compact_ack emitted up front is a "request received" signal so the UI
+// can show a compacting indicator immediately; the actual completion is the
+// later compact_boundary. (Previously this handler only emitted the ack and
+// relied on CC's automatic compaction — so the manual Compact button never
+// actually compacted anything.)
+//
+// Note: this assumes slash commands are enabled. A session started with
+// --disable-slash-commands cannot be compacted this way; /compact would be
+// sent as literal user text. That flag is not persisted on the harness, so we
+// can't guard it here — it is not set by the default flow.
 func (h *Harness) handleCompact(params CompactParams) error {
 	h.emit(msg.Event{
 		Type:      msg.EventSystem,
 		Harness:   harness,
 		Timestamp: time.Now(),
-		System:    &msg.SystemEvent{Subtype: "compact_ack", Message: "compaction delegated to Claude Code"},
+		System:    &msg.SystemEvent{Subtype: "compact_ack", Message: "compaction requested"},
 	})
+
+	if h.proc == nil || !h.proc.Alive() {
+		return fmt.Errorf("compact: no running Claude Code process")
+	}
+
+	cmd := "/compact"
+	if params.Summary != "" {
+		cmd = "/compact " + params.Summary
+	}
+	if err := h.proc.WriteMessage(cmd); err != nil {
+		return fmt.Errorf("compact: write /compact: %w", err)
+	}
+	h.drainUntilResult()
 	return nil
 }
 
