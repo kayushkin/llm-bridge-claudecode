@@ -201,16 +201,14 @@ func buildStoredSession(sess SessionRow, rollouts []RolloutRow) msg.StoredSessio
 
 	if path != "" {
 		out.Path = path
-		parent := filepath.Base(filepath.Dir(path))
-		if parent == "subagents" {
-			// Task()-spawned subagent: <projects>/<encoded-cwd>/<parent-uuid>/subagents/agent-*.jsonl
-			// Tag structurally so bridge-server buckets it via SOURCE_FOLDERS instead
-			// of surfacing as a top-level chat. Project comes from the grandparent.
-			out.Source = "subagent"
-			out.Project = ccProjectToPath(filepath.Base(filepath.Dir(filepath.Dir(filepath.Dir(path)))))
+		if source, project, ok := classifySubagentPath(path); ok {
+			// Structurally-spawned subagent. Tag it so bridge-server buckets it
+			// via SOURCE_FOLDERS instead of surfacing it as a top-level chat.
+			out.Source = source
+			out.Project = project
 		} else {
 			// Project is encoded into the parent directory name.
-			out.Project = ccProjectToPath(parent)
+			out.Project = ccProjectToPath(filepath.Base(filepath.Dir(path)))
 		}
 		if info, err := os.Stat(path); err == nil {
 			out.UpdatedAt = info.ModTime()
@@ -225,6 +223,41 @@ func buildStoredSession(sess SessionRow, rollouts []RolloutRow) msg.StoredSessio
 	}
 
 	return out
+}
+
+// classifySubagentPath inspects a rollout file path for Claude Code's
+// subagent layout and, if matched, returns the structural source tag and the
+// project root. Two layouts exist:
+//
+//	<projects>/<proj>/<parent-uuid>/subagents/agent-*.jsonl                   → "subagent"
+//	<projects>/<proj>/<parent-uuid>/subagents/workflows/<wf-id>/agent-*.jsonl → "workflow-subagent"
+//
+// The match keys on a `subagents` path segment at ANY depth, not just the
+// immediate parent, so the deeper Workflow-tool layout is classified too —
+// the original check only matched the one-level Task() layout, which left
+// workflow subagents untagged (empty type/purpose, origin falling back to the
+// harness name). The project is the directory two levels above `subagents`
+// (`<projects>/<proj>/<parent-uuid>/subagents` → `<proj>`), so it is correct
+// regardless of how deeply the agent file nests below `subagents`. Returns
+// ok=false when the path carries no `subagents` segment or is too shallow to
+// hold the `<proj>/<parent-uuid>/subagents` prefix.
+func classifySubagentPath(path string) (source, project string, ok bool) {
+	parts := strings.Split(path, string(filepath.Separator))
+	subIdx := -1
+	for i, p := range parts {
+		if p == "subagents" {
+			subIdx = i
+			break
+		}
+	}
+	if subIdx < 2 {
+		return "", "", false
+	}
+	source = "subagent"
+	if subIdx+1 < len(parts) && parts[subIdx+1] == "workflows" {
+		source = "workflow-subagent"
+	}
+	return source, ccProjectToPath(parts[subIdx-2]), true
 }
 
 // parseSessionHead scans a CC session JSONL file to extract the first user

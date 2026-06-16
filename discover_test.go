@@ -291,19 +291,33 @@ func TestDiscover_SubagentSourceTag(t *testing.T) {
 	writeJSONL(t, filepath.Join(projectsDir, "-tmp-proj", "uuid-top.jsonl"), "regular chat")
 	// Task subagent — sibling subagents/ dir under the parent UUID dir.
 	writeJSONL(t, filepath.Join(projectsDir, "-tmp-proj", "uuid-top", "subagents", "agent-abc.jsonl"), "Find the inber project")
+	// Workflow subagent — nested one level deeper under subagents/workflows/<wf>/.
+	writeJSONL(t, filepath.Join(projectsDir, "-tmp-proj", "uuid-top", "subagents", "workflows", "wf_xyz", "agent-wf1.jsonl"), "Review the diff")
 
 	got, err := discoverSessions("")
 	if err != nil {
 		t.Fatalf("discoverSessions: %v", err)
 	}
 	bySource := map[string]string{}
+	byProject := map[string]string{}
 	for _, s := range got {
 		bySource[s.HarnessSessionID] = s.Source
+		byProject[s.HarnessSessionID] = s.Project
 	}
 	if bySource["uuid-top"] != "" {
 		t.Fatalf("top-level session must not carry Source, got %q", bySource["uuid-top"])
 	}
 	if bySource["agent-abc"] != "subagent" {
-		t.Fatalf("subagent session must be Source=subagent, got %q (full map: %v)", bySource["agent-abc"], bySource)
+		t.Fatalf("Task subagent must be Source=subagent, got %q (full map: %v)", bySource["agent-abc"], bySource)
+	}
+	if bySource["agent-wf1"] != "workflow-subagent" {
+		t.Fatalf("workflow subagent must be Source=workflow-subagent, got %q (full map: %v)", bySource["agent-wf1"], bySource)
+	}
+	// Project must resolve to the encoded grandparent regardless of nesting depth.
+	if byProject["agent-abc"] != "/tmp/proj" {
+		t.Fatalf("Task subagent project = %q, want /tmp/proj", byProject["agent-abc"])
+	}
+	if byProject["agent-wf1"] != "/tmp/proj" {
+		t.Fatalf("workflow subagent project = %q, want /tmp/proj (deeper nesting must not skew project)", byProject["agent-wf1"])
 	}
 }
