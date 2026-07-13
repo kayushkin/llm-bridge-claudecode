@@ -337,6 +337,14 @@ func (h *Harness) emit(e msg.Event) {
 	if e.HarnessSessionID == "" {
 		e.HarnessSessionID = h.sessionID
 	}
+	// The stream-json translators stamp Harness at each construction site, but
+	// the in-process OTel receiver's translators (otel.go) do not — those events
+	// were reaching consumers with an empty Harness, which lies about where they
+	// came from. Backfill here, the one path every event from this harness takes.
+	// Mirrors the same backfill the PTY sidecar already does (sidecar.go).
+	if e.Harness == "" {
+		e.Harness = harness
+	}
 	emitEvent(e)
 }
 
