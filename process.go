@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/kayushkin/llm-bridge/msg"
+	"github.com/kayushkin/llm-bridge/ndjson"
 )
 
 // CCProcess manages a single Claude Code subprocess using bidirectional
@@ -301,23 +303,34 @@ func (p *CCProcess) ReadEvents(ctx context.Context) <-chan json.RawMessage {
 	ch := make(chan json.RawMessage, 100)
 	go func() {
 		defer close(ch)
-		scanner := bufio.NewScanner(p.stdout)
-		scanner.Buffer(make([]byte, 0, 1024*1024), 10*1024*1024) // 10MB max line
-		for scanner.Scan() {
-			line := scanner.Bytes()
-			if len(line) == 0 {
+		// ndjson.ReadLine carries no practical line cap and reports an
+		// oversized line as its own error, so a single large stream-json
+		// event (a big tool result, a multi-MB screenshot) no longer ends
+		// the scan indistinguishably from EOF — the old bufio.Scanner
+		// failure mode, which closed this channel while Claude Code was
+		// still streaming and killed the session mid-turn.
+		reader := bufio.NewReader(p.stdout)
+		for {
+			line, err := ndjson.ReadLine(reader, ndjson.MaxLineBytes)
+			if errors.Is(err, ndjson.ErrLineTooLong) {
+				log.Printf("dropping stdout event above %d bytes; stream continues", ndjson.MaxLineBytes)
 				continue
 			}
-			raw := make(json.RawMessage, len(line))
-			copy(raw, line)
-			select {
-			case ch <- raw:
-			case <-ctx.Done():
+			if len(line) > 0 {
+				raw := make(json.RawMessage, len(line))
+				copy(raw, line)
+				select {
+				case ch <- raw:
+				case <-ctx.Done():
+					return
+				}
+			}
+			if err != nil {
+				if !errors.Is(err, io.EOF) {
+					log.Printf("stdout read error: %v", err)
+				}
 				return
 			}
-		}
-		if err := scanner.Err(); err != nil {
-			log.Printf("stdout scanner error: %v", err)
 		}
 	}()
 	return ch
