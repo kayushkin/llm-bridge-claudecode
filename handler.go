@@ -463,10 +463,25 @@ func (h *Harness) handleStart(params StartParams) error {
 	if resumeID == "" {
 		resumeID = params.SessionID
 	}
-	if params.Resume {
+	// Claude Code's --resume / --fork-session accept ONLY a session UUID.
+	// Sub-agent sessions carry their rollout-file id ("agent-<hex>") and bridge
+	// sessions carry a timestamp id — neither is a UUID, so passing them makes
+	// `claude -p --resume …` exit with "not a UUID and does not match any
+	// session title" and the session never starts. When the id isn't a real
+	// UUID there is nothing resumable, so drop the flag and let CC mint a fresh
+	// session; its init event then persists that real UUID, so the bad id
+	// self-heals on the next turn.
+	switch {
+	case params.Resume && isClaudeSessionUUID(resumeID):
 		extraArgs = append(extraArgs, "--resume", resumeID)
-	} else if params.Fork != "" {
+	case params.Resume:
+		log.Printf("[harness] %s: skipping --resume %q (not a Claude Code session UUID); starting a fresh session",
+			h.bridgeSessionID, resumeID)
+	case params.Fork != "" && isClaudeSessionUUID(params.Fork):
 		extraArgs = append(extraArgs, "--resume", params.Fork, "--fork-session")
+	case params.Fork != "":
+		log.Printf("[harness] %s: skipping --fork-session of %q (not a Claude Code session UUID); starting a fresh session",
+			h.bridgeSessionID, params.Fork)
 	}
 
 	// Don't pass bridge session IDs to Claude Code — CC requires UUIDs
@@ -978,4 +993,30 @@ func (h *Harness) drainUntilResult() {
 			},
 		})
 	}
+}
+
+// isClaudeSessionUUID reports whether s has the canonical 8-4-4-4-12 hex shape
+// of a Claude Code session UUID. Claude Code's `--resume`/`--fork-session`
+// accept only such a UUID (or, interactively, a session title); sub-agent
+// rollout ids ("agent-<hex>") and bridge session ids are neither, so handing
+// them to `claude -p --resume` fails with "not a UUID and does not match any
+// session title". Kept dependency-free (no regexp) on purpose.
+func isClaudeSessionUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			if c != '-' {
+				return false
+			}
+			continue
+		}
+		isHex := (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+		if !isHex {
+			return false
+		}
+	}
+	return true
 }
