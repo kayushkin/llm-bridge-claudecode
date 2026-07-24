@@ -112,7 +112,7 @@ type otlpLogRecord struct {
 }
 
 type otlpAnyValue struct {
-	StringValue *string  `json:"stringValue,omitempty"`
+	StringValue *string `json:"stringValue,omitempty"`
 	// IntValue is int64. The OTLP/JSON spec encodes it as a quoted string
 	// (to avoid JS Number precision loss for >2^53 values), but the Node
 	// OTel SDK that ships with Claude Code emits a bare JSON number.
@@ -221,10 +221,16 @@ func (r *OTelReceiver) dispatchLogRecord(lr otlpLogRecord) {
 		r.emit(translateAPIRequest(attrs, ts))
 	case "claude_code.internal_error":
 		r.emit(translateInternalError(attrs, ts))
+	case "claude_code.api_error":
+		r.emit(translateAPIError(attrs, ts))
+	case "claude_code.api_retries_exhausted":
+		r.emit(translateAPIRetriesExhausted(attrs, ts))
 	case "claude_code.tool_decision":
 		r.emit(translateToolDecision(attrs, ts))
 	case "claude_code.tool_result":
 		r.emit(translateToolResult(attrs, ts))
+	case "claude_code.subagent_completed":
+		r.emit(translateSubagentCompleted(attrs, ts))
 	case "claude_code.user_prompt":
 		if ev, ok := translateUserPrompt(attrs, ts); ok {
 			r.emit(ev)
@@ -233,6 +239,20 @@ func (r *OTelReceiver) dispatchLogRecord(lr otlpLogRecord) {
 		// Lifecycle bookkeeping for the PreToolUse / PostToolUse hooks
 		// we install via --settings. Already surfaced as bridge HookEvents
 		// via the prehook HTTP path; emitting again here would duplicate.
+	case "claude_code.assistant_response":
+		// A telemetry copy of the model's turn text. In -p mode the full,
+		// authoritative text already arrives on stream-json as an "assistant"
+		// event (translateAssistant), so emitting this too would duplicate —
+		// and worse, CC truncates the OTel `response` attribute (it ships a
+		// separate `response_length`), so this copy is lossy. Recovering it as
+		// a content block for the case where stream-json drops the final turn
+		// needs render-edge dedup against the stream-json copy first; tracked
+		// as a follow-up. Skipped here rather than logged so it doesn't drown
+		// the unhandled-event log (~10k lines in a few weeks).
+	case "claude_code.mcp_server_connection", "claude_code.at_mention", "claude_code.skill_activated", "claude_code.auth":
+		// Status/lifecycle signals with no consumer today. Named explicitly so
+		// the default branch below stays a real "we've never seen this" alarm
+		// rather than routine noise.
 	default:
 		log.Printf("[otel] unhandled event.name=%q attrs=%v", name, attrs)
 	}
@@ -268,6 +288,70 @@ func translateInternalError(attrs map[string]string, ts time.Time) msg.Event {
 		Error: &msg.ErrorEvent{
 			Code:    "internal_error",
 			Message: attrs["message"], // empty when CC doesn't include one — fine; the code is the signal
+		},
+	}
+	tagOTelSource(&ev)
+	return ev
+}
+
+// translateAPIError maps the OTel `claude_code.api_error` event into an
+// EventError. CC emits this for a failed model API call (e.g. a 529
+// "Overloaded") that it then retries internally; the failure never appears
+// on stream-json, which only carries the eventual result. Surfacing it is
+// the difference between a session that visibly stalls on an overloaded API
+// and one that looks silently hung — the case this handler was added for.
+//
+// Retryable mirrors CC's own behavior: it retries on 429 and 5xx, so those
+// carry the transient signal. StatusCode is passed through as CC reported it.
+func translateAPIError(attrs map[string]string, ts time.Time) msg.Event {
+	status := atoiOr(attrs["status_code"], 0)
+	ev := msg.Event{
+		Type:      msg.EventError,
+		Timestamp: ts,
+		Error: &msg.ErrorEvent{
+			Code:       "api_error",
+			Message:    attrs["error"],
+			Retryable:  status == 429 || (status >= 500 && status <= 599),
+			StatusCode: status,
+		},
+	}
+	tagOTelSource(&ev)
+	return ev
+}
+
+// translateAPIRetriesExhausted maps the OTel `claude_code.api_retries_exhausted`
+// event into an EventError. This is the terminal companion to api_error: CC
+// has given up after total_attempts retries and the turn cannot proceed.
+// Retryable is false — the retry budget is spent, so this is the failure the
+// user needs to see, not a transient blip.
+func translateAPIRetriesExhausted(attrs map[string]string, ts time.Time) msg.Event {
+	ev := msg.Event{
+		Type:      msg.EventError,
+		Timestamp: ts,
+		Error: &msg.ErrorEvent{
+			Code:       "api_retries_exhausted",
+			Message:    attrs["error"],
+			Retryable:  false,
+			StatusCode: atoiOr(attrs["status_code"], 0),
+		},
+	}
+	tagOTelSource(&ev)
+	return ev
+}
+
+// translateSubagentCompleted maps the OTel `claude_code.subagent_completed`
+// event into a SystemEvent. When the main agent spawns a Task-tool subagent
+// and waits on it, this is the only signal the bridge gets that the subagent
+// finished (the subagent runs inside CC and its stream-json stays private to
+// the parent turn). Surfacing it lets a "waiting on N agents" turn show
+// progress instead of looking frozen.
+func translateSubagentCompleted(attrs map[string]string, ts time.Time) msg.Event {
+	ev := msg.Event{
+		Type:      msg.EventSystem,
+		Timestamp: ts,
+		System: &msg.SystemEvent{
+			Subtype: "subagent_completed",
+			Message: attrs["agent_type"],
 		},
 	}
 	tagOTelSource(&ev)

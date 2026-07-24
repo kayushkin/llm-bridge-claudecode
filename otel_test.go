@@ -182,6 +182,162 @@ func TestOTelReceiver_InternalErrorTranslation(t *testing.T) {
 	}
 }
 
+// TestOTelReceiver_APIErrorAndRetriesExhausted confirms the two API-failure
+// events CC emits over OTel (and never over stream-json, because it retries
+// internally) surface as typed EventError instead of being silently dropped.
+// This is the gap that made overloaded-API sessions look hung with no error
+// anywhere.
+func TestOTelReceiver_APIErrorAndRetriesExhausted(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		events []msg.Event
+	)
+	recv, err := NewOTelReceiver(func(e msg.Event) {
+		mu.Lock()
+		defer mu.Unlock()
+		events = append(events, e)
+	})
+	if err != nil {
+		t.Fatalf("new receiver: %v", err)
+	}
+	recv.Start()
+	defer recv.Stop(context.Background())
+
+	payload := `{
+		"resourceLogs": [{
+			"scopeLogs": [{
+				"logRecords": [
+					{
+						"body": {"stringValue": "claude_code.api_error"},
+						"attributes": [
+							{"key": "event.name",  "value": {"stringValue": "api_error"}},
+							{"key": "error",        "value": {"stringValue": "Overloaded"}},
+							{"key": "status_code",  "value": {"stringValue": "529"}},
+							{"key": "attempt",      "value": {"stringValue": "11"}}
+						]
+					},
+					{
+						"body": {"stringValue": "claude_code.api_retries_exhausted"},
+						"attributes": [
+							{"key": "event.name",    "value": {"stringValue": "api_retries_exhausted"}},
+							{"key": "error",          "value": {"stringValue": "Overloaded"}},
+							{"key": "status_code",    "value": {"stringValue": "529"}},
+							{"key": "total_attempts", "value": {"stringValue": "11"}}
+						]
+					}
+				]
+			}]
+		}]
+	}`
+	resp, err := http.Post(recv.EndpointURL()+"/v1/logs", "application/json", bytes.NewBufferString(payload))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	resp.Body.Close()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events, got %d: %+v", len(events), events)
+	}
+
+	apiErr := events[0]
+	if apiErr.Type != msg.EventError || apiErr.Error == nil ||
+		apiErr.Error.Code != "api_error" || apiErr.Error.Message != "Overloaded" ||
+		apiErr.Error.StatusCode != 529 || !apiErr.Error.Retryable {
+		t.Errorf("api_error mapped wrong: %+v / %+v", apiErr.Type, apiErr.Error)
+	}
+
+	exhausted := events[1]
+	if exhausted.Type != msg.EventError || exhausted.Error == nil ||
+		exhausted.Error.Code != "api_retries_exhausted" || exhausted.Error.StatusCode != 529 ||
+		exhausted.Error.Retryable {
+		t.Errorf("api_retries_exhausted mapped wrong: %+v / %+v", exhausted.Type, exhausted.Error)
+	}
+
+	for i, ev := range events {
+		if string(ev.Extensions["source"]) != `"otel"` {
+			t.Errorf("event[%d] missing otel source tag: %v", i, ev.Extensions)
+		}
+	}
+}
+
+// TestOTelReceiver_SubagentCompleted confirms a finished Task-tool subagent
+// surfaces as a system event so a waiting parent turn shows progress.
+func TestOTelReceiver_SubagentCompleted(t *testing.T) {
+	var got msg.Event
+	var gotOnce sync.Once
+	recv, err := NewOTelReceiver(func(e msg.Event) { gotOnce.Do(func() { got = e }) })
+	if err != nil {
+		t.Fatalf("new receiver: %v", err)
+	}
+	recv.Start()
+	defer recv.Stop(context.Background())
+
+	payload := `{
+		"resourceLogs": [{
+			"scopeLogs": [{
+				"logRecords": [{
+					"body": {"stringValue": "claude_code.subagent_completed"},
+					"attributes": [
+						{"key": "event.name", "value": {"stringValue": "subagent_completed"}},
+						{"key": "agent_type", "value": {"stringValue": "custom"}}
+					]
+				}]
+			}]
+		}]
+	}`
+	resp, _ := http.Post(recv.EndpointURL()+"/v1/logs", "application/json", bytes.NewBufferString(payload))
+	resp.Body.Close()
+
+	if got.Type != msg.EventSystem || got.System == nil ||
+		got.System.Subtype != "subagent_completed" || got.System.Message != "custom" {
+		t.Fatalf("subagent_completed mapped wrong: %+v / %+v", got.Type, got.System)
+	}
+}
+
+// TestOTelReceiver_AssistantResponseSkipped locks in that the assistant_response
+// telemetry copy does NOT emit an event — the authoritative full text comes on
+// stream-json, and this OTel copy is truncated and would duplicate. If it's
+// ever promoted to a recovery path, it must dedupe against stream-json first.
+func TestOTelReceiver_AssistantResponseSkipped(t *testing.T) {
+	var count int
+	var mu sync.Mutex
+	recv, err := NewOTelReceiver(func(msg.Event) {
+		mu.Lock()
+		count++
+		mu.Unlock()
+	})
+	if err != nil {
+		t.Fatalf("new receiver: %v", err)
+	}
+	recv.Start()
+	defer recv.Stop(context.Background())
+
+	payload := `{
+		"resourceLogs": [{
+			"scopeLogs": [{
+				"logRecords": [{
+					"body": {"stringValue": "claude_code.assistant_response"},
+					"attributes": [
+						{"key": "event.name",      "value": {"stringValue": "assistant_response"}},
+						{"key": "response",        "value": {"stringValue": "partial tel..."}},
+						{"key": "response_length", "value": {"stringValue": "113"}}
+					]
+				}]
+			}]
+		}]
+	}`
+	resp, _ := http.Post(recv.EndpointURL()+"/v1/logs", "application/json", bytes.NewBufferString(payload))
+	resp.Body.Close()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if count != 0 {
+		t.Fatalf("assistant_response should emit nothing, emitted %d", count)
+	}
+}
+
 // TestOTelReceiver_MetricsAccept confirms /v1/metrics returns 200 even
 // though we don't translate metrics. Without this, CC's OTLP exporter
 // retries indefinitely and floods stderr.
@@ -215,10 +371,10 @@ func TestOTelReceiver_EnvIncludesEndpoint(t *testing.T) {
 
 	env := recv.Env()
 	want := map[string]bool{
-		"CLAUDE_CODE_ENABLE_TELEMETRY=1":              false,
-		"OTEL_EXPORTER_OTLP_PROTOCOL=http/json":       false,
-		"OTEL_LOGS_EXPORTER=otlp":                     false,
-		"OTEL_METRICS_EXPORTER=otlp":                  false,
+		"CLAUDE_CODE_ENABLE_TELEMETRY=1":                    false,
+		"OTEL_EXPORTER_OTLP_PROTOCOL=http/json":             false,
+		"OTEL_LOGS_EXPORTER=otlp":                           false,
+		"OTEL_METRICS_EXPORTER=otlp":                        false,
 		"OTEL_EXPORTER_OTLP_ENDPOINT=" + recv.EndpointURL(): false,
 	}
 	for _, kv := range env {
