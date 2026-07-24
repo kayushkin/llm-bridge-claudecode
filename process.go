@@ -338,7 +338,7 @@ func (p *CCProcess) ReadEvents(ctx context.Context) <-chan json.RawMessage {
 
 // Kill terminates the Claude Code process.
 func (p *CCProcess) Kill() error {
-	if p.cmd.Process != nil {
+	if p.cmd != nil && p.cmd.Process != nil {
 		return p.cmd.Process.Kill()
 	}
 	return nil

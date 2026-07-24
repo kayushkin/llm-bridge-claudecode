@@ -296,17 +296,19 @@ func TestOTelReceiver_SubagentCompleted(t *testing.T) {
 	}
 }
 
-// TestOTelReceiver_AssistantResponseSkipped locks in that the assistant_response
-// telemetry copy does NOT emit an event — the authoritative full text comes on
-// stream-json, and this OTel copy is truncated and would duplicate. If it's
-// ever promoted to a recovery path, it must dedupe against stream-json first.
-func TestOTelReceiver_AssistantResponseSkipped(t *testing.T) {
-	var count int
-	var mu sync.Mutex
-	recv, err := NewOTelReceiver(func(msg.Event) {
+// TestOTelReceiver_AssistantResponseTaggedBlock confirms assistant_response
+// maps to a source=otel text block. The receiver always emits it; the consumer
+// (PTY sidecar vs -p harness) decides whether to forward or buffer-and-recover.
+// A body-less event emits nothing.
+func TestOTelReceiver_AssistantResponseTaggedBlock(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		events []msg.Event
+	)
+	recv, err := NewOTelReceiver(func(e msg.Event) {
 		mu.Lock()
-		count++
-		mu.Unlock()
+		defer mu.Unlock()
+		events = append(events, e)
 	})
 	if err != nil {
 		t.Fatalf("new receiver: %v", err)
@@ -317,14 +319,23 @@ func TestOTelReceiver_AssistantResponseSkipped(t *testing.T) {
 	payload := `{
 		"resourceLogs": [{
 			"scopeLogs": [{
-				"logRecords": [{
-					"body": {"stringValue": "claude_code.assistant_response"},
-					"attributes": [
-						{"key": "event.name",      "value": {"stringValue": "assistant_response"}},
-						{"key": "response",        "value": {"stringValue": "partial tel..."}},
-						{"key": "response_length", "value": {"stringValue": "113"}}
-					]
-				}]
+				"logRecords": [
+					{
+						"body": {"stringValue": "claude_code.assistant_response"},
+						"attributes": [
+							{"key": "event.name",      "value": {"stringValue": "assistant_response"}},
+							{"key": "response",        "value": {"stringValue": "Want me to (a) write the doc?"}},
+							{"key": "response_length", "value": {"stringValue": "29"}}
+						]
+					},
+					{
+						"body": {"stringValue": "claude_code.assistant_response"},
+						"attributes": [
+							{"key": "event.name",      "value": {"stringValue": "assistant_response"}},
+							{"key": "response_length", "value": {"stringValue": "0"}}
+						]
+					}
+				]
 			}]
 		}]
 	}`
@@ -333,8 +344,17 @@ func TestOTelReceiver_AssistantResponseSkipped(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	if count != 0 {
-		t.Fatalf("assistant_response should emit nothing, emitted %d", count)
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event (body-less one skipped), got %d", len(events))
+	}
+	e := events[0]
+	if e.Type != msg.EventBlock || e.Block == nil || e.Block.Block == nil ||
+		e.Block.Block.Type != msg.BlockText || e.Block.Block.Text == nil ||
+		e.Block.Block.Text.Text != "Want me to (a) write the doc?" {
+		t.Fatalf("assistant_response block malformed: %+v", e)
+	}
+	if string(e.Extensions["source"]) != `"otel"` {
+		t.Errorf("missing otel source tag: %v", e.Extensions)
 	}
 }
 

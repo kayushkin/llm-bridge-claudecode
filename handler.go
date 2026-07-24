@@ -7,6 +7,8 @@ import (
 	"log"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/kayushkin/llm-bridge/identity"
@@ -71,19 +73,19 @@ type StartParams struct {
 	// SessionID historically meant either the bridge_id (fresh start) or the
 	// harness_id (resume). Kept for backward compatibility — when Resume is
 	// true it carries the Claude Code session UUID to --resume against.
-	SessionID    string   `json:"session_id,omitempty"`
-	DisplayName  string   `json:"display_name"`
-	AgentID      string   `json:"agent_id"`
-	Prompt       string   `json:"prompt"`
+	SessionID   string `json:"session_id,omitempty"`
+	DisplayName string `json:"display_name"`
+	AgentID     string `json:"agent_id"`
+	Prompt      string `json:"prompt"`
 	// Blocks is the multimodal alternative to Prompt: a canonical content-block
 	// array (text, image, document, audio, video) for the initial user message.
 	// Mutually exclusive with Prompt — setting both returns an error.
 	Blocks       []msg.ContentBlock `json:"blocks,omitempty"`
-	Resume       bool     `json:"resume"`
-	Fork         string   `json:"fork"`
-	AutoApprove  *bool    `json:"auto_approve,omitempty"`  // nil = true (default), false = restricted mode
-	AllowedTools []string `json:"allowed_tools,omitempty"` // tools to allow when auto_approve is false
-	WorkDir      string   `json:"work_dir,omitempty"`      // working directory for resumed sessions
+	Resume       bool               `json:"resume"`
+	Fork         string             `json:"fork"`
+	AutoApprove  *bool              `json:"auto_approve,omitempty"`  // nil = true (default), false = restricted mode
+	AllowedTools []string           `json:"allowed_tools,omitempty"` // tools to allow when auto_approve is false
+	WorkDir      string             `json:"work_dir,omitempty"`      // working directory for resumed sessions
 
 	// Claude Code CLI flags (start-time)
 	SystemPrompt       string   `json:"system_prompt,omitempty"`        // --system-prompt: replace default system prompt
@@ -189,7 +191,26 @@ type Harness struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
+	// Turn-scoped assistant-text recovery. In -p mode each model text segment
+	// arrives on both stream-json (authoritative) and OTel (source=otel copy).
+	// emit forwards the stream-json copy and buffers the OTel copy; at turn end
+	// flushRecoveredAssistant surfaces the buffer only if stream-json produced
+	// no assistant text — recovering the message when stream-json drops the
+	// final turn, without duplicating on the healthy path. Guarded by turnMu.
+	turnMu              sync.Mutex
+	turnStreamAssistant bool     // stream-json delivered assistant text this turn
+	turnOTelAssistant   []string // OTel assistant_response segments buffered this turn
+
+	// lastActivityNano is the Unix-nano time of the most recent emitted event
+	// (either channel). The drainUntilResult watchdog compares against it to
+	// detect a turn that has gone fully silent while the process is still alive.
+	lastActivityNano atomic.Int64
 }
+
+// turnWatchdogInterval is how often drainUntilResult wakes to check whether an
+// alive turn has gone idle past Config.TurnIdleTimeout. Cheap relative to the
+// timeout, so the stall is caught within one interval of crossing it.
+const turnWatchdogInterval = 15 * time.Second
 
 // NewHarness creates a new harness instance.
 func NewHarness(cfg *Config) *Harness {
@@ -326,11 +347,39 @@ func recoverOrphansOnBoot(s *State) error {
 	return nil
 }
 
-// emit stamps the canonical bridge_session_id and harness_session_id onto the
+// emit is the sink for every event from this harness — both the stream-json
+// translators (via drainUntilResult) and the in-process OTel receiver (via
+// NewOTelReceiver(h.emit)). It records turn activity for the watchdog and
+// intercepts the OTel copy of assistant text so the healthy path doesn't
+// double-render; everything else is forwarded unchanged.
+func (h *Harness) emit(e msg.Event) {
+	h.markActivity()
+
+	if isAssistantTextEvent(e) {
+		if isOTelSourced(e) {
+			// -p mode: the authoritative copy of this segment also arrives on
+			// stream-json. Buffer this one; flushRecoveredAssistant decides at
+			// turn end whether it's needed. (In PTY mode the sidecar — not this
+			// emit — handles OTel, so PTY assistant text is never intercepted.)
+			h.turnMu.Lock()
+			h.turnOTelAssistant = append(h.turnOTelAssistant, e.Block.Block.Text.Text)
+			h.turnMu.Unlock()
+			return
+		}
+		h.turnMu.Lock()
+		h.turnStreamAssistant = true
+		h.turnMu.Unlock()
+	}
+
+	h.forward(e)
+}
+
+// forward stamps the canonical bridge_session_id and harness_session_id onto the
 // event before sending it to bridge-server. Bridge-server's manager re-stamps
 // the legacy BridgeID mirror for downstream NATS subscribers — bridges
-// themselves only emit the new fields.
-func (h *Harness) emit(e msg.Event) {
+// themselves only emit the new fields. It's the raw sink, bypassing emit's
+// assistant-text interception, so recovery flushes here without re-buffering.
+func (h *Harness) forward(e msg.Event) {
 	if e.BridgeSessionID == "" {
 		e.BridgeSessionID = h.bridgeSessionID
 	}
@@ -346,6 +395,79 @@ func (h *Harness) emit(e msg.Event) {
 		e.Harness = harness
 	}
 	emitEvent(e)
+}
+
+// markActivity records "an event just flowed" for the drainUntilResult
+// watchdog. Called on every emit from either channel.
+func (h *Harness) markActivity() {
+	h.lastActivityNano.Store(time.Now().UnixNano())
+}
+
+// sinceActivity is how long since the last emitted event.
+func (h *Harness) sinceActivity() time.Duration {
+	return time.Duration(time.Now().UnixNano() - h.lastActivityNano.Load())
+}
+
+// beginTurn resets per-turn recovery state and the activity clock. Called at
+// the top of drainUntilResult so each turn's stream-json/OTel bookkeeping and
+// idle timer start clean.
+func (h *Harness) beginTurn() {
+	h.markActivity()
+	h.turnMu.Lock()
+	h.turnStreamAssistant = false
+	h.turnOTelAssistant = nil
+	h.turnMu.Unlock()
+}
+
+// flushRecoveredAssistant surfaces the buffered OTel assistant text for the
+// turn that is ending — but only when stream-json delivered no assistant text
+// of its own. On the healthy path stream-json carried the message, so the
+// buffer is dropped and nothing double-renders. When stream-json dropped the
+// turn (process wedged, stdout silent), this is what makes the model's final
+// message visible instead of the session looking frozen. Idempotent: clears the
+// buffer, so calling it more than once per turn is safe.
+func (h *Harness) flushRecoveredAssistant() {
+	h.turnMu.Lock()
+	if h.turnStreamAssistant || len(h.turnOTelAssistant) == 0 {
+		h.turnOTelAssistant = nil
+		h.turnMu.Unlock()
+		return
+	}
+	texts := h.turnOTelAssistant
+	h.turnOTelAssistant = nil
+	h.turnMu.Unlock()
+
+	log.Printf("[claudecode] recovering %d assistant text segment(s) from OTel; stream-json produced none this turn (session=%s)", len(texts), h.sessionID)
+	for i, t := range texts {
+		h.forward(msg.Event{
+			Type:      msg.EventBlock,
+			Timestamp: time.Now(),
+			Block: &msg.BlockEvent{
+				Index: i,
+				Block: &msg.ContentBlock{
+					Type: msg.BlockText,
+					Text: &msg.TextBlock{Text: t},
+				},
+			},
+			Extensions: map[string]json.RawMessage{
+				"source":    json.RawMessage(`"otel"`),
+				"recovered": json.RawMessage(`true`),
+			},
+		})
+	}
+}
+
+// isAssistantTextEvent reports whether e is a model text block (the only block
+// kind that arrives redundantly on both stream-json and OTel).
+func isAssistantTextEvent(e msg.Event) bool {
+	return e.Type == msg.EventBlock && e.Block != nil && e.Block.Block != nil &&
+		e.Block.Block.Type == msg.BlockText && e.Block.Block.Text != nil
+}
+
+// isOTelSourced reports whether e carries the source=otel provenance tag that
+// otel.go stamps on every event it translates.
+func isOTelSourced(e msg.Event) bool {
+	return string(e.Extensions["source"]) == `"otel"`
 }
 
 // HandleRequest dispatches a JSON-RPC request to the appropriate handler.
@@ -926,73 +1048,148 @@ func (h *Harness) Shutdown() {
 // drainUntilResult reads events from the shared event channel until a result
 // or error event is seen, indicating the current turn is complete.
 // The channel persists across turns — only one goroutine reads from it.
+// drainUntilResult streams one turn's stream-json events, emitting each, and
+// returns when the turn ends. A turn ends three ways: a stream-json result/
+// error event (the normal path); the event channel closing (process exited);
+// or the idle watchdog firing when the process is alive but has produced no
+// event for Config.TurnIdleTimeout — the wedged-turn case that previously hung
+// forever. Every exit flushes any OTel-only assistant text first, so a message
+// stream-json dropped still reaches the user.
 func (h *Harness) drainUntilResult() {
-	for raw := range h.events {
-		translated := translateEvent(raw, h.sessionID, &h.agg, h.tracker)
-		for _, ev := range translated {
-			h.emit(ev)
+	h.beginTurn()
 
-			// Update session ID if CC assigned a new one (fork case), and emit
-			// a SessionInfo event carrying the start-time flags + CC init payload.
-			if ev.Type == msg.EventSystem && ev.System != nil && ev.System.Subtype == "init" {
-				var init struct {
-					SessionID string `json:"session_id"`
-				}
-				if json.Unmarshal(raw, &init) == nil && init.SessionID != "" {
-					h.sessionID = init.SessionID
-					// Apply staged chain rotation. Cold-start / fork commit
-					// the pending WAL and write a rollout row; resume bumps
-					// sessions.updated_at (and writes a kind='resume'
-					// rollout if CC unexpectedly rotated the UUID).
-					h.recordChainOnInit(init.SessionID, findRolloutForUUID(init.SessionID))
-				}
-				if info := parseInitInfo(raw); info != nil {
-					info.SystemPrompt = h.systemPrompt
-					info.AppendSystemPrompt = h.appendSystemPrompt
-					if info.WorkingDir == "" {
-						info.WorkingDir = h.workDir
-					}
-					h.emit(msg.Event{
-						Type:      msg.EventSessionInfo,
-						Harness:   harness,
-						Timestamp: time.Now(),
-						Info:      info,
-					})
-				}
-			}
+	// tick fires the idle watchdog. Left nil (never fires) when the watchdog is
+	// disabled, so the select degrades to the original block-until-channel loop.
+	// The interval checks at least twice per timeout so a stall is caught
+	// promptly, capped at turnWatchdogInterval so a long timeout doesn't poll
+	// needlessly often.
+	var tick <-chan time.Time
+	if h.cfg != nil && h.cfg.TurnIdleTimeout > 0 {
+		interval := turnWatchdogInterval
+		if half := h.cfg.TurnIdleTimeout / 2; half > 0 && half < interval {
+			interval = half
+		}
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		tick = t.C
+	}
 
-			// A result or error event means this turn is done.
-			if ev.Type == msg.EventResult || ev.Type == msg.EventError {
+	for {
+		select {
+		case raw, ok := <-h.events:
+			if !ok {
+				// Channel closed — process exited.
+				h.flushRecoveredAssistant()
+				h.handleProcessExit()
 				return
 			}
-		}
-	}
+			translated := translateEvent(raw, h.sessionID, &h.agg, h.tracker)
+			for _, ev := range translated {
+				h.emit(ev)
 
-	// If we get here, the event channel closed — process died.
-	if h.proc != nil && !h.proc.Alive() {
-		// Process died before delivering an init event for a still-pending
-		// chain rotation — orphan the WAL row eagerly so it doesn't shadow
-		// the next start (boot recovery would also catch it, but this
-		// avoids leaking pending rows for the lifetime of this bridge).
-		// Resume has no WAL row but still needs pending state cleared.
-		if h.state != nil && h.pendingWALID != 0 {
-			if oErr := h.state.OrphanWAL(h.pendingWALID); oErr != nil {
-				log.Printf("[harness] orphan WAL after process died: %v", oErr)
+				// Update session ID if CC assigned a new one (fork case), and emit
+				// a SessionInfo event carrying the start-time flags + CC init payload.
+				if ev.Type == msg.EventSystem && ev.System != nil && ev.System.Subtype == "init" {
+					var init struct {
+						SessionID string `json:"session_id"`
+					}
+					if json.Unmarshal(raw, &init) == nil && init.SessionID != "" {
+						h.sessionID = init.SessionID
+						// Apply staged chain rotation. Cold-start / fork commit
+						// the pending WAL and write a rollout row; resume bumps
+						// sessions.updated_at (and writes a kind='resume'
+						// rollout if CC unexpectedly rotated the UUID).
+						h.recordChainOnInit(init.SessionID, findRolloutForUUID(init.SessionID))
+					}
+					if info := parseInitInfo(raw); info != nil {
+						info.SystemPrompt = h.systemPrompt
+						info.AppendSystemPrompt = h.appendSystemPrompt
+						if info.WorkingDir == "" {
+							info.WorkingDir = h.workDir
+						}
+						h.emit(msg.Event{
+							Type:      msg.EventSessionInfo,
+							Harness:   harness,
+							Timestamp: time.Now(),
+							Info:      info,
+						})
+					}
+				}
+
+				// A result or error event means this turn is done.
+				if ev.Type == msg.EventResult || ev.Type == msg.EventError {
+					h.flushRecoveredAssistant()
+					return
+				}
 			}
+
+		case <-tick:
+			if h.sinceActivity() < h.cfg.TurnIdleTimeout {
+				continue
+			}
+			if h.proc == nil || !h.proc.Alive() {
+				// Process is gone; let the channel-closed branch above run the
+				// real exit handling on the next iteration.
+				continue
+			}
+			// Process alive but the turn produced nothing for the whole idle
+			// window — it's wedged (stream-json stopped while CC kept running,
+			// the failure that stranded the "todo linker" session). Surface any
+			// OTel-only assistant text, report the stall, and kill so leftover
+			// output can't bleed into the next turn. The next message respawns
+			// via --resume, which reloads CC's rollout, so the work isn't lost.
+			h.flushRecoveredAssistant()
+			log.Printf("[claudecode] turn idle timeout (%s) session=%s; killing wedged process", h.cfg.TurnIdleTimeout, h.sessionID)
+			h.emit(msg.Event{
+				Type:      msg.EventError,
+				Harness:   harness,
+				Timestamp: time.Now(),
+				Error: &msg.ErrorEvent{
+					Code:    "TURN_IDLE_TIMEOUT",
+					Message: fmt.Sprintf("no harness activity for %s; turn abandoned and process killed", h.cfg.TurnIdleTimeout),
+				},
+			})
+			if h.proc != nil {
+				_ = h.proc.Kill()
+			}
+			return
+
+		case <-h.ctx.Done():
+			return
 		}
-		h.pendingWALID = 0
-		h.pendingIntent = ""
-		h.pendingParent = ""
-		h.emit(msg.Event{
-			Type:      msg.EventError,
-			Harness:   harness,
-			Timestamp: time.Now(),
-			Error: &msg.ErrorEvent{
-				Code:    "PROCESS_DIED",
-				Message: fmt.Sprintf("Claude Code process exited unexpectedly: %v", h.proc.Err()),
-			},
-		})
 	}
+}
+
+// handleProcessExit runs the bookkeeping for a process that has exited while a
+// turn was draining: orphan any pending chain-rotation WAL row and surface a
+// PROCESS_DIED error. Split out of drainUntilResult so the channel-closed exit
+// path stays readable alongside the watchdog path.
+func (h *Harness) handleProcessExit() {
+	if h.proc == nil || h.proc.Alive() {
+		return
+	}
+	// Process died before delivering an init event for a still-pending
+	// chain rotation — orphan the WAL row eagerly so it doesn't shadow
+	// the next start (boot recovery would also catch it, but this
+	// avoids leaking pending rows for the lifetime of this bridge).
+	// Resume has no WAL row but still needs pending state cleared.
+	if h.state != nil && h.pendingWALID != 0 {
+		if oErr := h.state.OrphanWAL(h.pendingWALID); oErr != nil {
+			log.Printf("[harness] orphan WAL after process died: %v", oErr)
+		}
+	}
+	h.pendingWALID = 0
+	h.pendingIntent = ""
+	h.pendingParent = ""
+	h.emit(msg.Event{
+		Type:      msg.EventError,
+		Harness:   harness,
+		Timestamp: time.Now(),
+		Error: &msg.ErrorEvent{
+			Code:    "PROCESS_DIED",
+			Message: fmt.Sprintf("Claude Code process exited unexpectedly: %v", h.proc.Err()),
+		},
+	})
 }
 
 // isClaudeSessionUUID reports whether s has the canonical 8-4-4-4-12 hex shape

@@ -43,7 +43,9 @@ func execClaudePTY() {
 }
 
 // emitEvent writes a canonical msg.Event as a single NDJSON line to stdout.
-func emitEvent(ev any) {
+// It is a package var (not a plain func) so tests can swap the sink and
+// capture what the harness emits without touching real stdout.
+var emitEvent = func(ev any) {
 	emitMu.Lock()
 	defer emitMu.Unlock()
 

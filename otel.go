@@ -240,15 +240,17 @@ func (r *OTelReceiver) dispatchLogRecord(lr otlpLogRecord) {
 		// we install via --settings. Already surfaced as bridge HookEvents
 		// via the prehook HTTP path; emitting again here would duplicate.
 	case "claude_code.assistant_response":
-		// A telemetry copy of the model's turn text. In -p mode the full,
-		// authoritative text already arrives on stream-json as an "assistant"
-		// event (translateAssistant), so emitting this too would duplicate —
-		// and worse, CC truncates the OTel `response` attribute (it ships a
-		// separate `response_length`), so this copy is lossy. Recovering it as
-		// a content block for the case where stream-json drops the final turn
-		// needs render-edge dedup against the stream-json copy first; tracked
-		// as a follow-up. Skipped here rather than logged so it doesn't drown
-		// the unhandled-event log (~10k lines in a few weeks).
+		// A copy of a model text segment. In PTY mode (sidecar) this is the
+		// ONLY copy — stream-json doesn't exist — so it flows straight through.
+		// In -p mode the authoritative copy also arrives on stream-json, so the
+		// harness buffers this tagged copy and only surfaces it if the turn's
+		// stream-json produces no assistant text (the drop that stranded the
+		// "todo linker" session); see Harness.emit / flushRecoveredAssistant.
+		// Empirically the `response` attribute is not truncated (max observed
+		// length ~700, no cap cluster), so it's a faithful segment.
+		if ev, ok := translateAssistantResponse(attrs, ts); ok {
+			r.emit(ev)
+		}
 	case "claude_code.mcp_server_connection", "claude_code.at_mention", "claude_code.skill_activated", "claude_code.auth":
 		// Status/lifecycle signals with no consumer today. Named explicitly so
 		// the default branch below stays a real "we've never seen this" alarm
@@ -356,6 +358,33 @@ func translateSubagentCompleted(attrs map[string]string, ts time.Time) msg.Event
 	}
 	tagOTelSource(&ev)
 	return ev
+}
+
+// translateAssistantResponse maps the OTel `claude_code.assistant_response`
+// event into an assistant text block, tagged source=otel. The consumer decides
+// what to do with it: the PTY sidecar forwards it (sole copy of the model's
+// text in PTY mode), while the -p harness buffers it and emits it only when
+// stream-json delivered no assistant text for the turn — so the healthy path
+// never double-renders. Returns ok=false when the body is absent (nothing to
+// show).
+func translateAssistantResponse(attrs map[string]string, ts time.Time) (msg.Event, bool) {
+	body := attrs["response"]
+	if body == "" {
+		return msg.Event{}, false
+	}
+	ev := msg.Event{
+		Type:      msg.EventBlock,
+		Timestamp: ts,
+		Block: &msg.BlockEvent{
+			Index: 0,
+			Block: &msg.ContentBlock{
+				Type: msg.BlockText,
+				Text: &msg.TextBlock{Text: body},
+			},
+		},
+	}
+	tagOTelSource(&ev)
+	return ev, true
 }
 
 // translateToolDecision maps the OTel `claude_code.tool_decision` event
