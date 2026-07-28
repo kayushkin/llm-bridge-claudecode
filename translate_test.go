@@ -152,3 +152,179 @@ func TestTranslateAssistant_ToolUseAndResultUnchanged(t *testing.T) {
 		t.Errorf("expected EventToolCall, got %s", events[0].Type)
 	}
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Subagent demux key (TEAM-ORCHESTRATION.md §21.4)
+// ──────────────────────────────────────────────────────────────────────────────
+
+// subagentAssistantFrame is a verbatim subagent frame from a live
+// `claude -p --output-format stream-json` capture (CC 2.1.x), trimmed to one
+// content block. Note that session_id is the PARENT's — Claude Code stamps
+// every frame it emits with the parent process's session id, which is exactly
+// why parent_tool_use_id has to be the discriminator.
+const subagentAssistantFrame = `{"type":"assistant","message":{"model":"claude-haiku-4-5-20251001","id":"msg_011CdUvE9NrBfik9EV8vKZng","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":10,"output_tokens":4}},"parent_tool_use_id":"toolu_01C6u17fXLPviJJdM4tRLSjd","session_id":"5c3112cf-ac7b-4215-92de-991dd4628667","subagent_type":"Explore","task_description":"tiny-probe"}`
+
+// parentAssistantFrame is the same shape without the discriminator — the
+// parent's own work.
+const parentAssistantFrame = `{"type":"assistant","message":{"model":"claude-haiku-4-5-20251001","id":"msg_0199parent","type":"message","role":"assistant","content":[{"type":"text","text":"spawning"}],"usage":{"input_tokens":10,"output_tokens":4}},"parent_tool_use_id":null,"session_id":"5c3112cf-ac7b-4215-92de-991dd4628667"}`
+
+// TestTranslateEventCarriesSubagentParentID pins the demux key. Dropping
+// parent_tool_use_id is what collapsed every harness subagent onto its parent's
+// session and left the subagent rows with no link to what spawned them; the
+// adapter is the only layer that ever sees the field.
+func TestTranslateEventCarriesSubagentParentID(t *testing.T) {
+	events := translateEvent(json.RawMessage(subagentAssistantFrame), "fallback-session", &UsageAggregator{}, nil)
+	if len(events) == 0 {
+		t.Fatal("subagent assistant frame produced no events")
+	}
+	const want = "toolu_01C6u17fXLPviJJdM4tRLSjd"
+	for i, ev := range events {
+		if ev.HarnessParentID != want {
+			t.Errorf("event %d (%s): harness_parent_id = %q, want %q", i, ev.Type, ev.HarnessParentID, want)
+		}
+	}
+}
+
+// TestTranslateEventLeavesParentFramesUnstamped is the negative guard: if the
+// parent's own frames picked up a harness_parent_id, the demux would route the
+// parent's work into a subagent session.
+func TestTranslateEventLeavesParentFramesUnstamped(t *testing.T) {
+	events := translateEvent(json.RawMessage(parentAssistantFrame), "fallback-session", &UsageAggregator{}, nil)
+	if len(events) == 0 {
+		t.Fatal("parent assistant frame produced no events")
+	}
+	for i, ev := range events {
+		if ev.HarnessParentID != "" {
+			t.Errorf("event %d (%s): parent frame got harness_parent_id = %q, want empty", i, ev.Type, ev.HarnessParentID)
+		}
+	}
+}
+
+// TestTranslateEventStampsTaskNarrationOnParent locks in which side of the
+// split the narration falls on: task_started describes a spawn the PARENT
+// performed, so it must stay on the parent's session even though it names the
+// subagent. The live capture confirms CC emits it with no parent_tool_use_id.
+func TestTranslateEventStampsTaskNarrationOnParent(t *testing.T) {
+	const frame = `{"type":"system","subtype":"task_started","task_id":"a13cb6a91d4c5d3dc","tool_use_id":"toolu_01C6u17fXLPviJJdM4tRLSjd","description":"tiny-probe","subagent_type":"Explore","session_id":"5c3112cf-ac7b-4215-92de-991dd4628667"}`
+	events := translateEvent(json.RawMessage(frame), "fallback-session", &UsageAggregator{}, nil)
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want 1", len(events))
+	}
+	ev := events[0]
+	if ev.HarnessParentID != "" {
+		t.Errorf("task_started got harness_parent_id = %q; it belongs to the parent that spawned the task", ev.HarnessParentID)
+	}
+	// The demux needs both ids off this frame to build the subagent's dedupe key.
+	if ev.System == nil || ev.System.TaskID != "a13cb6a91d4c5d3dc" || ev.System.ToolUseID != "toolu_01C6u17fXLPviJJdM4tRLSjd" {
+		t.Fatalf("task_started did not surface both correlator ids: %+v", ev.System)
+	}
+}
+
+// subagentPromptFrame is the verbatim frame Claude Code emits for a Task
+// subagent under the flags this bridge runs it with:
+//
+//	claude -p --input-format stream-json --output-format stream-json --verbose
+//
+// Measured, not assumed. In that mode it is the ONLY frame the subagent
+// contributes to the parent's stream — the subagent's assistant turns never
+// appear inline, they only reach its own rollout file on disk. (Plain `-p` with
+// a text prompt behaves differently and DOES inline the assistant turns, which
+// is what an earlier capture recorded; the bridge does not run that way.)
+const subagentPromptFrame = `{"type":"user","message":{"role":"user","content":[{"type":"text","text":"reply with the single word ping"}]},"parent_tool_use_id":"toolu_01QSYM3UeBGpKU28zdnpuftA","session_id":"c8939508-e6ea-4341-b614-c0adbe9ace1c","subagent_type":"Explore","task_description":"probe2"}`
+
+// operatorEchoFrame is the shape that must still be dropped: a user frame with
+// no parent_tool_use_id is an echo of a message the operator already sent.
+const operatorEchoFrame = `{"type":"user","message":{"role":"user","content":[{"type":"text","text":"do the thing"}]},"parent_tool_use_id":null,"session_id":"c8939508-e6ea-4341-b614-c0adbe9ace1c"}`
+
+// TestTranslateEventKeepsSubagentPromptFrame is the regression for the bug the
+// live e2e caught: every `user` frame was dropped as an echo, which threw away
+// the one frame carrying parent_tool_use_id. The demux upstream was correct and
+// still never fired, because nothing ever reached it.
+func TestTranslateEventKeepsSubagentPromptFrame(t *testing.T) {
+	events := translateEvent(json.RawMessage(subagentPromptFrame), "fallback-session", &UsageAggregator{}, nil)
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want 1 — the subagent's only live frame must survive translation", len(events))
+	}
+	ev := events[0]
+	if ev.Type != msg.EventUserMessage {
+		t.Errorf("type = %q, want user_message", ev.Type)
+	}
+	if ev.HarnessParentID != "toolu_01QSYM3UeBGpKU28zdnpuftA" {
+		t.Errorf("harness_parent_id = %q; without it bridge-server cannot route the frame", ev.HarnessParentID)
+	}
+	if ev.Result == nil || ev.Result.Text != "reply with the single word ping" {
+		t.Errorf("prompt text did not survive: %+v", ev.Result)
+	}
+}
+
+func TestTranslateEventStillDropsOperatorEcho(t *testing.T) {
+	if events := translateEvent(json.RawMessage(operatorEchoFrame), "fallback-session", &UsageAggregator{}, nil); len(events) != 0 {
+		t.Fatalf("operator echo produced %d events, want 0", len(events))
+	}
+}
+
+func TestExtractUserText(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{"bare string", `"hello"`, "hello"},
+		{"text blocks", `[{"type":"text","text":"a"},{"type":"text","text":"b"}]`, "a\nb"},
+		{"tool result only", `[{"type":"tool_result","content":"x"}]`, ""},
+		{"empty", ``, ""},
+		{"malformed", `{"nope":1}`, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := extractUserText(json.RawMessage(tc.content)); got != tc.want {
+				t.Errorf("extractUserText(%s) = %q, want %q", tc.content, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestTranslateSystemSurfacesTaskTerminalIDs is the second regression the live
+// e2e caught. task_updated and task_notification fell through to the catch-all
+// system branch, which sets only Subtype — so the frames that report a
+// subagent finished arrived without naming the subagent, and every promoted
+// subagent session sat at "running" forever. Both frames are verbatim from a
+// live capture.
+func TestTranslateSystemSurfacesTaskTerminalIDs(t *testing.T) {
+	cases := []struct {
+		name    string
+		frame   string
+		subtype string
+	}{
+		{
+			"task_updated",
+			`{"type":"system","subtype":"task_updated","task_id":"a13cb6a91d4c5d3dc","patch":{"status":"completed","end_time":1785262846220},"session_id":"5c3112cf"}`,
+			"task_updated",
+		},
+		{
+			"task_notification",
+			`{"type":"system","subtype":"task_notification","task_id":"a13cb6a91d4c5d3dc","tool_use_id":"toolu_01C6u17fXLPviJJdM4tRLSjd","status":"completed","session_id":"5c3112cf"}`,
+			"task_notification",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			events := translateEvent(json.RawMessage(tc.frame), "fallback-session", &UsageAggregator{}, nil)
+			if len(events) != 1 {
+				t.Fatalf("got %d events, want 1", len(events))
+			}
+			sys := events[0].System
+			if sys == nil || sys.Subtype != tc.subtype {
+				t.Fatalf("subtype = %+v, want %s", sys, tc.subtype)
+			}
+			if sys.TaskID != "a13cb6a91d4c5d3dc" {
+				t.Errorf("task_id = %q; without it nothing can tell which subagent this closes", sys.TaskID)
+			}
+			// The status stays on Raw — there is no canonical field for it —
+			// so Raw must survive translation.
+			if len(events[0].Raw) == 0 {
+				t.Error("Raw was dropped; the terminal status is only readable there")
+			}
+		})
+	}
+}

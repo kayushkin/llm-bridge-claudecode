@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/kayushkin/llm-bridge/identity"
@@ -19,6 +20,13 @@ type ccStreamEvent struct {
 	Message   json.RawMessage `json:"message,omitempty"`
 	Result    string          `json:"result,omitempty"`
 	IsError   bool            `json:"is_error,omitempty"`
+
+	// ParentToolUseID is the tool_use_id of the Task/Agent call that spawned
+	// the subagent this frame belongs to. Claude Code emits a subagent's own
+	// frames inline on the parent process's stdout, all carrying the PARENT's
+	// session_id, so session_id cannot tell them apart — this field is the only
+	// discriminator. Null/absent on the parent's own frames.
+	ParentToolUseID string `json:"parent_tool_use_id,omitempty"`
 
 	// Result fields
 	DurationMS        int64             `json:"duration_ms,omitempty"`
@@ -70,6 +78,34 @@ func translateEvent(raw json.RawMessage, sessionID string, agg *UsageAggregator,
 		sid = sessionID
 	}
 
+	out := translateEventByType(ev, sid, raw, agg, tracker)
+
+	// Carry the subagent discriminator through to the canonical event so
+	// bridge-server can demux a harness subagent's frames into their own
+	// session (TEAM-ORCHESTRATION.md §21.4).
+	//
+	// Measured against a live capture taken with the exact flags spawnClaudeCode
+	// uses: every frame — parent and subagent alike — carries the PARENT's
+	// session_id, so session_id discriminates nothing, and only a subagent's
+	// frames carry parent_tool_use_id. The task_started/task_progress narration
+	// leaves it null and so stays on the parent, which is right: the parent is
+	// the one narrating that it spawned a task.
+	//
+	// How much a subagent contributes is flag-dependent — under these flags it
+	// is one `user` frame; see the `case "user"` branch below.
+	if ev.ParentToolUseID != "" {
+		for i := range out {
+			out[i].HarnessParentID = ev.ParentToolUseID
+		}
+	}
+	return out
+}
+
+// translateEventByType dispatches one parsed stream-json frame to the
+// per-type translator. Split out of translateEvent so the caller can stamp
+// frame-wide fields (HarnessParentID) onto every event a frame produces
+// without repeating the assignment at each translator's construction sites.
+func translateEventByType(ev ccStreamEvent, sid string, raw json.RawMessage, agg *UsageAggregator, tracker *identity.Tracker) []msg.Event {
 	switch ev.Type {
 	case "system":
 		return translateSystem(ev, sid, raw)
@@ -88,13 +124,79 @@ func translateEvent(raw json.RawMessage, sessionID string, agg *UsageAggregator,
 	case "control_response", "keep_alive":
 		return nil // consumed internally
 	case "user":
-		return nil // echo of user messages (e.g. interrupt synthetic), skip
+		// A `user` frame with no parent_tool_use_id is an echo of the operator's
+		// own message (e.g. the interrupt synthetic) — already recorded when it
+		// was sent, so skip it.
+		//
+		// A `user` frame WITH one is a different thing wearing the same type
+		// tag: it is the subagent's prompt, addressed to the subagent. Under the
+		// flags this bridge runs claude with (-p --input-format stream-json
+		// --output-format stream-json --verbose) it is the ONLY frame a Task
+		// subagent contributes to the parent's stream — measured, not assumed:
+		// the subagent's assistant turns are not emitted inline in this mode,
+		// they only reach disk in the subagent's own rollout file. Dropping it
+		// therefore drops the sole live signal that a subagent exists, along
+		// with the parent_tool_use_id the demux keys on.
+		if ev.ParentToolUseID == "" {
+			return nil
+		}
+		return translateSubagentPrompt(ev, sid, raw)
 	default:
 		// Forward unknown events as system events for visibility.
 		return []msg.Event{makeEvent(sid, msg.EventSystem, raw, func(e *msg.Event) {
 			e.System = &msg.SystemEvent{Subtype: ev.Type, Message: string(raw)}
 		})}
 	}
+}
+
+// translateSubagentPrompt converts the `user` frame Claude Code emits when it
+// hands a Task subagent its instructions. The frame's content is the prompt the
+// subagent was given, so it becomes a user_message on the subagent's own
+// session once bridge-server routes it there by parent_tool_use_id.
+//
+// Returns nil when the frame carries no text (a tool-result-only frame), rather
+// than emitting an empty message.
+func translateSubagentPrompt(ev ccStreamEvent, sid string, raw json.RawMessage) []msg.Event {
+	var m struct {
+		Content json.RawMessage `json:"content"`
+	}
+	if json.Unmarshal(ev.Message, &m) != nil {
+		return nil
+	}
+	text := extractUserText(m.Content)
+	if text == "" {
+		return nil
+	}
+	return []msg.Event{makeEvent(sid, msg.EventUserMessage, raw, func(e *msg.Event) {
+		e.Result = &msg.ResultEvent{Text: text}
+	})}
+}
+
+// extractUserText pulls the plain text out of a CC user message's content,
+// which is either a bare string or an array of content blocks. Non-text blocks
+// (tool results, images) contribute nothing.
+func extractUserText(content json.RawMessage) string {
+	if len(content) == 0 {
+		return ""
+	}
+	var asString string
+	if json.Unmarshal(content, &asString) == nil {
+		return asString
+	}
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(content, &blocks) != nil {
+		return ""
+	}
+	var parts []string
+	for _, b := range blocks {
+		if b.Type == "text" && b.Text != "" {
+			parts = append(parts, b.Text)
+		}
+	}
+	return strings.Join(parts, "\n")
 }
 
 // parseInitInfo extracts the session-metadata fields from a Claude Code
@@ -210,6 +312,28 @@ func translateSystem(ev ccStreamEvent, sid string, raw json.RawMessage) []msg.Ev
 				TaskID:       tp.TaskID,
 				Description:  tp.Description,
 				LastToolName: tp.LastToolName,
+			}
+		}))
+
+	case "task_updated", "task_notification":
+		// The frames that close a subagent task out. Both name the task they
+		// report on, and without that id surfaced they arrive as anonymous
+		// "something changed" events — a consumer cannot tell WHICH subagent
+		// finished, which is what left promoted subagent sessions stuck at
+		// running. Surface the same correlators task_started/task_progress
+		// already carry. The status itself has no canonical SystemEvent field
+		// and stays readable on Raw: task_updated nests it under "patch",
+		// task_notification puts it at the top level.
+		var tu struct {
+			TaskID    string `json:"task_id"`
+			ToolUseID string `json:"tool_use_id"`
+		}
+		_ = json.Unmarshal(raw, &tu)
+		events = append(events, makeEvent(sid, msg.EventSystem, raw, func(e *msg.Event) {
+			e.System = &msg.SystemEvent{
+				Subtype:   ev.Subtype,
+				TaskID:    tu.TaskID,
+				ToolUseID: tu.ToolUseID,
 			}
 		}))
 
