@@ -86,6 +86,7 @@ type StartParams struct {
 	WorkDir      string   `json:"work_dir,omitempty"`      // working directory for resumed sessions
 
 	// Claude Code CLI flags (start-time)
+	Model              string   `json:"model,omitempty"`                // --model: the model this session runs on; overrides the CLAUDE_MODEL default
 	SystemPrompt       string   `json:"system_prompt,omitempty"`        // --system-prompt: replace default system prompt
 	AppendSystemPrompt string   `json:"append_system_prompt,omitempty"` // --append-system-prompt: append to default system prompt
 	AddDirs            []string `json:"add_dirs,omitempty"`             // --add-dir: additional directories for tool access
@@ -163,6 +164,12 @@ type Harness struct {
 	// surfaced in SessionInfo after every init (CC never echoes them back).
 	systemPrompt       string
 	appendSystemPrompt string
+
+	// model is the session's own model choice — from the start params, or
+	// from a later set_model. Persisted across respawns because --model is a
+	// spawn-time flag: without it a resumed session would silently fall back
+	// to the process-wide CLAUDE_MODEL default and change model mid-chat.
+	model string
 
 	// state is the per-bridge persistent chain (sessions/rollouts/wal).
 	// Opened once at boot via openStateAndRecover.
@@ -456,6 +463,9 @@ func (h *Harness) handleStart(params StartParams) error {
 	if params.AppendSystemPrompt != "" {
 		h.appendSystemPrompt = params.AppendSystemPrompt
 	}
+	if params.Model != "" {
+		h.model = params.Model
+	}
 
 	var extraArgs []string
 
@@ -487,8 +497,8 @@ func (h *Harness) handleStart(params StartParams) error {
 	// Don't pass bridge session IDs to Claude Code — CC requires UUIDs
 	// and bridge IDs are timestamp-based. Let CC generate its own session ID.
 
-	if h.cfg.Model != "" {
-		extraArgs = append(extraArgs, "--model", h.cfg.Model)
+	if model := h.modelForSpawn(); model != "" {
+		extraArgs = append(extraArgs, "--model", model)
 	}
 
 	if params.SystemPrompt != "" {
@@ -836,15 +846,34 @@ func (h *Harness) handleResume() error {
 	})
 }
 
-// handleSetModel forwards a set_model control_request to Claude Code.
+// modelForSpawn returns the --model value for the next Claude Code spawn: the
+// model this session was given (start params or a later set_model), falling
+// back to the process-wide CLAUDE_MODEL default for callers that name none.
+func (h *Harness) modelForSpawn() string {
+	if h.model != "" {
+		return h.model
+	}
+	if h.cfg == nil {
+		return ""
+	}
+	return h.cfg.Model
+}
+
+// handleSetModel forwards a set_model control_request to Claude Code and
+// records the choice, so the next respawn spawns on the same model instead of
+// reverting to the CLAUDE_MODEL default.
 func (h *Harness) handleSetModel(params SetModelParams) error {
 	if params.Model == "" {
 		return fmt.Errorf("set_model: model is required")
 	}
-	return h.handleControl(ControlParams{
+	if err := h.handleControl(ControlParams{
 		Subtype: "set_model",
 		Payload: map[string]any{"model": params.Model},
-	})
+	}); err != nil {
+		return err
+	}
+	h.model = params.Model
+	return nil
 }
 
 // handleControl sends a generic control_request to Claude Code's stdin. The
@@ -860,9 +889,24 @@ func (h *Harness) handleControl(params ControlParams) error {
 	return h.proc.WriteControl(requestID, params.Subtype, params.Payload)
 }
 
+// SessionConfigParams is the payload POST /sessions/{id}/config sends: the
+// bridge-server marshals msg.ConfigSessionRequest and hands it over as
+// "config:<json>" (llm-bridge-server internal/server/sessions.go
+// handleConfigSession). It carries no subtype — the fields present say what to
+// change — which is also the shape the conformance suite sends
+// (conformance/runner.go) and the reference mock harness accepts.
+type SessionConfigParams struct {
+	Model         string   `json:"model,omitempty"`
+	Effort        string   `json:"effort,omitempty"`
+	MaxBudget     *float64 `json:"max_budget,omitempty"`
+	DisabledTools []string `json:"disabled_tools,omitempty"`
+}
+
 // handleConfig is the entry point for "config:<json>" method routing from the
-// bridge-server. It inspects the JSON payload's "subtype" field and dispatches
-// to the typed handler. Any extra fields are passed as the control payload.
+// bridge-server. A payload naming a "subtype" is a Claude Code control request
+// (set_model, interrupt, or anything newer, passed through untouched). A
+// payload without one is the bridge-server's own session-config shape, which
+// handleSessionConfig applies field by field.
 func (h *Harness) handleConfig(raw json.RawMessage) error {
 	var probe struct {
 		Subtype string `json:"subtype"`
@@ -872,7 +916,7 @@ func (h *Harness) handleConfig(raw json.RawMessage) error {
 	}
 	switch probe.Subtype {
 	case "":
-		return fmt.Errorf("config: subtype is required")
+		return h.handleSessionConfig(raw)
 	case "set_model":
 		var p SetModelParams
 		if err := json.Unmarshal(raw, &p); err != nil {
@@ -892,6 +936,59 @@ func (h *Harness) handleConfig(raw json.RawMessage) error {
 		delete(payload, "subtype")
 		return h.handleControl(ControlParams{Subtype: probe.Subtype, Payload: payload})
 	}
+}
+
+// handleSessionConfig applies the bridge-server's session-config payload to a
+// running session. Only the model can change under a live Claude Code process:
+// --effort, --max-budget-usd and --disallowed-tools are spawn-time CLI flags,
+// so a request to change them mid-session is reported as not applied rather
+// than dropped. Every request answers with a system event naming exactly what
+// changed, so the caller never has to assume it worked.
+func (h *Harness) handleSessionConfig(raw json.RawMessage) error {
+	var params SessionConfigParams
+	if err := json.Unmarshal(raw, &params); err != nil {
+		return fmt.Errorf("parse session config: %w", err)
+	}
+
+	var applied, startTimeOnly []string
+	if params.Model != "" {
+		if err := h.handleSetModel(SetModelParams{Model: params.Model}); err != nil {
+			return fmt.Errorf("config: set model to %q: %w", params.Model, err)
+		}
+		applied = append(applied, "model="+params.Model)
+	}
+	if params.Effort != "" {
+		startTimeOnly = append(startTimeOnly, "effort")
+	}
+	if params.MaxBudget != nil {
+		startTimeOnly = append(startTimeOnly, "max_budget")
+	}
+	if len(params.DisabledTools) > 0 {
+		startTimeOnly = append(startTimeOnly, "disabled_tools")
+	}
+
+	if len(applied) == 0 && len(startTimeOnly) == 0 {
+		return fmt.Errorf("config: payload sets nothing (want a subtype, or one of model/effort/max_budget/disabled_tools)")
+	}
+
+	subtype, message := "config_updated", "applied "+strings.Join(applied, " ")
+	if len(applied) == 0 {
+		subtype, message = "config_ignored", "applied nothing"
+	}
+	if len(startTimeOnly) > 0 {
+		message += "; spawn-time only, unchanged: " + strings.Join(startTimeOnly, ", ")
+	}
+	h.emit(msg.Event{
+		Type:      msg.EventSystem,
+		Harness:   harness,
+		Timestamp: time.Now(),
+		System:    &msg.SystemEvent{Subtype: subtype, Message: message},
+	})
+
+	if len(startTimeOnly) > 0 {
+		return fmt.Errorf("config: a running Claude Code process cannot change its spawn-time flags: %s", strings.Join(startTimeOnly, ", "))
+	}
+	return nil
 }
 
 // Interrupt sends an interrupt to the running CC process.
