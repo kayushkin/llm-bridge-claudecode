@@ -7,7 +7,8 @@ import (
 )
 
 // defaultTurnIdleTimeout is how long a turn may produce zero harness activity
-// (no stream-json event, no OTel event) while the CC process is still alive
+// (nothing on stdout at all, not even a keep_alive; no OTel event) while the
+// CC process is still alive
 // before drainUntilResult treats it as wedged and unblocks. It must sit
 // comfortably above the longest legitimate silence — a single overloaded model
 // call can stall for ~3 minutes before its retry telemetry lands — so 5 minutes
@@ -21,10 +22,12 @@ type Config struct {
 	WorkDir    string
 	APIKey     string
 
-	// TurnIdleTimeout bounds how long drainUntilResult waits on a silent-but-
-	// alive turn before surfacing a TURN_IDLE_TIMEOUT error and killing the
-	// wedged process. Zero disables the watchdog (the turn waits forever on a
-	// stream-json result, the pre-watchdog behavior).
+	// TurnIdleTimeout bounds how long drainUntilResult waits on a turn that is
+	// producing nothing while its process is still alive, before surfacing a
+	// TURN_IDLE_TIMEOUT error and killing it. Any stream-json line resets the
+	// clock, keep_alive included, so this only fires on genuine silence. Zero
+	// disables the watchdog (the turn waits forever on a stream-json result,
+	// the pre-watchdog behavior).
 	TurnIdleTimeout time.Duration
 }
 
