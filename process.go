@@ -30,7 +30,8 @@ type CCProcess struct {
 	err       error         // exit error, set before done is closed
 
 	// otelRecv is the per-process OTLP receiver, if telemetry was enabled
-	// at spawn. The exit goroutine shuts it down after CC exits.
+	// at spawn. The exit goroutine shuts it down a short flush window after
+	// CC exits — after done is closed, never before it.
 	otelRecv *OTelReceiver
 }
 
@@ -145,12 +146,28 @@ func spawnClaudeCode(cfg *Config, sessionID string, allowedTools []string, otelR
 		otelRecv:  otelRecv,
 	}
 
-	// Monitor process exit in background. OTel exporter batches with a 1s
-	// interval; give it a short flush window after the subprocess exits
-	// before tearing the receiver down so trailing batches land as
-	// EventAPICall msg.Events rather than getting dropped.
+	// Monitor process exit in background.
+	//
+	// done is closed the moment cmd.Wait returns, before the telemetry
+	// teardown below, and the order matters: done is what Alive reads, and
+	// three handlers branch on Alive to choose respawn-vs-write. Closing it
+	// after the flush window made Alive answer "true" for two seconds after
+	// every death, so a resume arriving in that window returned success
+	// having respawned nothing, and a message wrote to a dead process's
+	// stdin. done means the process is gone; it has never meant telemetry
+	// is drained.
+	//
+	// p.err is assigned before the close so a reader that saw done closed
+	// sees the exit error too — the contract Err documents.
+	//
+	// The OTel exporter batches with a 1s interval, so the receiver still
+	// gets a short flush window after the subprocess exits before it is
+	// torn down; trailing batches land as EventAPICall msg.Events rather
+	// than getting dropped. Nothing waits on this goroutine, so the wait
+	// costs only itself.
 	go func() {
 		p.err = cmd.Wait()
+		close(p.done)
 		if p.otelRecv != nil {
 			time.Sleep(2 * time.Second)
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -159,7 +176,6 @@ func spawnClaudeCode(cfg *Config, sessionID string, allowedTools []string, otelR
 			}
 			cancel()
 		}
-		close(p.done)
 	}()
 
 	return p, nil
