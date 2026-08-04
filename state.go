@@ -332,6 +332,24 @@ VALUES (?, ?, ?, ?, ?, ?, ?)`,
 	return err
 }
 
+// RolloutPathFor returns the on-disk transcript path recorded for a Claude
+// Code session UUID, or "" when the row exists without one.
+//
+// The newest row wins. A UUID appears once per rollout it opened, and a resume
+// keeps the same UUID, so the same id can carry several rows; the latest is the
+// one whose file is certain to still be there.
+func (s *State) RolloutPathFor(harnessSessionID string) (string, error) {
+	var path string
+	err := s.db.QueryRow(`
+SELECT COALESCE(rollout_path, '') FROM rollouts
+WHERE harness_session_id = ? AND rollout_path != ''
+ORDER BY sequence DESC, created_at DESC LIMIT 1`, harnessSessionID).Scan(&path)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return path, err
+}
+
 // ListRollouts returns the rollouts for one bridge_session_id ordered by
 // sequence ascending.
 func (s *State) ListRollouts(bridgeSessionID string) ([]RolloutRow, error) {

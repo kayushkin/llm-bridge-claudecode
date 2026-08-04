@@ -481,17 +481,42 @@ func (h *Harness) handleStart(params StartParams) error {
 	// UUID there is nothing resumable, so drop the flag and let CC mint a fresh
 	// session; its init event then persists that real UUID, so the bad id
 	// self-heals on the next turn.
+	// continueUUID is the conversation Claude Code is being asked to read: the
+	// one being resumed, or the one being forked from. Empty for a cold start.
+	var continueUUID string
+
 	switch {
 	case params.Resume && isClaudeSessionUUID(resumeID):
 		extraArgs = append(extraArgs, "--resume", resumeID)
+		continueUUID = resumeID
 	case params.Resume:
 		log.Printf("[harness] %s: skipping --resume %q (not a Claude Code session UUID); starting a fresh session",
 			h.bridgeSessionID, resumeID)
 	case params.Fork != "" && isClaudeSessionUUID(params.Fork):
 		extraArgs = append(extraArgs, "--resume", params.Fork, "--fork-session")
+		continueUUID = params.Fork
 	case params.Fork != "":
 		log.Printf("[harness] %s: skipping --fork-session of %q (not a Claude Code session UUID); starting a fresh session",
 			h.bridgeSessionID, params.Fork)
+	}
+
+	// Run where the conversation IS, not where we were asked to run.
+	//
+	// Claude Code finds a conversation only from the directory it was created
+	// in (see transcript.go). A resume pointed anywhere else does not start in
+	// the wrong place — it does not start at all, and the session aborts with
+	// "No conversation found with session ID". The directory a caller
+	// configures governs where NEW sessions run; it cannot move a conversation
+	// that already exists, because Claude Code has no way to move one.
+	//
+	// This overrides h.workDir deliberately and says so in the log, because the
+	// alternative is honouring a directory that makes the session fail.
+	if continueUUID != "" {
+		if dir, ok := transcriptWorkingDir(h.state, continueUUID); ok && dir != h.workDir {
+			log.Printf("[harness] %s: resuming %s from %q, not %q — that is where Claude Code keeps this conversation",
+				h.bridgeSessionID, continueUUID, dir, h.workDir)
+			h.workDir = dir
+		}
 	}
 
 	// Don't pass bridge session IDs to Claude Code — CC requires UUIDs
@@ -626,11 +651,16 @@ func (h *Harness) handleStart(params StartParams) error {
 		extraArgs = append(extraArgs, "--permission-mode", "bypassPermissions")
 	}
 
-	// Use params.WorkDir if provided (for resumed sessions), otherwise fall back to config.
+	// h.workDir, not params.WorkDir. It starts as params.WorkDir above and is
+	// the value that SURVIVES a respawn, so reading params here made a respawn
+	// that carried no WorkDir silently fall back to the process-wide config and
+	// drop the directory the session had been running in. It is also the value
+	// the resume resolution above corrects to the conversation's own directory,
+	// which is the whole point of doing that work.
 	cfg := h.cfg
-	if params.WorkDir != "" {
+	if h.workDir != "" {
 		cfgCopy := *h.cfg
-		cfgCopy.WorkDir = params.WorkDir
+		cfgCopy.WorkDir = h.workDir
 		cfg = &cfgCopy
 	}
 
