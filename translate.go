@@ -392,20 +392,40 @@ func translateSystem(ev ccStreamEvent, sid string, raw json.RawMessage) []msg.Ev
 		// report on, and without that id surfaced they arrive as anonymous
 		// "something changed" events — a consumer cannot tell WHICH subagent
 		// finished, which is what left promoted subagent sessions stuck at
-		// running. Surface the same correlators task_started/task_progress
-		// already carry. The status itself has no canonical SystemEvent field
-		// and stays readable on Raw: task_updated nests it under "patch",
-		// task_notification puts it at the top level.
+		// running.
+		//
+		// Claude Code spells the status differently per subtype: task_updated
+		// nests it under "patch", task_notification puts it at the top level.
+		// That difference is CC's, not the bridge's, so it is normalized here
+		// onto SystemEvent.TaskStatus rather than left on Raw for every
+		// consumer to rediscover. It used to be left on Raw, and bridge-server
+		// duly re-parsed the frame to get it back.
+		//
+		// Only task_notification carries the summary and the transcript path.
+		// task_updated is the state change; task_notification is the report.
 		var tu struct {
-			TaskID    string `json:"task_id"`
-			ToolUseID string `json:"tool_use_id"`
+			TaskID     string `json:"task_id"`
+			ToolUseID  string `json:"tool_use_id"`
+			Status     string `json:"status"`
+			Summary    string `json:"summary"`
+			OutputFile string `json:"output_file"`
+			Patch      struct {
+				Status string `json:"status"`
+			} `json:"patch"`
 		}
 		_ = json.Unmarshal(raw, &tu)
+		status := tu.Status
+		if status == "" {
+			status = tu.Patch.Status
+		}
 		events = append(events, makeEvent(sid, msg.EventSystem, raw, func(e *msg.Event) {
 			e.System = &msg.SystemEvent{
-				Subtype:   ev.Subtype,
-				TaskID:    tu.TaskID,
-				ToolUseID: tu.ToolUseID,
+				Subtype:        ev.Subtype,
+				TaskID:         tu.TaskID,
+				ToolUseID:      tu.ToolUseID,
+				TaskStatus:     status,
+				TaskSummary:    tu.Summary,
+				TaskOutputFile: tu.OutputFile,
 			}
 		}))
 

@@ -417,3 +417,64 @@ func TestTranslateSystemSurfacesTaskTerminalIDs(t *testing.T) {
 		})
 	}
 }
+
+// TestTranslateSystemNormalizesTaskStatus pins the field that actually settles
+// a subagent. Claude Code spells the status two different ways — task_updated
+// nests it under "patch", task_notification puts it at the top level — and it
+// used to be surfaced as neither, left on Raw with a comment saying so. That
+// pushed the difference onto every consumer: bridge-server re-parsed the raw
+// frame to recover it, a second parser of CC's wire format that would have
+// broken silently the day CC renamed the field.
+//
+// Frames are verbatim from a live capture (CC 2.1.220, the flags the bridge
+// actually runs: -p --input-format stream-json --output-format stream-json).
+func TestTranslateSystemNormalizesTaskStatus(t *testing.T) {
+	cases := []struct {
+		name       string
+		frame      string
+		wantStatus string
+		wantSummry string
+		wantOutput string
+	}{
+		{
+			name:       "task_updated nests status under patch",
+			frame:      `{"type":"system","subtype":"task_updated","task_id":"a66ecc868c9c5c8db","patch":{"status":"completed","end_time":1785969393340},"session_id":"741b7725"}`,
+			wantStatus: "completed",
+		},
+		{
+			name: "task_notification puts status at top level, with the report",
+			// Interpreted literal, not raw: the real summary is markdown and
+			// contains code fences, which would close a raw string.
+			frame:      "{\"type\":\"system\",\"subtype\":\"task_notification\",\"task_id\":\"a66ecc868c9c5c8db\",\"tool_use_id\":\"toolu_01PdEBPefCBfgx62jXmkfBvP\",\"status\":\"completed\",\"output_file\":\"/tmp/claude-1000/x/tasks/a66ecc868c9c5c8db.output\",\"summary\":\"The command's exact stdout was:\\n\\n```\\nhi\\n```\",\"session_id\":\"741b7725\"}",
+			wantStatus: "completed",
+			wantSummry: "The command's exact stdout was:\n\n```\nhi\n```",
+			wantOutput: "/tmp/claude-1000/x/tasks/a66ecc868c9c5c8db.output",
+		},
+		{
+			name:       "a non-terminal status is carried through, not swallowed",
+			frame:      `{"type":"system","subtype":"task_updated","task_id":"a66ecc868c9c5c8db","patch":{"status":"in_progress"},"session_id":"741b7725"}`,
+			wantStatus: "in_progress",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			events := translateEvent(json.RawMessage(tc.frame), "fallback-session", &UsageAggregator{}, nil)
+			if len(events) != 1 {
+				t.Fatalf("got %d events, want 1", len(events))
+			}
+			sys := events[0].System
+			if sys == nil {
+				t.Fatal("no SystemEvent")
+			}
+			if sys.TaskStatus != tc.wantStatus {
+				t.Errorf("TaskStatus = %q, want %q — without it nothing can settle the subagent", sys.TaskStatus, tc.wantStatus)
+			}
+			if sys.TaskSummary != tc.wantSummry {
+				t.Errorf("TaskSummary = %q, want %q", sys.TaskSummary, tc.wantSummry)
+			}
+			if sys.TaskOutputFile != tc.wantOutput {
+				t.Errorf("TaskOutputFile = %q, want %q", sys.TaskOutputFile, tc.wantOutput)
+			}
+		})
+	}
+}

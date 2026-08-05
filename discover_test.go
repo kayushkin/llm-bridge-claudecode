@@ -321,3 +321,66 @@ func TestDiscover_SubagentSourceTag(t *testing.T) {
 		t.Fatalf("workflow subagent project = %q, want /tmp/proj (deeper nesting must not skew project)", byProject["agent-wf1"])
 	}
 }
+
+// TestClassifySubagentPathReportsParent pins the lineage that Claude Code
+// records on disk and this function used to throw away. The parent's UUID sits
+// directly above `subagents` in the path; classifySubagentPath read the
+// segment above THAT for the project and skipped the parent entirely, so every
+// discovered subagent landed with no link to what spawned it — 1,259 such rows
+// on this host at the time of writing.
+func TestClassifySubagentPathReportsParent(t *testing.T) {
+	const parentUUID = "d8a4678c-01d4-4f39-9c7f-e22ede97f6da"
+	base := "/home/u/.claude/projects/-home-u-repos/" + parentUUID
+
+	cases := []struct {
+		name       string
+		path       string
+		wantSource string
+		wantParent string
+		wantOK     bool
+	}{
+		{
+			name:       "Task-tool layout",
+			path:       base + "/subagents/agent-a369d3bc29842e6c3.jsonl",
+			wantSource: "subagent",
+			wantParent: parentUUID,
+			wantOK:     true,
+		},
+		{
+			name:       "Workflow-tool layout nests deeper, parent is still the segment above subagents",
+			path:       base + "/subagents/workflows/wf_abc123/agent-a14d7597bb43ed4b3.jsonl",
+			wantSource: "workflow-subagent",
+			wantParent: parentUUID,
+			wantOK:     true,
+		},
+		{
+			name:   "a top-level rollout has no parent and must not be given one",
+			path:   "/home/u/.claude/projects/-home-u-repos/" + parentUUID + ".jsonl",
+			wantOK: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			source, project, parent, ok := classifySubagentPath(tc.path)
+			if ok != tc.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tc.wantOK)
+			}
+			if !tc.wantOK {
+				if parent != "" {
+					t.Errorf("parent = %q on a non-subagent path; empty means no parent, and a guess here would link a session to the wrong row", parent)
+				}
+				return
+			}
+			if source != tc.wantSource {
+				t.Errorf("source = %q, want %q", source, tc.wantSource)
+			}
+			if parent != tc.wantParent {
+				t.Errorf("parent = %q, want %q", parent, tc.wantParent)
+			}
+			if project == "" {
+				t.Error("project is empty; the parent must not have been read in its place")
+			}
+		})
+	}
+}

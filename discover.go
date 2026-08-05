@@ -201,11 +201,14 @@ func buildStoredSession(sess SessionRow, rollouts []RolloutRow) msg.StoredSessio
 
 	if path != "" {
 		out.Path = path
-		if source, project, ok := classifySubagentPath(path); ok {
+		if source, project, parent, ok := classifySubagentPath(path); ok {
 			// Structurally-spawned subagent. Tag it so bridge-server buckets it
-			// via SOURCE_FOLDERS instead of surfacing it as a top-level chat.
+			// via SOURCE_FOLDERS instead of surfacing it as a top-level chat,
+			// and report the parent CC recorded in the path so bridge-server
+			// can resolve it to a session and write the lineage link.
 			out.Source = source
 			out.Project = project
+			out.ParentHarnessSessionID = parent
 		} else {
 			// Project is encoded into the parent directory name.
 			out.Project = ccProjectToPath(filepath.Base(filepath.Dir(path)))
@@ -226,8 +229,8 @@ func buildStoredSession(sess SessionRow, rollouts []RolloutRow) msg.StoredSessio
 }
 
 // classifySubagentPath inspects a rollout file path for Claude Code's
-// subagent layout and, if matched, returns the structural source tag and the
-// project root. Two layouts exist:
+// subagent layout and, if matched, returns the structural source tag, the
+// project root, and the parent session's harness id. Two layouts exist:
 //
 //	<projects>/<proj>/<parent-uuid>/subagents/agent-*.jsonl                   → "subagent"
 //	<projects>/<proj>/<parent-uuid>/subagents/workflows/<wf-id>/agent-*.jsonl → "workflow-subagent"
@@ -241,7 +244,13 @@ func buildStoredSession(sess SessionRow, rollouts []RolloutRow) msg.StoredSessio
 // regardless of how deeply the agent file nests below `subagents`. Returns
 // ok=false when the path carries no `subagents` segment or is too shallow to
 // hold the `<proj>/<parent-uuid>/subagents` prefix.
-func classifySubagentPath(path string) (source, project string, ok bool) {
+//
+// parent is the segment directly above `subagents`, which is the parent
+// session's own UUID — the same id its top-level rollout file is named for.
+// This function used to read parts[subIdx-2] for the project and simply skip
+// parts[subIdx-1], discarding the one piece of lineage Claude Code records on
+// disk; every discovered subagent then landed with no link to what spawned it.
+func classifySubagentPath(path string) (source, project, parent string, ok bool) {
 	parts := strings.Split(path, string(filepath.Separator))
 	subIdx := -1
 	for i, p := range parts {
@@ -251,13 +260,13 @@ func classifySubagentPath(path string) (source, project string, ok bool) {
 		}
 	}
 	if subIdx < 2 {
-		return "", "", false
+		return "", "", "", false
 	}
 	source = "subagent"
 	if subIdx+1 < len(parts) && parts[subIdx+1] == "workflows" {
 		source = "workflow-subagent"
 	}
-	return source, ccProjectToPath(parts[subIdx-2]), true
+	return source, ccProjectToPath(parts[subIdx-2]), parts[subIdx-1], true
 }
 
 // parseSessionHead scans a CC session JSONL file to extract the first user
