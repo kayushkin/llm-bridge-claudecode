@@ -55,8 +55,8 @@ func TestTranslateRolloutEntry_UserToolResult(t *testing.T) {
 		"sessionId": "sess-bbb",
 		"timestamp": "2026-05-14T22:30:01Z",
 		"message": {"role": "user", "content": [
-			{"type": "tool_result", "id": "toolu_abc", "content": "stdout: ok", "is_error": false},
-			{"type": "tool_result", "id": "toolu_def", "content": "ENOENT", "is_error": true}
+			{"type": "tool_result", "tool_use_id": "toolu_abc", "content": "stdout: ok", "is_error": false},
+			{"type": "tool_result", "tool_use_id": "toolu_def", "content": "ENOENT", "is_error": true}
 		]}
 	}`)
 	out := translateRolloutEntry(stored)

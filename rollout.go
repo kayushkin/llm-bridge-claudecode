@@ -237,8 +237,8 @@ func translateRolloutEntry(stored ccStoredEvent) []msg.Event {
 					HarnessSessionID: stored.SessionID,
 					Timestamp:        ts,
 					ToolResult: &msg.ToolResultEvent{
-						ToolID:  b.ID,
-						Output:  b.Content,
+						ToolID:  b.ToolUseID,
+						Output:  decodeToolResultContent(b.Content),
 						IsError: b.IsError,
 					},
 				})

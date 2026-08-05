@@ -28,15 +28,23 @@ type ccStoredMessage struct {
 }
 
 // ccStoredContentBlock is a content block in a stored message.
+//
+// ToolUseID, not ID, is what a tool_result block uses to name the call it
+// answers; ID belongs to a tool_use block. Content is raw because Claude Code
+// writes a tool_result's content either as a bare string or as an array of
+// content blocks — typing it as a string fails to unmarshal the array shape and
+// takes the whole enclosing message down with it. Use decodeToolResultContent
+// to render it.
 type ccStoredContentBlock struct {
-	Type     string          `json:"type"`
-	Text     string          `json:"text,omitempty"`
-	Thinking string          `json:"thinking,omitempty"`
-	ID       string          `json:"id,omitempty"`
-	Name     string          `json:"name,omitempty"`
-	Input    json.RawMessage `json:"input,omitempty"`
-	Content  string          `json:"content,omitempty"`
-	IsError  bool            `json:"is_error,omitempty"`
+	Type      string          `json:"type"`
+	Text      string          `json:"text,omitempty"`
+	Thinking  string          `json:"thinking,omitempty"`
+	ID        string          `json:"id,omitempty"`
+	ToolUseID string          `json:"tool_use_id,omitempty"`
+	Name      string          `json:"name,omitempty"`
+	Input     json.RawMessage `json:"input,omitempty"`
+	Content   json.RawMessage `json:"content,omitempty"`
+	IsError   bool            `json:"is_error,omitempty"`
 }
 
 // ccStoredUsage is the usage info in stored assistant messages.
@@ -162,7 +170,7 @@ func translateAssistantEvent(stored ccStoredEvent, sessionID string, ts time.Tim
 			// Find matching tool and add result
 			for i := len(tools) - 1; i >= 0; i-- {
 				if tools[i].Output == "" {
-					tools[i].Output = block.Content
+					tools[i].Output = decodeToolResultContent(block.Content)
 					if block.IsError {
 						tools[i].Error = "tool error"
 					}

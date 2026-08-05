@@ -263,6 +263,95 @@ func TestTranslateEventStillDropsOperatorEcho(t *testing.T) {
 	}
 }
 
+// taskToolResultFrame is the frame that closes a Task call out, verbatim from a
+// live rollout. Two details killed it before: the call is named by
+// `tool_use_id` (not `id`), and the content is an ARRAY of blocks rather than a
+// bare string. A string-typed Content field fails to unmarshal this exact
+// shape, so the frames reporting a subagent were the ones most reliably lost.
+// parent_tool_use_id is absent because the result is addressed to the PARENT.
+const taskToolResultFrame = `{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_01EY4GRJgffcgazw4KotQuwu","type":"tool_result","content":[{"type":"text","text":"Async agent launched successfully."}]}]},"session_id":"c8939508-e6ea-4341-b614-c0adbe9ace1c"}`
+
+// bashToolResultFrame is the ordinary shape: a parent-session tool reporting
+// back with string content. It has no parent_tool_use_id either, which is why
+// the blanket drop took every tool's output with it, not just Task's.
+const bashToolResultFrame = `{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_01Bash","type":"tool_result","content":"stdout: ok"}]},"session_id":"c8939508-e6ea-4341-b614-c0adbe9ace1c"}`
+
+// TestTranslateUserFrameEmitsTaskToolResult is the regression for the reported
+// bug: a Task block spun forever because the only event that could resolve it
+// was discarded. The UI pairs strictly on tool_id, so an event with an empty
+// ToolID is no better than no event at all.
+func TestTranslateUserFrameEmitsTaskToolResult(t *testing.T) {
+	events := translateEvent(json.RawMessage(taskToolResultFrame), "fallback-session", &UsageAggregator{}, nil)
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want 1 — the Task result must survive translation", len(events))
+	}
+	ev := events[0]
+	if ev.Type != msg.EventToolResult {
+		t.Fatalf("type = %q, want tool_result", ev.Type)
+	}
+	if ev.ToolResult.ToolID != "toolu_01EY4GRJgffcgazw4KotQuwu" {
+		t.Errorf("tool_id = %q; without it nothing can pair the result to its Task call", ev.ToolResult.ToolID)
+	}
+	if ev.ToolResult.Output != "Async agent launched successfully." {
+		t.Errorf("output = %q, want the array content flattened to text", ev.ToolResult.Output)
+	}
+}
+
+func TestTranslateUserFrameEmitsOrdinaryToolResult(t *testing.T) {
+	events := translateEvent(json.RawMessage(bashToolResultFrame), "fallback-session", &UsageAggregator{}, nil)
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want 1", len(events))
+	}
+	tr := events[0].ToolResult
+	if tr.ToolID != "toolu_01Bash" || tr.Output != "stdout: ok" || tr.IsError {
+		t.Errorf("tool_result = %+v", tr)
+	}
+}
+
+// A subagent's frame can carry its prompt and a tool result at once. Emitting
+// only one shape per frame would silently drop the other.
+func TestTranslateUserFrameEmitsBothResultAndPrompt(t *testing.T) {
+	frame := `{"type":"user","message":{"role":"user","content":[` +
+		`{"tool_use_id":"toolu_01Sub","type":"tool_result","content":"done","is_error":true},` +
+		`{"type":"text","text":"now do the next thing"}` +
+		`]},"parent_tool_use_id":"toolu_01Parent","session_id":"s"}`
+	events := translateEvent(json.RawMessage(frame), "fallback-session", &UsageAggregator{}, nil)
+	if len(events) != 2 {
+		t.Fatalf("got %d events, want 2 (tool_result + user_message)", len(events))
+	}
+	if events[0].Type != msg.EventToolResult || !events[0].ToolResult.IsError {
+		t.Errorf("first event = %+v, want a failing tool_result", events[0])
+	}
+	if events[1].Type != msg.EventUserMessage || events[1].Result.Text != "now do the next thing" {
+		t.Errorf("second event = %+v, want the subagent prompt", events[1])
+	}
+	for _, ev := range events {
+		if ev.HarnessParentID != "toolu_01Parent" {
+			t.Errorf("harness_parent_id = %q on %s; both events belong to the subagent", ev.HarnessParentID, ev.Type)
+		}
+	}
+}
+
+func TestDecodeToolResultContent(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{"bare string", `"stdout"`, "stdout"},
+		{"block array", `[{"type":"text","text":"a"},{"type":"text","text":"b"}]`, "a\nb"},
+		{"image block ignored", `[{"type":"image"}]`, ""},
+		{"empty", ``, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := decodeToolResultContent(json.RawMessage(tc.content)); got != tc.want {
+				t.Errorf("decodeToolResultContent(%s) = %q, want %q", tc.content, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestExtractUserText(t *testing.T) {
 	cases := []struct {
 		name    string

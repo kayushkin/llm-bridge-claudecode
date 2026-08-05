@@ -53,8 +53,6 @@ type ccAssistantBlock struct {
 	ID        string          `json:"id,omitempty"`
 	Name      string          `json:"name,omitempty"`
 	Input     json.RawMessage `json:"input,omitempty"`
-	Content   string          `json:"content,omitempty"`
-	IsError   bool            `json:"is_error,omitempty"`
 }
 
 // translateEvent converts a raw CC stream-json event into canonical msg.Event(s).
@@ -124,23 +122,7 @@ func translateEventByType(ev ccStreamEvent, sid string, raw json.RawMessage, agg
 	case "control_response", "keep_alive":
 		return nil // consumed internally
 	case "user":
-		// A `user` frame with no parent_tool_use_id is an echo of the operator's
-		// own message (e.g. the interrupt synthetic) — already recorded when it
-		// was sent, so skip it.
-		//
-		// A `user` frame WITH one is a different thing wearing the same type
-		// tag: it is the subagent's prompt, addressed to the subagent. Under the
-		// flags this bridge runs claude with (-p --input-format stream-json
-		// --output-format stream-json --verbose) it is the ONLY frame a Task
-		// subagent contributes to the parent's stream — measured, not assumed:
-		// the subagent's assistant turns are not emitted inline in this mode,
-		// they only reach disk in the subagent's own rollout file. Dropping it
-		// therefore drops the sole live signal that a subagent exists, along
-		// with the parent_tool_use_id the demux keys on.
-		if ev.ParentToolUseID == "" {
-			return nil
-		}
-		return translateSubagentPrompt(ev, sid, raw)
+		return translateUserFrame(ev, sid, raw)
 	default:
 		// Forward unknown events as system events for visibility.
 		return []msg.Event{makeEvent(sid, msg.EventSystem, raw, func(e *msg.Event) {
@@ -149,27 +131,117 @@ func translateEventByType(ev ccStreamEvent, sid string, raw json.RawMessage, agg
 	}
 }
 
-// translateSubagentPrompt converts the `user` frame Claude Code emits when it
-// hands a Task subagent its instructions. The frame's content is the prompt the
-// subagent was given, so it becomes a user_message on the subagent's own
-// session once bridge-server routes it there by parent_tool_use_id.
+// translateUserFrame converts a Claude Code `user` frame into canonical events.
+// The frame type is overloaded three ways, and each needs different handling:
 //
-// Returns nil when the frame carries no text (a tool-result-only frame), rather
-// than emitting an empty message.
-func translateSubagentPrompt(ev ccStreamEvent, sid string, raw json.RawMessage) []msg.Event {
+//   - Tool results. Every tool Claude Code runs reports back in a `user` frame
+//     carrying tool_result blocks, because that is where the Anthropic wire
+//     format requires them to live — a tool_result may only appear in a
+//     user-role message. These frames are the ONLY live source of tool output
+//     in stream-json mode. That covers the parent's own tools (which carry no
+//     parent_tool_use_id) as much as a subagent's, and it includes the Task
+//     tool's own result — the event that tells a Task block it finished.
+//   - A subagent's prompt: a frame WITH parent_tool_use_id whose content is
+//     text. That text is the instructions handed to the Task subagent, so it
+//     becomes a user_message on the subagent's own session once bridge-server
+//     routes it there by parent_tool_use_id.
+//   - An echo of the operator's own message (e.g. the interrupt synthetic):
+//     text with no parent_tool_use_id. Already recorded when it was sent, so
+//     it is skipped.
+//
+// A single frame can carry both tool results and text, so the block walk emits
+// each independently rather than choosing one shape for the whole frame.
+func translateUserFrame(ev ccStreamEvent, sid string, raw json.RawMessage) []msg.Event {
 	var m struct {
 		Content json.RawMessage `json:"content"`
 	}
 	if json.Unmarshal(ev.Message, &m) != nil {
 		return nil
 	}
-	text := extractUserText(m.Content)
-	if text == "" {
+
+	var events []msg.Event
+	for _, block := range parseUserBlocks(m.Content) {
+		if block.Type != "tool_result" {
+			continue
+		}
+		events = append(events, makeEvent(sid, msg.EventToolResult, raw, func(e *msg.Event) {
+			e.ToolResult = &msg.ToolResultEvent{
+				ToolID:  block.ToolUseID,
+				Output:  decodeToolResultContent(block.Content),
+				IsError: block.IsError,
+			}
+		}))
+	}
+
+	// Only a subagent's text is new information; the operator's own text was
+	// recorded when it was sent.
+	if ev.ParentToolUseID != "" {
+		if text := extractUserText(m.Content); text != "" {
+			events = append(events, makeEvent(sid, msg.EventUserMessage, raw, func(e *msg.Event) {
+				e.Result = &msg.ResultEvent{Text: text}
+			}))
+		}
+	}
+	return events
+}
+
+// ccUserBlock is a content block inside a Claude Code `user` frame.
+//
+// A tool_result names its call with `tool_use_id`, NOT `id` — `id` is what a
+// tool_use block uses. Reading `id` here yields an empty ToolID, which is
+// indistinguishable from "unpairable" to every downstream consumer, so the
+// result silently never reaches the tool row it belongs to.
+type ccUserBlock struct {
+	Type      string          `json:"type"`
+	Text      string          `json:"text,omitempty"`
+	ToolUseID string          `json:"tool_use_id,omitempty"`
+	Content   json.RawMessage `json:"content,omitempty"`
+	IsError   bool            `json:"is_error,omitempty"`
+}
+
+// parseUserBlocks decodes a user message's content into blocks. Content is
+// either a bare string (which carries no blocks) or an array of them.
+func parseUserBlocks(content json.RawMessage) []ccUserBlock {
+	if len(content) == 0 {
 		return nil
 	}
-	return []msg.Event{makeEvent(sid, msg.EventUserMessage, raw, func(e *msg.Event) {
-		e.Result = &msg.ResultEvent{Text: text}
-	})}
+	var blocks []ccUserBlock
+	if json.Unmarshal(content, &blocks) != nil {
+		return nil
+	}
+	return blocks
+}
+
+// decodeToolResultContent renders a tool_result block's content as plain text.
+// Claude Code writes it either as a bare string or as an array of content
+// blocks — measured on live rollouts, both shapes occur, and the array shape is
+// what the Task tool uses. Typing this field as a plain string therefore fails
+// to unmarshal exactly the frames that report a subagent, taking the whole
+// message down with it.
+//
+// Non-text blocks (images) contribute nothing.
+func decodeToolResultContent(content json.RawMessage) string {
+	if len(content) == 0 {
+		return ""
+	}
+	var asString string
+	if json.Unmarshal(content, &asString) == nil {
+		return asString
+	}
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(content, &blocks) != nil {
+		return ""
+	}
+	var parts []string
+	for _, b := range blocks {
+		if b.Type == "text" && b.Text != "" {
+			parts = append(parts, b.Text)
+		}
+	}
+	return strings.Join(parts, "\n")
 }
 
 // extractUserText pulls the plain text out of a CC user message's content,
@@ -506,17 +578,11 @@ func translateAssistant(ev ccStreamEvent, sid string, raw json.RawMessage, agg *
 				}
 			}))
 
-		case "tool_result":
-			events = append(events, makeEvent(sid, msg.EventToolResult, raw, func(e *msg.Event) {
-				stamp(e)
-				e.ToolResult = &msg.ToolResultEvent{
-					ToolID:    block.ID,
-					Name:      block.Name,
-					Output:    block.Content,
-					IsError:   block.IsError,
-					MessageID: blockMessageID,
-				}
-			}))
+			// No `tool_result` case: an assistant frame never carries one. The
+			// Anthropic wire format only permits tool_result in a user-role
+			// message, and Claude Code follows it. A branch here reads as
+			// "tool results are handled" while never running once; see
+			// translateUserFrame for where they actually arrive.
 		}
 	}
 
