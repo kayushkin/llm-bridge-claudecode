@@ -351,17 +351,26 @@ func translateSystem(ev ccStreamEvent, sid string, raw json.RawMessage) []msg.Ev
 		// task_type tag — preserve them all so the UI can render the task
 		// opener with context instead of a bare "Task" row.
 		var ts struct {
-			TaskID      string `json:"task_id"`
-			ToolUseID   string `json:"tool_use_id"`
-			Description string `json:"description"`
+			TaskID       string `json:"task_id"`
+			ToolUseID    string `json:"tool_use_id"`
+			Description  string `json:"description"`
+			TaskType     string `json:"task_type"`
+			SubagentType string `json:"subagent_type"`
 		}
 		_ = json.Unmarshal(raw, &ts)
+		// task_started is the ONLY frame that says what kind of task this is.
+		// Claude Code backgrounds a shell command through the same task frames
+		// it uses for a subagent ("local_bash" vs "local_agent"), so without
+		// the kind a consumer cannot tell an agent from `sleep 2` — and
+		// bridge-server promoted both to sessions.
 		events = append(events, makeEvent(sid, msg.EventSystem, raw, func(e *msg.Event) {
 			e.System = &msg.SystemEvent{
-				Subtype:     "task_started",
-				ToolUseID:   ts.ToolUseID,
-				TaskID:      ts.TaskID,
-				Description: ts.Description,
+				Subtype:      "task_started",
+				ToolUseID:    ts.ToolUseID,
+				TaskID:       ts.TaskID,
+				Description:  ts.Description,
+				TaskType:     ts.TaskType,
+				SubagentType: ts.SubagentType,
 			}
 		}))
 
