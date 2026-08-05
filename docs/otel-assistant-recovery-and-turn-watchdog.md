@@ -1,8 +1,8 @@
 # Dropped OTel events, lost final messages, and stuck turns
 
-Status: **implemented, not deployed** (live `llm-bridge.service` restart is user-gated)
+Status: **merged to `main` and deployed** (2026-08-05)
 Repo: `llm-bridge-claudecode`
-Branch: `otel-surface-dropped-errors`
+Branch: `otel-surface-dropped-errors`, later folded into `feat/subagent-session-demux` and merged
 Commits: `54001e0`, `954c50c` (on top of `2a99c97`)
 Origin: session "Dash session/todo linker" (`br_1784567616625538966`, harness `0764e87b-6abc-468d-8d3b-774cb377fb46`)
 Related noteboard todo: `a367a8d1-0c75-45f9-adf3-476a1566831e` (marked done, holds the same summary)
@@ -149,3 +149,26 @@ recovery and watchdog take effect for new sessions after restart. `dash` /
 `dashv2` need no change to *function* (the recovered block and new errors render
 under existing generic handling), but the three items above make them render
 *well* and, for `TURN_IDLE_TIMEOUT`, correctly clear the stuck state.
+
+### What actually happened, 2026-08-05
+
+Only the adapter half shipped, and that is worth recording because the gap was
+invisible from either side alone.
+
+`~/bin/llm-bridge-claudecode` was rebuilt from this branch (`b3ab3d4`) while
+`/usr/local/bin/llm-bridge` stayed on `main`, which had no subagent handling at
+all — no `subagent.go`, no consumer of `task_started` / `task_notification`.
+The adapter was emitting `harness_parent_id` and task frames to a server that
+read neither. Three noteboard todos recorded the work as "deployed to
+production, verified end-to-end"; it was not.
+
+Building from a branch also silently reverted the running harness: the deployed
+binary predated `0f702c9`, `009042f` and `4713a61`, so it was missing the
+resume-working-directory fix, the WAL-conversion wait and the session-config
+application. Merging both directions before deploying is what closes that.
+
+Section 3 above ("subagent progress") said the frontend could safely ignore an
+unstyled `system.subtype`. That was true of `subagent_completed`, and false of
+`task_notification` — it is the only event that ever says a subagent finished,
+because a subagent emits no result of its own. Ignoring it is precisely what
+left tasks looking unfinished forever. See `msg.SystemEvent.TaskStatus`.
