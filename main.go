@@ -36,6 +36,27 @@ func execClaudePTY() {
 		fmt.Fprintf(os.Stderr, "llm-bridge-claudecode pty: claude binary not found at %q: %v\n", cfg.ClaudePath, err)
 		os.Exit(127)
 	}
+
+	// Resume in the directory the conversation is in, not the one we were
+	// launched in. Claude Code finds a conversation only from the directory it
+	// was created in (transcript.go), and in pty mode there is no start-params
+	// handshake to carry a working directory — the resume id arrives as an env
+	// var and the cwd is whatever bridge-server gave this process. Without this
+	// a pty resume of any conversation created under a different directory
+	// opens a blank session instead of the one the user asked for.
+	if id := os.Getenv("LLMBRIDGE_PTY_RESUME_ID"); isClaudeSessionUUID(id) {
+		st, err := OpenState(DefaultStatePath())
+		if err != nil {
+			st = nil
+		} else {
+			defer st.Close()
+		}
+		if dir, ok := transcriptWorkingDir(st, id); ok {
+			if err := os.Chdir(dir); err != nil {
+				fmt.Fprintf(os.Stderr, "llm-bridge-claudecode pty: chdir %q for resume %s: %v\n", dir, id, err)
+			}
+		}
+	}
 	if err := syscall.Exec(bin, []string{bin}, os.Environ()); err != nil {
 		fmt.Fprintf(os.Stderr, "llm-bridge-claudecode pty: exec %s: %v\n", bin, err)
 		os.Exit(127)

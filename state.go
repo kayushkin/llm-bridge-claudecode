@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -53,6 +54,67 @@ type WALRow struct {
 	CommittedAt     *time.Time
 }
 
+// busyTimeout is how long a contended statement waits for another connection to
+// release the database before giving up with SQLITE_BUSY.
+const busyTimeout = 5000
+
+// journalMode is what lets a reader and a writer hold state.db at the same time.
+const journalMode = "WAL"
+
+// switchJournalMode moves state.db into journalMode, waiting out the other
+// bridge processes converting the same fresh file.
+//
+// Switching a rollback-journal database into WAL takes a brief exclusive lock,
+// and that one statement is the only part of opening the store that busy_timeout
+// cannot mediate. SQLite declines to run the busy handler when a connection has
+// to upgrade a lock it already holds, because waiting there is how two
+// connections deadlock; it returns SQLITE_BUSY on the spot instead. Measured in
+// memory-store, where this defect was first found: raising busy_timeout six-fold
+// changed nothing and the failure still landed in a millisecond, so the wait was
+// never being entered. A longer timeout has nothing to give, so the wait has to
+// be ours.
+//
+// state.db is the sharpest case of it on this box. It is one path per harness,
+// ~/.local/share/llm-bridge-claudecode/state.db, and every bridge process of that
+// kind opens it — where the stores this was found in each had a single process
+// of their own.
+//
+// Retrying converges because the race is only ever over the first conversion:
+// once any process has won it the file is in WAL, and every later connection
+// reads the mode back instead of changing it.
+//
+// This is not a retry loop around ordinary reads and writes. That was tried in
+// memory-store and measured worse than doing nothing, because it tries to do
+// WAL's job by waiting. This runs once per store, on the one statement that
+// turns WAL on, and everything after it relies on WAL rather than on waiting.
+func switchJournalMode(db *sql.DB) error {
+	// The conversion gets the same patience as any other contended statement.
+	// busy_timeout already answers "how long is this store willing to wait for a
+	// lock" and there is no reason for a second number.
+	deadline := time.Now().Add(busyTimeout * time.Millisecond)
+
+	var settled string
+	var err error
+	for backoff := time.Millisecond; ; backoff += time.Millisecond {
+		err = db.QueryRow("PRAGMA journal_mode(" + journalMode + ")").Scan(&settled)
+		if err == nil && strings.EqualFold(settled, journalMode) {
+			return nil
+		}
+		if !time.Now().Add(backoff).Before(deadline) {
+			break
+		}
+		time.Sleep(backoff)
+	}
+
+	if err != nil {
+		return fmt.Errorf("switch journal mode to %s: %w", journalMode, err)
+	}
+	// A lost race can also come back quietly, reporting the mode it stayed on
+	// rather than an error, and a state store left on the rollback journal is
+	// the serialized queue WAL exists to avoid.
+	return fmt.Errorf("journal mode settled on %q, want %s", settled, journalMode)
+}
+
 // DefaultStatePath returns the canonical on-disk location for state.db.
 func DefaultStatePath() string {
 	home, err := os.UserHomeDir()
@@ -73,15 +135,29 @@ func OpenState(path string) (*State, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, fmt.Errorf("create state.db dir: %w", err)
 	}
-	db, err := sql.Open("sqlite", path)
+	// modernc.org/sqlite only understands _pragma=NAME(VALUE), and it drops a
+	// DSN key it does not recognise instead of rejecting it — a mattn-style
+	// ?_busy_timeout=5000 would apply nothing and report no error. These two
+	// belong in the DSN because the driver replays it on every connection the
+	// pool opens, so they survive a connection being recycled, where a pragma
+	// run once as a statement would not.
+	//
+	// journal_mode deliberately does not travel with them: a DSN pragma runs
+	// during connection setup, in a place that cannot retry, and its failure is
+	// charged to whatever statement happened to open the connection. See
+	// switchJournalMode.
+	dsn := fmt.Sprintf("%s?_pragma=busy_timeout(%d)&_pragma=foreign_keys(1)", path, busyTimeout)
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := db.Exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;"); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("sqlite pragmas: %w", err)
-	}
+	// Pin the pool before the conversion so it, the migrations and every later
+	// write all go through the one connection.
 	db.SetMaxOpenConns(1)
+	if err := switchJournalMode(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 
 	s := &State{db: db}
 	if err := s.migrate(); err != nil {
@@ -254,6 +330,24 @@ VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		r.HarnessSessionID, r.BridgeSessionID, r.RolloutPath, r.Sequence, parent, r.Kind,
 		created.UTC().Format(time.RFC3339Nano))
 	return err
+}
+
+// RolloutPathFor returns the on-disk transcript path recorded for a Claude
+// Code session UUID, or "" when the row exists without one.
+//
+// The newest row wins. A UUID appears once per rollout it opened, and a resume
+// keeps the same UUID, so the same id can carry several rows; the latest is the
+// one whose file is certain to still be there.
+func (s *State) RolloutPathFor(harnessSessionID string) (string, error) {
+	var path string
+	err := s.db.QueryRow(`
+SELECT COALESCE(rollout_path, '') FROM rollouts
+WHERE harness_session_id = ? AND rollout_path != ''
+ORDER BY sequence DESC, created_at DESC LIMIT 1`, harnessSessionID).Scan(&path)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return path, err
 }
 
 // ListRollouts returns the rollouts for one bridge_session_id ordered by

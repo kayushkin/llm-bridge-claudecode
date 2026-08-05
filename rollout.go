@@ -40,18 +40,35 @@ func runRolloutTailer(emit func(msg.Event), cwd, resumeID string, done <-chan st
 		return
 	}
 
-	home, err := os.UserHomeDir()
-	if err != nil {
-		log.Printf("[rollout] cannot resolve $HOME: %v", err)
-		return
+	// On a resume the conversation's id is a better address than the cwd. The
+	// pty child chdirs to the directory that conversation actually lives in
+	// (see execClaudePTY), so deriving the directory from the cwd we were
+	// handed would send the tailer somewhere the child is not writing and the
+	// session would produce no telemetry at all. Ask by id first; the cwd is
+	// only the answer for a fresh session, which has no id yet.
+	var target string
+	if isClaudeSessionUUID(resumeID) {
+		st, err := OpenState(DefaultStatePath())
+		if err != nil {
+			st = nil
+		} else {
+			defer st.Close()
+		}
+		if p := transcriptPath(st, resumeID); p != "" {
+			target = p
+			log.Printf("[rollout] located %s by session id", target)
+		}
 	}
-	if cwd == "" {
-		cwd = "/"
-	}
-	projectsDir := filepath.Join(home, ".claude", "projects", pathToCCProject(cwd))
 
-	start := time.Now()
-	target := locateRolloutFile(projectsDir, resumeID, start, done)
+	projectsDir := ""
+	if target == "" {
+		if cwd == "" {
+			cwd = "/"
+		}
+		projectsDir = filepath.Join(projectsRoot(), pathToCCProject(cwd))
+		start := time.Now()
+		target = locateRolloutFile(projectsDir, resumeID, start, done)
+	}
 	if target == "" {
 		log.Printf("[rollout] no rollout file located in %s within startup window", projectsDir)
 		return
