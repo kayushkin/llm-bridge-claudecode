@@ -404,13 +404,15 @@ func (h *Harness) forward(e msg.Event) {
 	emitEvent(e)
 }
 
-// markActivity records "an event just flowed" for the drainUntilResult
-// watchdog. Called on every emit from either channel.
+// markActivity records "the harness just produced something" for the
+// drainUntilResult watchdog. Called on every emit from either channel, and on
+// every raw stream-json line — including the ones the translator consumes
+// without emitting, which are still proof the process is running.
 func (h *Harness) markActivity() {
 	h.lastActivityNano.Store(time.Now().UnixNano())
 }
 
-// sinceActivity is how long since the last emitted event.
+// sinceActivity is how long since the harness last produced anything.
 func (h *Harness) sinceActivity() time.Duration {
 	return time.Duration(time.Now().UnixNano() - h.lastActivityNano.Load())
 }
@@ -1210,6 +1212,14 @@ func (h *Harness) drainUntilResult() {
 				h.handleProcessExit()
 				return
 			}
+			// A line on stdout is the process working, whatever it turns into.
+			// Only emitted events used to count, so the frames translateEvent
+			// consumes internally were invisible here — and one of them is
+			// keep_alive, Claude Code's own liveness ping. A turn that went
+			// quiet on everything except the frame that exists to say "still
+			// here" was read as wedged and killed.
+			h.markActivity()
+
 			translated := translateEvent(raw, h.sessionID, &h.agg, h.tracker)
 			for _, ev := range translated {
 				h.emit(ev)
@@ -1259,8 +1269,9 @@ func (h *Harness) drainUntilResult() {
 				// real exit handling on the next iteration.
 				continue
 			}
-			// Process alive but the turn produced nothing for the whole idle
-			// window — it's wedged (stream-json stopped while CC kept running,
+			// Process alive but the turn produced nothing at all for the whole
+			// idle window — not even a keep_alive. It's wedged (stream-json
+			// stopped while CC kept running,
 			// the failure that stranded the "todo linker" session). Surface any
 			// OTel-only assistant text, report the stall, and kill so leftover
 			// output can't bleed into the next turn. The next message respawns
