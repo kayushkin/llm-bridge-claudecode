@@ -25,8 +25,15 @@ import (
 // by cloning an existing one, which copies all five verbatim, and any one left
 // un-retargeted silently points this harness at a different harness: it answers
 // to that harness's name on the bus, writes into its state.db, or overwrites its
-// installed binary. Three of the five shipped wrong in llm-bridge-copilotcli (a
+// installed binary. Four of the five shipped wrong in llm-bridge-copilotcli (a
 // claudecode clone) and none was caught by a build or a test.
+//
+// The count is four, recounted on 2026-08-08 from copilotcli's initial commit
+// 0ec0dbd rather than inherited: go.mod and DefaultStatePath (both fixed by
+// 154c948), deploy.sh BIN_NAME (c51e880) and the harness constant. It read three
+// until then, having missed the BIN_NAME collision. It is a claim about what
+// SHIPPED, so it does not fall as the legs are fixed — all four are repaired now
+// and the number is still four.
 //
 // The checkout directory is the anchor because it is the only one of the five a
 // clone does not inherit from its parent.
