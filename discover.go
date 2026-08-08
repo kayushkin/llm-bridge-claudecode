@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/kayushkin/llm-bridge/msg"
 )
@@ -302,7 +303,7 @@ func parseSessionHead(path string) (prompt string, ts time.Time, turns int) {
 			if prompt == "" {
 				prompt = extractUserContent(entry.Message)
 				if prompt != "" {
-					prompt = truncate(prompt, 200)
+					prompt = truncateAtRuneBoundary(prompt, 200)
 				}
 				if ts.IsZero() && entry.Timestamp != "" {
 					ts, _ = time.Parse(time.RFC3339Nano, entry.Timestamp)
@@ -358,11 +359,33 @@ func ccProjectToPath(name string) string {
 	return "/" + strings.ReplaceAll(strings.TrimPrefix(name, "-"), "-", "/")
 }
 
-func truncate(s string, max int) string {
-	if len(s) <= max {
+// truncateAtRuneBoundary returns the longest prefix of s that is no longer than
+// maxBytes and does not end part-way through a multi-byte UTF-8 sequence.
+//
+// Cutting a Go string at a fixed byte offset splits whatever rune straddles that
+// offset, and the result is not valid UTF-8. Nothing reports it: encoding/json
+// substitutes U+FFFD rather than failing, so the reader sees a replacement
+// character and no error is raised anywhere along the way. The one caller here
+// cuts a discovered session's first user message down to a label, and that label
+// is encoded into msg.StoredSession.Prompt and crosses to bridge-server — so a
+// split rune survives the request and a reload does not fix it.
+//
+// The walk-back costs at most three byte comparisons and allocates nothing,
+// which is why it is preferred here over converting to []rune.
+func truncateAtRuneBoundary(s string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(s) <= maxBytes {
 		return s
 	}
-	return s[:max]
+	// s[cut] is the first byte past the prefix. While it is a continuation
+	// byte, a rune straddles the cut, so move the cut earlier.
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
 }
 
 // extractUserContent extracts text from a CC user message.
