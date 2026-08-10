@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -34,7 +35,7 @@ func TestHarnessIdentityIsSelfConsistent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getwd: %v", err)
 	}
-	want := filepath.Base(root)
+	want := identityAnchor(t, root)
 	if !strings.HasPrefix(want, "llm-bridge-") {
 		t.Skipf("checkout dir %q is not a canonical llm-bridge-* checkout; no anchor to compare identity against", want)
 	}
@@ -96,4 +97,28 @@ func deployBinName(t *testing.T, root string) (string, bool) {
 		return "", false
 	}
 	return string(m[1]), true
+}
+
+// identityAnchor returns the name of the directory this source was cloned into.
+// That name is what every leg above is compared against, so getting it right is
+// the whole premise of the test.
+//
+// In an ordinary checkout it is simply the working directory. In a git worktree
+// it is not. A worktree is a second view of the same clone, checked out into a
+// directory whose name whoever created it invented — and that invented name
+// still starts with "llm-bridge-", so the prefix check above waves it through.
+// Every leg then compares a correctly-retargeted constant against a name no
+// constant in the repository was ever meant to match, and all four fail. Git
+// knows where the clone itself lives: --git-common-dir names the clone's .git
+// directory even when asked from inside a worktree. So ask git which checkout
+// this is, rather than reading the path we happen to be standing in.
+func identityAnchor(t *testing.T, root string) string {
+	t.Helper()
+	out, err := exec.Command("git", "-C", root, "rev-parse", "--path-format=absolute", "--git-common-dir").Output()
+	if err != nil {
+		t.Skipf("cannot ask git which checkout %q belongs to (%v); without that answer a worktree is "+
+			"indistinguishable from a mis-named clone, and every assertion below would fail for the wrong reason", root, err)
+		return "" // unreachable; Skipf ends the test
+	}
+	return filepath.Base(filepath.Dir(strings.TrimSpace(string(out))))
 }
