@@ -54,6 +54,12 @@ idle() { if [ -n "$FAKECC_EXIT" ]; then exit 0; fi; exec sleep 3600; }
 emit "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"$uuid\",\"model\":\"fake\",\"tools\":[]}"
 result="{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turns\":1,\"session_id\":\"$uuid\",\"result\":\"ok\"}"
 
+# say and endturn build a turn whose text names it, so a test can tell WHICH
+# turn's answer it received. That is the whole question once turns can be
+# delivered out of step with the messages that caused them.
+say() { printf '{"type":"assistant","session_id":"%s","message":{"id":"msg_%s","role":"assistant","model":"fake","content":[{"type":"text","text":"%s"}]}}\n' "$uuid" "$1" "$1"; }
+endturn() { printf '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"session_id":"%s","result":"%s"}\n' "$uuid" "$1"; }
+
 case "$FAKECC_MODE" in
   wedge)
     # The turn never ends and the process never exits. exec so the thing
@@ -74,6 +80,25 @@ case "$FAKECC_MODE" in
     emit "{\"type\":\"assistant\",\"session_id\":\"$uuid\",\"message\":{\"id\":\"msg_fake\",\"role\":\"assistant\",\"model\":\"fake\",\"content\":[{\"type\":\"text\",\"text\":\"answered\"}]}}"
     emit "$result"
     idle
+    ;;
+  unprompted)
+    # A real claude reads the prompt, then answers it.
+    IFS= read -r _prompt
+    say answered-first
+    endturn r-first
+    # The turn Claude Code starts on its OWN. When a background Task finishes
+    # it injects a <task-notification> into its own conversation and runs a
+    # turn on it — no stdin is read first, which is the entire point. The
+    # harness reads stdout only while servicing a request it initiated, so
+    # nothing is listening when this lands.
+    sleep "$FAKECC_UNPROMPTED_DELAY_SEC"
+    say answered-unprompted
+    endturn r-unprompted
+    # Healthy from here on: one turn per line of stdin.
+    while IFS= read -r _line; do
+      say answered-next
+      endturn r-next
+    done
     ;;
 esac
 `
