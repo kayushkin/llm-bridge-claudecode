@@ -15,10 +15,13 @@ import (
 // finishes, CC injects a <task-notification> into its own conversation and runs
 // a turn on it — with nothing written to its stdin first.
 //
-// The harness has no reader running at that moment. h.events (process.go
-// ReadEvents) has exactly one consumer, drainUntilResult, and that is called
-// only from handleStart, handleMessage and handleCompact — all handlers for a
-// request the harness itself initiated. Between turns nobody reads.
+// The harness used to have no reader running at that moment. h.events
+// (process.go ReadEvents) had exactly one consumer, and it was called only
+// from handleStart, handleMessage and handleCompact — all handlers for a
+// request the harness itself initiated. Between turns nobody read.
+//
+// readStreamJSON now reads for the life of the process and awaitTurnEnd only
+// waits, which is what these canaries pin.
 //
 // So an unprompted turn's stream-json frames sit in the channel. The next
 // harness-initiated turn drains them, returns on the *stale* result, and leaves
@@ -100,11 +103,11 @@ func startUnpromptedCanary(t *testing.T) (*Harness, func() []msg.Event) {
 	t.Cleanup(restore)
 
 	t.Setenv("FAKECC_UNPROMPTED_DELAY_SEC", "1")
-	h := spawnCanary(t, "unprompted", 0)
+	h, waiter := spawnCanary(t, "unprompted", 0)
 
-	// Turn 1 is harness-initiated, so today's code drains it normally. If this
-	// fails the rig is broken, not the behaviour under test.
-	drainWithin(t, h, 20*time.Second)
+	// Turn 1 is harness-initiated, so it completes normally either way. If
+	// this fails the rig is broken, not the behaviour under test.
+	turnEndsWithin(t, h, waiter, 20*time.Second)
 	if !containsText(resultTexts(get()), "r-first") {
 		t.Fatalf("the harness-initiated turn never completed; rig problem, not the defect. results=%q", resultTexts(get()))
 	}

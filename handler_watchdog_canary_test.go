@@ -12,7 +12,7 @@ import (
 	"github.com/kayushkin/llm-bridge/msg"
 )
 
-// The watchdog tests in handler_recovery_test.go drive drainUntilResult with a
+// The watchdog tests in handler_recovery_test.go drive awaitTurnEnd with a
 // hand-built Harness: an event channel nobody feeds and a CCProcess with no
 // cmd behind it. That proves the select arithmetic and nothing else. It cannot
 // see whether a real subprocess wedges the way the bug report describes, whether
@@ -21,9 +21,9 @@ import (
 // core turn loop.
 //
 // These canaries spawn a real subprocess through the real spawnClaudeCode,
-// read it through the real ReadEvents, and drain it through the real
-// drainUntilResult. The only fake part is the binary on the far end of the
-// pipe, which is the one thing a test cannot supply honestly.
+// read it through the real ReadEvents and readStreamJSON, and wait the turn
+// out through the real awaitTurnEnd. The only fake part is the binary on the
+// far end of the pipe, which is the one thing a test cannot supply honestly.
 
 // fakeClaude writes a stand-in `claude` binary that speaks enough stream-json
 // for the drain loop, and returns its path. Behaviour is chosen by the
@@ -114,9 +114,13 @@ esac
 const canaryUUID = "6a1c9f2e-8b41-4d0a-9f77-2c5e13ab7f40"
 
 // spawnCanary starts the fake through the real spawn path and wires a Harness
-// exactly as handleStart does, so the drain loop under test sees a genuine
-// subprocess, pipe and reader goroutine.
-func spawnCanary(t *testing.T, mode string, idle time.Duration, extraArgs ...string) *Harness {
+// exactly as handleStart does — lifetime reader goroutine included — so the
+// turn loop under test sees a genuine subprocess, pipe and reader.
+//
+// Returns the harness and the waiter for the turn the initial prompt starts.
+// The waiter is armed before the write, as handleStart arms it, because a fast
+// turn can end before the write call returns.
+func spawnCanary(t *testing.T, mode string, idle time.Duration, extraArgs ...string) (*Harness, <-chan struct{}) {
 	t.Helper()
 	path := fakeClaude(t)
 	argvLog := filepath.Join(t.TempDir(), "argv")
@@ -140,22 +144,25 @@ func spawnCanary(t *testing.T, mode string, idle time.Duration, extraArgs ...str
 	})
 	h.proc = proc
 	h.events = proc.ReadEvents(h.ctx)
+	go h.readStreamJSON(proc, h.events)
+	waiter := h.registerTurnWaiter()
 	if err := proc.WriteMessage("hello"); err != nil {
 		t.Fatalf("write prompt: %v", err)
 	}
-	return h
+	return h, waiter
 }
 
-// drainWithin runs one turn and fails if it does not end in the given window —
-// the hang this watchdog exists to break.
-func drainWithin(t *testing.T, h *Harness, limit time.Duration) {
+// turnEndsWithin waits out one turn and fails if it does not end in the given
+// window — the hang this watchdog exists to break. It no longer does the
+// reading; the lifetime reader does that, and this only waits.
+func turnEndsWithin(t *testing.T, h *Harness, waiter <-chan struct{}, limit time.Duration) {
 	t.Helper()
 	done := make(chan struct{})
-	go func() { h.drainUntilResult(); close(done) }()
+	go func() { h.awaitTurnEnd(waiter); close(done) }()
 	select {
 	case <-done:
 	case <-time.After(limit):
-		t.Fatalf("drainUntilResult did not return within %s", limit)
+		t.Fatalf("awaitTurnEnd did not return within %s", limit)
 	}
 }
 
@@ -195,13 +202,13 @@ func TestCanaryWatchdogKillsARealWedgedProcess(t *testing.T) {
 	get, restore := swapEmit()
 	defer restore()
 
-	h := spawnCanary(t, "wedge", 2*time.Second)
+	h, waiter := spawnCanary(t, "wedge", 2*time.Second)
 	pid := h.proc.cmd.Process.Pid
 	if !pidAlive(pid) {
 		t.Fatal("fake claude was not running at the start of the turn")
 	}
 
-	drainWithin(t, h, 20*time.Second)
+	turnEndsWithin(t, h, waiter, 20*time.Second)
 
 	if n := idleTimeouts(get()); n != 1 {
 		t.Fatalf("expected exactly one TURN_IDLE_TIMEOUT, got %d", n)
@@ -226,10 +233,10 @@ func TestCanaryWatchdogSparesATurnSendingKeepAlives(t *testing.T) {
 
 	t.Setenv("FAKECC_TICKS", "6")
 	t.Setenv("FAKECC_TICK_SEC", "1")
-	h := spawnCanary(t, "keepalive", 2*time.Second)
+	h, waiter := spawnCanary(t, "keepalive", 2*time.Second)
 	pid := h.proc.cmd.Process.Pid
 
-	drainWithin(t, h, 30*time.Second)
+	turnEndsWithin(t, h, waiter, 30*time.Second)
 
 	events := get()
 	if n := idleTimeouts(events); n != 0 {
