@@ -173,6 +173,20 @@ type Harness struct {
 	// to the process-wide CLAUDE_MODEL default and change model mid-chat.
 	model string
 
+	// settings and permissionMode are the session's permission gate, and they
+	// are persisted for the same reason as model: both are spawn-time flags,
+	// so a respawn that does not carry them starts an UNGATED process.
+	//
+	// settings is bridge-server's --settings payload, which is what installs
+	// the PreToolUse hook. permissionMode is the caller's --permission-mode.
+	// Losing settings removes the hook; losing permissionMode drops the spawn
+	// onto the bypassPermissions default below. A session started block_all,
+	// read, ask_all or plan therefore came back unrestricted and with no gate
+	// at all — and respawn is a routine path, reached by this file's own idle
+	// watchdog. Read these, never params, when building the spawn args.
+	settings       string
+	permissionMode string
+
 	// state is the per-bridge persistent chain (sessions/rollouts/wal).
 	// Opened once at boot via openStateAndRecover.
 	state *State
@@ -649,6 +663,12 @@ func (h *Harness) handleStart(params StartParams) error {
 	if params.Model != "" {
 		h.model = params.Model
 	}
+	if params.Settings != "" {
+		h.settings = params.Settings
+	}
+	if params.PermissionMode != "" {
+		h.permissionMode = params.PermissionMode
+	}
 
 	var extraArgs []string
 
@@ -731,7 +751,9 @@ func (h *Harness) handleStart(params StartParams) error {
 	// (ask/auto/bypass) or CC-native values (default/acceptEdits/auto/plan/
 	// bypassPermissions/dontAsk). Canonical values get translated; anything
 	// else passes through unchanged so direct CC-vocab callers keep working.
-	if ccMode := translateCanonicalPermissionMode(params.PermissionMode); ccMode != "" {
+	//
+	// h.permissionMode, not params.PermissionMode — see the struct field.
+	if ccMode := translateCanonicalPermissionMode(h.permissionMode); ccMode != "" {
 		extraArgs = append(extraArgs, "--permission-mode", ccMode)
 	}
 	if params.Worktree != "" {
@@ -781,8 +803,9 @@ func (h *Harness) handleStart(params StartParams) error {
 	if params.ReplayUserMessages {
 		extraArgs = append(extraArgs, "--replay-user-messages")
 	}
-	if params.Settings != "" {
-		extraArgs = append(extraArgs, "--settings", params.Settings)
+	// h.settings, not params.Settings — see the struct field.
+	if h.settings != "" {
+		extraArgs = append(extraArgs, "--settings", h.settings)
 	}
 	if len(params.SettingSources) > 0 {
 		extraArgs = append(extraArgs, "--setting-sources", strings.Join(params.SettingSources, ","))
@@ -830,7 +853,12 @@ func (h *Harness) handleStart(params StartParams) error {
 	// --permission-mode, so the gate still runs on every tool call. When
 	// the caller didn't set a mode, default to bypassPermissions so CC's
 	// own UI never tries to prompt — the hook is the sole gate.
-	if params.PermissionMode == "" {
+	//
+	// That reasoning only holds while the hook is actually installed, so this
+	// default reads h.permissionMode: keyed off params it fired on every
+	// respawn, which is exactly when --settings had been dropped too and
+	// there was no hook left to be the sole gate.
+	if h.permissionMode == "" {
 		extraArgs = append(extraArgs, "--permission-mode", "bypassPermissions")
 	}
 

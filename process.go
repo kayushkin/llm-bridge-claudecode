@@ -78,9 +78,13 @@ type ccControlRequest struct {
 // spawnClaudeCode starts a new Claude Code process with stream-json I/O.
 // Permission gating runs as a PreToolUse HTTP hook injected via --settings
 // by bridge-server (see internal/server/hook_settings.go). CC's own
-// permission system stays off — handleStart hardcodes
-// --permission-mode bypassPermissions so CC never consults a
-// --permission-prompt-tool we no longer wire.
+// permission system stays off — handleStart defaults to
+// --permission-mode bypassPermissions when the caller named no mode, so CC
+// never consults a --permission-prompt-tool we no longer wire.
+//
+// Both flags are built from the Harness fields, not the start params, so a
+// respawn carries the same gate as the original spawn. See handler.go's
+// settings/permissionMode fields for what dropping them used to cost.
 //
 // allowedTools is forwarded as --allowed-tools when non-empty. It just
 // narrows the tool surface; the permission gate still fires on every call.
