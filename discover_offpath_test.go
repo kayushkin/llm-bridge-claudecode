@@ -182,11 +182,12 @@ func jsonlLineOfExactly(t *testing.T, n int) string {
 // expression, so a mutation that moves the ceiling cannot move the fixture with
 // it.
 //
-// ⚠️ The over-ceiling half pins current behaviour, and current behaviour is a
-// SILENT drop: parseSessionHead never reads scanner.Err(), so a session whose
-// first user line is too long is indistinguishable from one with no user lines
-// at all. That defect is filed separately (603e3ded) — this test asserts what
-// the code does today so the boundary cannot drift while it waits.
+// The over-ceiling half pins the drop itself: a line at or over the ceiling is
+// not parsed and does not count as a turn. The drop is no longer SILENT — this
+// comment said it was, which stopped being true when parseSessionHead started
+// reading scanner.Err() and reporting it. What is dropped has not changed, only
+// whether anything says so, and that half is pinned by
+// TestParseSessionHeadReportsAnOverLongLineInsteadOfDroppingItInSilence.
 func TestParseSessionHeadReadsTheLongestLineItsCeilingAllows(t *testing.T) {
 	const (
 		longestAccepted = 1048575 // one below the shipped 1 MB ceiling

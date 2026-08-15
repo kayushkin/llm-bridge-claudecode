@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -272,6 +273,10 @@ func classifySubagentPath(path string) (source, project, parent string, ok bool)
 
 // parseSessionHead scans a CC session JSONL file to extract the first user
 // prompt, timestamp, and turn count.
+//
+// A line over the scanner's ceiling ends the scan where it sits, so the counts
+// returned describe the file up to that line and nothing after it. That is
+// reported, not propagated — see the end of the function for why.
 func parseSessionHead(path string) (prompt string, ts time.Time, turns int) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -280,6 +285,13 @@ func parseSessionHead(path string) (prompt string, ts time.Time, turns int) {
 	defer f.Close()
 
 	scanner := bufio.NewScanner(f)
+	// The largest line this accepts is 1024*1024 - 1 bytes, not 1024*1024. A
+	// line of exactly the cap fills the buffer with no newline in it, so the
+	// token-too-long check fires before the split can succeed. The two spellings
+	// are the starting buffer and the cap, not two separate ceilings — the
+	// effective one is the larger of the two, and the zero-length starting slice
+	// only sets how much is allocated up front. Pinned from both sides by
+	// TestParseSessionHeadReadsTheLongestLineItsCeilingAllows.
 	scanner.Buffer(make([]byte, 0, 256*1024), 1024*1024)
 
 	for scanner.Scan() {
@@ -310,6 +322,26 @@ func parseSessionHead(path string) (prompt string, ts time.Time, turns int) {
 				}
 			}
 		}
+	}
+
+	// bufio.Scanner ends a scan on ErrTooLong exactly as it ends one at EOF —
+	// Scan() returns false — so without this read an over-long line is
+	// indistinguishable from a clean end of file, and a session with 500 user
+	// turns behind one long line reports the turns it managed to reach as if
+	// that were the whole file.
+	//
+	// Deliberately NOT propagated. This function has no error return, and the
+	// two callers cannot agree on what one would mean: coldImportRollouts calls
+	// it from inside a filepath.WalkDir callback, where a returned error aborts
+	// the entire import and drops every session after this one. Losing a turn
+	// count is worth reporting; losing the rest of the walk is not. Whether an
+	// over-ceiling line should be skipped or should kill the read is the open
+	// fleet question 6fbf83b3 — this changes nothing there, it only stops the
+	// failure being silent.
+	if err := scanner.Err(); err != nil {
+		log.Printf("parseSessionHead: %s: scan stopped early: %v; "+
+			"reporting the first %d turn(s) only — any turn after the over-long line is not counted",
+			path, err, turns)
 	}
 
 	return prompt, ts, turns
