@@ -54,12 +54,35 @@ CASES = [
     # that reports CAUGHT here is reporting CAUGHT for everything.
     ("CONTROL (no-op): the maxBytes guard narrows from <=0 to <0",
      "discover.go", "if maxBytes <= 0 {", "if maxBytes < 0 {", False),
+
+    # ---- boundary VALUES, added by the 187th pass -------------------------
+    # Everything above moves a MECHANISM: the walk-back, the slice, the call
+    # site. None of it moves a number by one. A suite can hold every mechanism
+    # in this file and still let each boundary drift a byte, because a rune
+    # sliding across a fixed cut never asks what the cut is.
+    ("the budget-of-one boundary: the empty-budget guard swallows maxBytes==1",
+     "discover.go", "if maxBytes <= 0 {", "if maxBytes <= 1 {", True),
+    ("the exactly-at-budget boundary: a string the length of the budget is cut",
+     "discover.go", "if len(s) <= maxBytes {", "if len(s) < maxBytes {", True),
+    ("the over-budget boundary: one byte more than the budget is returned whole",
+     "discover.go", "if len(s) <= maxBytes {", "if len(s) <= maxBytes+1 {", True),
+    ("the cut starts one byte below the budget",
+     "discover.go", "\tcut := maxBytes", "\tcut := maxBytes - 1", True),
+    ("the walk-back's own loop bound stops at 1, keeping a lone lead byte",
+     "discover.go", WALKBACK, "for cut > 1 && !utf8.RuneStart(s[cut]) {", True),
+    # The call site's 200 is the value that SHIPS. Every helper test supplies
+    # its own budget, so none of them is a claim about this number.
+    ("the shipped label budget shrinks by one byte, 200 -> 199",
+     "discover.go", CALLSITE, "prompt = truncateAtRuneBoundary(prompt, 199)", True),
+    ("the shipped label budget grows by one byte, 200 -> 201",
+     "discover.go", CALLSITE, "prompt = truncateAtRuneBoundary(prompt, 201)", True),
 ]
 
 TESTS = ("TestTruncateAtRuneBoundarySlidesTheCutAcrossEveryOffset|"
          "TestTruncateAtRuneBoundaryMixedWidths|"
          "TestTruncateAtRuneBoundaryEdgeCases|"
-         "TestDiscoveredPromptStaysValidUTF8")
+         "TestDiscoveredPromptStaysValidUTF8|"
+         "TestDiscoveredLabelKeepsExactlyTheShippedBudget")
 
 # Messages from fixture guards rather than from an assertion about truncation.
 # A red run that shows only these is the test falling over, not detecting.
@@ -142,8 +165,18 @@ def self_test():
     return ok
 
 
+# Every file any row in CASES mutates. This used to be the literal
+# "discover.go", while CASES has carried a per-row file since it was written --
+# so the file field was a promise the restore did not keep. A row naming a
+# second file would have left that file mutated for every case after it AND
+# after the run, which is the exact failure the signal handlers below exist to
+# prevent, reachable without any signal at all. Derived from the table so it
+# cannot drift from it again.
+MUTATED_FILES = sorted({fname for _, fname, _, _, _ in CASES})
+
+
 def restore():
-    subprocess.run(["git", "checkout", "--", "discover.go"], cwd=REPO, check=True)
+    subprocess.run(["git", "checkout", "--"] + MUTATED_FILES, cwd=REPO, check=True)
 
 
 print("Sabotaging the rune-boundary truncation fix in llm-bridge-claudecode\n")
