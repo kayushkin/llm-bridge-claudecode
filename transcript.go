@@ -89,8 +89,24 @@ func transcriptPath(st *State, uuid string) string {
 // encode identically — and there is no need to guess when the file states it.
 //
 // A transcript with no cwd on any of its opening lines reports not-found
-// rather than a guess: a wrong directory resumes nothing, and the caller's
-// configured directory is a better answer than a decoded one.
+// rather than a guess: a wrong directory resumes nothing, and a configured
+// directory is a better answer than a decoded one.
+//
+// ⚠️ That argument is about handler.go, and it does not carry to the other
+// caller. Not-found means different things at the two call sites:
+//
+//   - handler.go leaves h.workDir at the directory its caller configured. If
+//     that is not where the conversation lives, Claude Code aborts with "No
+//     conversation found with session ID" — wrong, but loud.
+//   - main.go's pty path (execClaudePTY) has no configured directory to fall
+//     back to. It skips the chdir silently and execs claude in whatever cwd
+//     bridge-server handed the child, which per its own comment "opens a blank
+//     session instead of the one the user asked for" — wrong, and quiet.
+//
+// So do not read a not-found here as harmless. It also has several producers —
+// no transcript file, an unopenable one, an opening line past the scanner
+// ceiling below, or genuinely no recorded cwd — and the pty caller cannot tell
+// them apart, because none of them says anything.
 func transcriptWorkingDir(st *State, uuid string) (string, bool) {
 	p := transcriptPath(st, uuid)
 	if p == "" {
