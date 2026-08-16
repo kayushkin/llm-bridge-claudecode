@@ -37,29 +37,73 @@ func execClaudePTY() {
 		os.Exit(127)
 	}
 
-	// Resume in the directory the conversation is in, not the one we were
-	// launched in. Claude Code finds a conversation only from the directory it
-	// was created in (transcript.go), and in pty mode there is no start-params
-	// handshake to carry a working directory — the resume id arrives as an env
-	// var and the cwd is whatever bridge-server gave this process. Without this
-	// a pty resume of any conversation created under a different directory
-	// opens a blank session instead of the one the user asked for.
-	if id := os.Getenv("LLMBRIDGE_PTY_RESUME_ID"); isClaudeSessionUUID(id) {
+	if id := os.Getenv("LLMBRIDGE_PTY_RESUME_ID"); id != "" {
 		st, err := OpenState(DefaultStatePath())
 		if err != nil {
+			// Not fatal: transcriptWorkingDir falls back to walking the
+			// projects tree when it has no state.db. It is still worth saying,
+			// because the walk only covers conversations this harness has not
+			// recorded, so a lost state.db makes a not-found answer likelier.
+			fmt.Fprintf(os.Stderr, "llm-bridge-claudecode pty: open state %q for resume %s: %v; falling back to a transcript scan\n", DefaultStatePath(), id, err)
 			st = nil
 		} else {
 			defer st.Close()
 		}
-		if dir, ok := transcriptWorkingDir(st, id); ok {
-			if err := os.Chdir(dir); err != nil {
-				fmt.Fprintf(os.Stderr, "llm-bridge-claudecode pty: chdir %q for resume %s: %v\n", dir, id, err)
-			}
-		}
+		changeToResumeDirectory(os.Stderr, id, func(uuid string) (string, bool) {
+			return transcriptWorkingDir(st, uuid)
+		}, os.Chdir)
 	}
 	if err := syscall.Exec(bin, []string{bin}, os.Environ()); err != nil {
 		fmt.Fprintf(os.Stderr, "llm-bridge-claudecode pty: exec %s: %v\n", bin, err)
 		os.Exit(127)
+	}
+}
+
+// changeToResumeDirectory moves the process into the directory a resumed
+// conversation was created in, and writes a diagnostic to diagnostics on every
+// path where it cannot.
+//
+// Claude Code finds a conversation only from the directory it was created in
+// (transcript.go), and in pty mode there is no start-params handshake to carry
+// a working directory — the resume id arrives as an env var and the cwd is
+// whatever bridge-server gave this process. Without this move, a pty resume of
+// any conversation created under a different directory opens a blank session
+// instead of the one the user asked for.
+//
+// Every failure here produces that same blank session, so every failure says
+// so. It used to say nothing: the not-found branch had no diagnostic at all,
+// and the user got a working, empty Claude Code somewhere else with nothing
+// anywhere explaining why. The other pty-resume caller (handler.go) can afford
+// silence because it keeps its configured directory and Claude Code then aborts
+// loudly with "No conversation found with session ID"; this caller has no
+// configured directory to keep, only whatever it inherited.
+//
+// It is a separate function because execClaudePTY ends in syscall.Exec and can
+// never be called from a test. lookUpWorkingDir and changeDirectory are
+// parameters for the same reason: a test can then reach every branch without a
+// state database, a transcript on disk, or moving the test process itself.
+func changeToResumeDirectory(
+	diagnostics io.Writer,
+	resumeID string,
+	lookUpWorkingDir func(uuid string) (string, bool),
+	changeDirectory func(dir string) error,
+) {
+	// An unset resume id is the ordinary launch path, not a failure, and must
+	// stay quiet. The caller filters it out; this is the guard for anyone else.
+	if resumeID == "" {
+		return
+	}
+	if !isClaudeSessionUUID(resumeID) {
+		fmt.Fprintf(diagnostics, "llm-bridge-claudecode pty: resume id %q is not a Claude Code session uuid; execing claude in the inherited directory, which opens a blank session\n", resumeID)
+		return
+	}
+	dir, found := lookUpWorkingDir(resumeID)
+	if !found {
+		fmt.Fprintf(diagnostics, "llm-bridge-claudecode pty: no working directory recorded for resume %s; execing claude in the inherited directory, which opens a blank session unless the conversation was created there\n", resumeID)
+		return
+	}
+	if err := changeDirectory(dir); err != nil {
+		fmt.Fprintf(diagnostics, "llm-bridge-claudecode pty: chdir %q for resume %s: %v\n", dir, resumeID, err)
 	}
 }
 
