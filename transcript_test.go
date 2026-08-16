@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -199,5 +200,62 @@ func TestRolloutPathFor_EmptyWhenOnlyBlankPathsRecorded(t *testing.T) {
 	}
 	if got != "" {
 		t.Fatalf("RolloutPathFor = %q; want empty", got)
+	}
+}
+
+// The scanner ceiling in transcriptWorkingDir, pinned from both sides one byte
+// apart. Nothing held this value before: the 194th nightly pass examined it and
+// left it unpinned, so the cap could be raised or lowered with a green suite.
+//
+// The straddle is deliberately tighter than any plausible drift. 8388607 is the
+// longest opening line a transcript may carry and still be read; 8388608 is the
+// first that is not. The literal here is written out independently of
+// transcript.go's own expression so that moving one and not the other fails.
+//
+// Both cases put the long line BEFORE the line carrying the cwd, because that
+// is the only order in which the ceiling is reachable at all — a cwd on line 1
+// returns before the scanner ever meets the long line.
+func TestTranscriptWorkingDir_ScannerCeilingStraddle(t *testing.T) {
+	const ceiling = 8 * 1024 * 1024 // must match transcript.go's sc.Buffer max
+
+	// padLine returns a well-formed JSONL record with no cwd, exactly n bytes long.
+	padLine := func(t *testing.T, n int) string {
+		t.Helper()
+		const prefix, suffix = `{"type":"meta","pad":"`, `"}`
+		line := prefix + strings.Repeat("x", n-len(prefix)-len(suffix)) + suffix
+		if len(line) != n {
+			t.Fatalf("pad line is %d bytes; want %d", len(line), n)
+		}
+		return line
+	}
+
+	cases := []struct {
+		name    string
+		padTo   int
+		wantOK  bool
+		wantDir string
+	}{
+		{"longest readable opening line", ceiling - 1, true, "/tmp/straddle"},
+		{"one byte over the ceiling", ceiling, false, ""},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			t.Setenv("CLAUDE_CONFIG_DIR", root)
+			const uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+			writeTranscript(t, root, "/tmp/straddle", uuid,
+				padLine(t, tc.padTo),
+				`{"type":"user","cwd":"/tmp/straddle","message":{"role":"user"}}`,
+			)
+
+			dir, ok := transcriptWorkingDir(nil, uuid)
+			if ok != tc.wantOK {
+				t.Fatalf("ok = %v; want %v (pad line %d bytes, ceiling %d)", ok, tc.wantOK, tc.padTo, ceiling)
+			}
+			if dir != tc.wantDir {
+				t.Fatalf("dir = %q; want %q", dir, tc.wantDir)
+			}
+		})
 	}
 }
