@@ -53,9 +53,14 @@ func projectsRoot() string {
 // state.db is asked first because this harness already records it: every
 // rollout it has ever opened is stored with its rollout_path, so the usual
 // answer costs one indexed lookup and no filesystem walk. The walk is the
-// fallback for the rollouts written before that column was populated —
-// currently 470 of 7,838 rows — and for conversations this harness never
-// opened itself.
+// fallback for the rollouts written before that column was populated, and for
+// conversations this harness never opened itself.
+//
+// Attrition will not retire that fallback: the path-less rows numbered 470 when
+// this was written and more than that on 2026-08-17, so the tail is growing,
+// not draining. A live row count belongs in the database, not here — ask it:
+//
+//	select count(*), sum(rollout_path is null or rollout_path = '') from rollouts;
 func transcriptPath(st *State, uuid string) string {
 	if st != nil {
 		if p, err := st.RolloutPathFor(uuid); err == nil && p != "" {
