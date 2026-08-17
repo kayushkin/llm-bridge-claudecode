@@ -186,7 +186,10 @@ func TestRolloutPathFor_EmptyWhenOnlyBlankPathsRecorded(t *testing.T) {
 	if err := st.UpsertSession("br_test", uuid); err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
-	// 470 of the 7,838 live rows look exactly like this.
+	// Measured 2026-08-17: 546 of the 8,910 live rows look exactly like this.
+	// Dated because the store is live and grows -- it read 470 of 7,838 on
+	// 2026-08-04, and an undated count here is a measurement that expires in
+	// silence rather than a fact.
 	if err := st.InsertRollout(RolloutRow{
 		HarnessSessionID: uuid, BridgeSessionID: "br_test", Sequence: 1, Kind: "start",
 	}); err != nil {
