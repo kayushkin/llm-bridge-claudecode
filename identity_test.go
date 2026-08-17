@@ -21,7 +21,8 @@ import (
 //	BIN_NAME in deploy.sh          what ./deploy.sh builds, installs and restarts
 //
 // These are five independent constants. Every wrapper in this family was created
-// by cloning an existing one, which copies all five verbatim, and any one left
+// by cloning an existing one, which copies the four file-resident values
+// verbatim -- the checkout directory is chosen fresh -- and any one left
 // un-retargeted silently points this harness at a different harness: it answers
 // to that harness's name on the bus, writes into its state.db, or overwrites its
 // installed binary. Four of the five shipped wrong in llm-bridge-copilotcli (a
