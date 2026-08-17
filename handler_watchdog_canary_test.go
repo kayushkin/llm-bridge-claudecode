@@ -185,10 +185,16 @@ func hasResult(events []msg.Event) bool {
 	return false
 }
 
-// pidAlive asks the OS, not the harness. CCProcess.Alive reads a channel the
-// spawn goroutine closes, and with an OTel receiver attached that close is
-// deliberately delayed — so Alive is the wrong instrument for "did Kill kill
-// it".
+// pidAlive asks the OS, not the harness. CCProcess.Alive reads done, which the
+// spawn goroutine closes as soon as cmd.Wait returns — so the two answers are a
+// goroutine hop apart, not a flush window apart. Alive is still the wrong
+// instrument for "did Kill kill it": it reports that the harness has noticed,
+// and these tests need the OS's own answer that the process was reaped.
+//
+// Until 84af6b4 the gap was much wider — the close sat behind the OTel flush
+// window, so Alive answered true for two seconds after every death. That is
+// where this discipline comes from, and it is why the wording matters: the
+// reason has changed, the rule has not.
 func pidAlive(pid int) bool {
 	return syscall.Kill(pid, syscall.Signal(0)) == nil
 }
@@ -292,10 +298,11 @@ func TestCanaryWedgedTurnRespawnsWithResume(t *testing.T) {
 	if h.sessionID != canaryUUID {
 		t.Fatalf("harness did not adopt the UUID from init: %q", h.sessionID)
 	}
-	// handleMessage respawns only once CCProcess.Alive goes false, and that
-	// lags the kill: with an OTel receiver attached the spawn goroutine waits
-	// for a flush window before closing done. A real next message arrives
-	// long after; this test has to wait for the same condition explicitly.
+	// handleMessage respawns only once CCProcess.Alive goes false. done is
+	// closed as soon as cmd.Wait returns, so that is a scheduling hop after
+	// the kill rather than the flush window it used to be — short, but still
+	// not instant, and a real next message arrives whenever the user sends
+	// one. Wait for the condition rather than assuming it has happened.
 	for h.proc.Alive() && time.Now().Before(deadline.Add(5*time.Second)) {
 		time.Sleep(50 * time.Millisecond)
 	}
