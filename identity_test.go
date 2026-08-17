@@ -24,8 +24,21 @@ import (
 // by cloning an existing one, which copies all five verbatim, and any one left
 // un-retargeted silently points this harness at a different harness: it answers
 // to that harness's name on the bus, writes into its state.db, or overwrites its
-// installed binary. Three of the five shipped wrong in llm-bridge-copilotcli (a
+// installed binary. Four of the five shipped wrong in llm-bridge-copilotcli (a
 // claudecode clone) and none was caught by a build or a test.
+//
+// The count is four, recounted 2026-08-17 from copilotcli's initial commit
+// 0ec0dbd rather than inherited: go.mod, DefaultStatePath and deploy.sh BIN_NAME
+// all read llm-bridge-claudecode, and so did the harness constant. It read three
+// until BIN_NAME was counted. The sentence is about what SHIPPED, so it does not
+// fall as the legs are repaired.
+//
+// Three of those four are repaired on copilotcli's main. The harness constant is
+// NOT: translate.go still says msg.HarnessClaudeCode while msg.HarnessCopilotCLI
+// exists, so every event that bridge emits is still labelled claude_code. This
+// guard does not cover it -- eleven repos in the family have this test and
+// copilotcli, the one repo named above, is not one of them. Card
+// 993b5924-2d1c-412f-95a6-20aa237b2f6f.
 //
 // The checkout directory is the anchor because it is the only one of the five a
 // clone does not inherit from its parent.
