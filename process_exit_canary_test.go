@@ -68,12 +68,21 @@ func spawnWithTelemetry(t *testing.T, mode string, emit func(msg.Event)) (*CCPro
 
 // waitPidGone blocks until the OS says the pid is reaped. It asks the kernel,
 // not CCProcess.Alive — Alive is the thing under test here.
-func waitPidGone(t *testing.T, pid int, limit time.Duration) {
+//
+// The pid-only signature is the point, not an accident: a helper that cannot
+// see a *CCProcess structurally cannot reach .Alive(), so no caller can pick
+// the wrong instrument. That is the enforcement pidAlive's comment asks for
+// and could not supply on its own — see the note above pidAlive.
+//
+// what names the process's role, so a failure says which one outlived its
+// killer. The kill is not always an explicit Kill() call: the watchdog canaries
+// reach here after the watchdog killed the process for them.
+func waitPidGone(t *testing.T, what string, pid int, limit time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(limit)
 	for pidAlive(pid) {
 		if time.Now().After(deadline) {
-			t.Fatalf("process %d was still running %s after Kill", pid, limit)
+			t.Fatalf("%s (pid %d) was still running %s after it should have died", what, pid, limit)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -93,7 +102,7 @@ func TestAliveGoesFalseWhenTheProcessDies(t *testing.T) {
 	if err := proc.Kill(); err != nil {
 		t.Fatalf("kill: %v", err)
 	}
-	waitPidGone(t, pid, 5*time.Second)
+	waitPidGone(t, "the killed process", pid, 5*time.Second)
 
 	// A quarter of the window: comfortably longer than cmd.Wait needs to reap
 	// a killed child, and far short of the two seconds the old code took.
@@ -128,7 +137,7 @@ func TestDoneClosesBeforeTheTelemetryFlush(t *testing.T) {
 	if err := proc.Kill(); err != nil {
 		t.Fatalf("kill: %v", err)
 	}
-	waitPidGone(t, pid, 5*time.Second)
+	waitPidGone(t, "the killed process", pid, 5*time.Second)
 
 	select {
 	case <-proc.Done():
@@ -239,7 +248,7 @@ func TestHandleResumeRespawnsAfterADeath(t *testing.T) {
 	if err := h.proc.Kill(); err != nil {
 		t.Fatalf("kill: %v", err)
 	}
-	waitPidGone(t, pid, 5*time.Second)
+	waitPidGone(t, "the process that died", pid, 5*time.Second)
 	// Long enough for cmd.Wait to reap the child, an order of magnitude short
 	// of the flush window the old code hid the death behind. Sleeping until
 	// Alive goes false instead would make this test assert nothing: it would

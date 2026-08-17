@@ -185,10 +185,27 @@ func hasResult(events []msg.Event) bool {
 	return false
 }
 
-// pidAlive asks the OS, not the harness. CCProcess.Alive reads a channel the
-// spawn goroutine closes, and with an OTel receiver attached that close is
-// deliberately delayed — so Alive is the wrong instrument for "did Kill kill
-// it".
+// pidAlive asks the OS, not the harness: Alive is the wrong instrument for
+// "did Kill kill it", because Alive is the harness's own bookkeeping and this
+// question is whether that bookkeeping matched reality.
+//
+// This comment used to give a timing reason — that Alive lags because the spawn
+// goroutine delays closing done until the OTel flush window ends. That reason
+// is dead twice over on main and must not be restored:
+//
+//   - 84af6b4 ("Let Alive answer for the process, not for the telemetry
+//     receiver") moved close(p.done) to the line after cmd.Wait, ahead of the
+//     flush sleep. See the comment on that goroutine in process.go.
+//   - spawnCanary passes nil for the receiver, so no process in this file ever
+//     had one attached. The cited condition never applied here even before the
+//     fix.
+//
+// Measured on main: after Kill, pidAlive and Alive flip within 0-1µs of each
+// other over 10 runs, with a receiver and without. So the old claim that a
+// three-second margin separates them is false, and no timing assertion can
+// pin the distinction — an ordering case would be scheduling noise. The
+// enforcement is structural instead: waitPidGone takes a pid and therefore
+// cannot reach .Alive(). Prefer it over calling pidAlive in a wait loop.
 func pidAlive(pid int) bool {
 	return syscall.Kill(pid, syscall.Signal(0)) == nil
 }
@@ -214,13 +231,9 @@ func TestCanaryWatchdogKillsARealWedgedProcess(t *testing.T) {
 		t.Fatalf("expected exactly one TURN_IDLE_TIMEOUT, got %d", n)
 	}
 	// Kill is asynchronous at the OS level; give the signal a moment to land.
-	deadline := time.Now().Add(5 * time.Second)
-	for pidAlive(pid) && time.Now().Before(deadline) {
-		time.Sleep(50 * time.Millisecond)
-	}
-	if pidAlive(pid) {
-		t.Fatalf("wedged process %d survived the watchdog", pid)
-	}
+	// Through waitPidGone rather than a local loop, so the OS stays the
+	// authority on "did the watchdog's Kill land" by signature, not by comment.
+	waitPidGone(t, "the wedged process the watchdog killed", pid, 5*time.Second)
 }
 
 // TestCanaryWatchdogSparesATurnSendingKeepAlives is the other half of the
@@ -282,21 +295,20 @@ func TestCanaryWedgedTurnRespawnsWithResume(t *testing.T) {
 	// handleStart drains the wedged turn inline; the watchdog is what let it
 	// return at all.
 	firstPID := h.proc.cmd.Process.Pid
-	deadline := time.Now().Add(5 * time.Second)
-	for pidAlive(firstPID) && time.Now().Before(deadline) {
-		time.Sleep(50 * time.Millisecond)
-	}
-	if pidAlive(firstPID) {
-		t.Fatalf("first process %d survived the watchdog", firstPID)
-	}
+	waitPidGone(t, "the first process the watchdog killed", firstPID, 5*time.Second)
 	if h.sessionID != canaryUUID {
 		t.Fatalf("harness did not adopt the UUID from init: %q", h.sessionID)
 	}
-	// handleMessage respawns only once CCProcess.Alive goes false, and that
-	// lags the kill: with an OTel receiver attached the spawn goroutine waits
-	// for a flush window before closing done. A real next message arrives
-	// long after; this test has to wait for the same condition explicitly.
-	for h.proc.Alive() && time.Now().Before(deadline.Add(5*time.Second)) {
+	// handleMessage branches on CCProcess.Alive, not on the pid, so waiting for
+	// the pid above is not enough: Alive goes false when the spawn goroutine's
+	// cmd.Wait returns and closes done, which is a different goroutine from the
+	// one that just watched the pid disappear. The gap is a scheduling hop —
+	// measured at 0-1µs, not the flush window an earlier comment here claimed —
+	// but it is the condition handleMessage actually reads, so wait on it.
+	// This is the one .Alive() call in this file that is asking the right
+	// question: has the harness noticed yet, so a respawn will happen.
+	aliveDeadline := time.Now().Add(5 * time.Second)
+	for h.proc.Alive() && time.Now().Before(aliveDeadline) {
 		time.Sleep(50 * time.Millisecond)
 	}
 
