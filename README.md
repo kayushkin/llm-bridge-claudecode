@@ -32,7 +32,7 @@ claude --input-format stream-json --output-format stream-json
 
 ### Operating Modes
 
-The binary runs in one of two modes, selected by llm-bridge-server:
+The binary runs in one of three modes, selected by llm-bridge-server:
 
 - **stream-json mode (default).** The flow described above: the harness spawns
   `claude -p --input-format stream-json --output-format stream-json` and
@@ -49,6 +49,14 @@ The binary runs in one of two modes, selected by llm-bridge-server:
   produces versus stream-json mode.
   Because it passes no flags, PTY mode does not honour a session's
   `disabled_tools`: every built-in tool stays on.
+- **OTel-sidecar mode.** `llm-bridge-server` spawns
+  `llm-bridge-claudecode -otel-sidecar` (`internal/harness/sidecar.go`) before
+  it launches a PTY child, because a PTY session `exec`s away the Go process
+  and leaves nothing to host the OTLP receiver. The sidecar starts that
+  receiver, tails the rollout in a goroutine, prints its endpoint URL on stdout
+  — bridge-server blocks reading that line — and lives until stdin closes or it
+  is sent SIGTERM. It is a third mode rather than a flag on the second: it is a
+  separate long-lived process, and the PTY bullet above depends on it.
 
 ### Persistent Bidirectional Process
 
