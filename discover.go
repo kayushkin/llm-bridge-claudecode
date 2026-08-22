@@ -38,14 +38,11 @@ import (
 // minted by bridge-server.
 //
 // projectDir filters the result to sessions whose latest rollout is under
-// `~/.claude/projects/<encoded(projectDir)>/`. Empty projectDir returns
-// every session.
+// `<projectsRoot()>/<encoded(projectDir)>/` — that is, under
+// `$CLAUDE_CONFIG_DIR/projects` when the variable is set and
+// `~/.claude/projects` otherwise. Empty projectDir returns every session.
 func discoverSessions(projectDir string) ([]msg.StoredSession, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil, err
-	}
-	projectsDir := filepath.Join(home, ".claude", "projects")
+	projectsDir := projectsRoot()
 
 	st, err := OpenState(DefaultStatePath())
 	if err != nil {
@@ -347,7 +344,7 @@ func parseSessionHead(path string) (prompt string, ts time.Time, turns int) {
 	return prompt, ts, turns
 }
 
-// findRolloutForUUID does a best-effort scan of ~/.claude/projects/*/<uuid>.jsonl
+// findRolloutForUUID does a best-effort scan of <projectsRoot()>/*/<uuid>.jsonl
 // for a file matching the given Claude Code session UUID. Returns "" if not
 // found — caller treats that as "rollout file not yet on disk" and proceeds
 // without the path. The path can be backfilled later by re-globbing.
@@ -355,11 +352,7 @@ func findRolloutForUUID(uuid string) string {
 	if uuid == "" {
 		return ""
 	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
-	projectsDir := filepath.Join(home, ".claude", "projects")
+	projectsDir := projectsRoot()
 	target := uuid + ".jsonl"
 	var found string
 	_ = filepath.WalkDir(projectsDir, func(path string, d os.DirEntry, err error) error {
