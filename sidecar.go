@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"syscall"
@@ -111,6 +112,26 @@ func runOTelSidecar() {
 	}
 }
 
+// escapePathSegment percent-encodes segment so it can only ever occupy ONE
+// path segment of a URL.
+//
+// The bridge session id reaches this process through
+// LLMBRIDGE_BRIDGE_SESSION_ID, which bridge-server fills from sess.SessionID
+// — and that id is caller-minted: POST /sessions copies the request body's
+// session_id verbatim, checking only that it does not already exist
+// (llm-bridge-server internal/server/sessions.go:306). Nothing checks its
+// characters. So a '/' in the id silently addresses a different endpoint, and
+// a '?' turns the rest of the path into a query string.
+//
+// url.PathEscape is the right escaper because the value sits in path
+// position. url.QueryEscape also escapes '/', but encodes a space as '+',
+// which is a literal '+' in a path. (&url.URL{Path: segment}).EscapedPath()
+// escapes a segment for *joining into* a path and so leaves '/' alone by
+// design — it is the wrong answer that reads most like the right one.
+func escapePathSegment(segment string) string {
+	return url.PathEscape(segment)
+}
+
 // newSidecarEmitter returns an emit callback that POSTs each translated
 // msg.Event to bridge-server's /sidecar/event/{bridge_id} endpoint with
 // the canonical bridge_session_id stamped on the event body.
@@ -119,7 +140,7 @@ func runOTelSidecar() {
 // abort the sidecar — losing one event is better than dropping all
 // subsequent ones because of a transient HTTP hiccup.
 func newSidecarEmitter(bridgeServerURL, bridgeSessionID string) func(msg.Event) {
-	endpoint := fmt.Sprintf("%s/sidecar/event/%s", bridgeServerURL, bridgeSessionID)
+	endpoint := fmt.Sprintf("%s/sidecar/event/%s", bridgeServerURL, escapePathSegment(bridgeSessionID))
 	client := &http.Client{Timeout: 5 * time.Second}
 
 	return func(ev msg.Event) {
