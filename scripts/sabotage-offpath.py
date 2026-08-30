@@ -52,6 +52,9 @@ import signal
 import subprocess
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import tree_hold  # noqa: E402  vendored; see tree_hold.py on keeping copies identical
+
 REPO = pathlib.Path(__file__).resolve().parent.parent
 
 SHALLOW = "if subIdx < 2 {"
@@ -272,44 +275,65 @@ print()
 #
 # SIGKILL cannot be caught by the process that receives it. That is the one gap
 # left here, and it is named rather than papered over.
-_previous_handlers = {}
+# Card `d869d2be`. Every verdict below is read off the SUITE'S exit code, and that
+# exit code belongs to the whole tree rather than to the mutation this run wrote.
+# A second run mutating these same files hands this one a red suite it did not
+# cause, and this one scores it CAUGHT -- the collision does not add noise, it
+# INFLATES the score, and these scores are what the write-ups quote.
+#
+# The `git status` refusal above is a different guard and cannot stand in for
+# this one: it stops this harness deleting somebody's uncommitted work, and it
+# is blind to a concurrent run, because that run restores each file before its
+# next case and the tree is clean between mutations exactly when trusting it is
+# most dangerous.
+#
+# The hold is taken HERE rather than at the `try` below because the signal
+# handlers installed inside it call `restore()`, which writes to the tree. It
+# refuses rather than waits: a run told to come back later can say so and exit,
+# where one silently blocked for the length of somebody else's suite looks hung.
+with tree_hold.exclusive_hold_on_tree(
+        REPO, purpose=os.path.basename(sys.argv[0] or "sabotage")) as _refusal:
+    if _refusal:
+        sys.exit("REFUSING: " + _refusal)
+
+    _previous_handlers = {}
 
 
-def _restore_and_reraise(signum, frame):
-    restore()
-    signal.signal(signum, _previous_handlers[signum])
-    os.kill(os.getpid(), signum)
-
-
-for _sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-    _previous_handlers[_sig] = signal.signal(_sig, _restore_and_reraise)
-
-score = 0
-try:
-    for label, fname, old, new, expect in CASES:
+    def _restore_and_reraise(signum, frame):
         restore()
-        p = REPO / fname
-        text = p.read_text()
-        if text.count(old) != 1:
-            print(f"  SETUP FAIL   {label}\n      pattern appears {text.count(old)}x in {fname}, want 1")
-            continue
-        p.write_text(text.replace(old, new, 1))
+        signal.signal(signum, _previous_handlers[signum])
+        os.kill(os.getpid(), signum)
 
-        r = subprocess.run(["go", "test", "-count=1", "-run", TESTS, "."],
-                           cwd=REPO, capture_output=True, text=True)
-        verdict, detail = classify(r.stdout + r.stderr)
 
-        caught = verdict.startswith("CAUGHT") and "NOT coverage" not in verdict
-        ok = caught == expect
-        score += ok
-        want = "CAUGHT" if expect else "UNNOTICED"
-        print(f"  {'ok  ' if ok else 'BAD '} {verdict:<34} (want {want:<9}) {label}")
-        if detail:
-            print(f"         -> {detail}")
-finally:
-    restore()
-    for _sig, _handler in _previous_handlers.items():
-        signal.signal(_sig, _handler)
+    for _sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        _previous_handlers[_sig] = signal.signal(_sig, _restore_and_reraise)
+
+    score = 0
+    try:
+        for label, fname, old, new, expect in CASES:
+            restore()
+            p = REPO / fname
+            text = p.read_text()
+            if text.count(old) != 1:
+                print(f"  SETUP FAIL   {label}\n      pattern appears {text.count(old)}x in {fname}, want 1")
+                continue
+            p.write_text(text.replace(old, new, 1))
+
+            r = subprocess.run(["go", "test", "-count=1", "-run", TESTS, "."],
+                               cwd=REPO, capture_output=True, text=True)
+            verdict, detail = classify(r.stdout + r.stderr)
+
+            caught = verdict.startswith("CAUGHT") and "NOT coverage" not in verdict
+            ok = caught == expect
+            score += ok
+            want = "CAUGHT" if expect else "UNNOTICED"
+            print(f"  {'ok  ' if ok else 'BAD '} {verdict:<34} (want {want:<9}) {label}")
+            if detail:
+                print(f"         -> {detail}")
+    finally:
+        restore()
+        for _sig, _handler in _previous_handlers.items():
+            signal.signal(_sig, _handler)
 
 reals = sum(1 for _, _, _, _, e in CASES if e)
 print(f"\nscore {score}/{len(CASES)}   ({reals} real rows, {len(CASES) - reals} known-negative controls)")
