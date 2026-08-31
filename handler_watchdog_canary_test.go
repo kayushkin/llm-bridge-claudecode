@@ -12,7 +12,7 @@ import (
 	"github.com/kayushkin/llm-bridge/msg"
 )
 
-// The watchdog tests in handler_recovery_test.go drive drainUntilResult with a
+// The watchdog tests in handler_recovery_test.go drive awaitTurnEnd with a
 // hand-built Harness: an event channel nobody feeds and a CCProcess with no
 // cmd behind it. That proves the select arithmetic and nothing else. It cannot
 // see whether a real subprocess wedges the way the bug report describes, whether
@@ -21,9 +21,9 @@ import (
 // core turn loop.
 //
 // These canaries spawn a real subprocess through the real spawnClaudeCode,
-// read it through the real ReadEvents, and drain it through the real
-// drainUntilResult. The only fake part is the binary on the far end of the
-// pipe, which is the one thing a test cannot supply honestly.
+// read it through the real ReadEvents and readStreamJSON, and wait the turn
+// out through the real awaitTurnEnd. The only fake part is the binary on the
+// far end of the pipe, which is the one thing a test cannot supply honestly.
 
 // fakeClaude writes a stand-in `claude` binary that speaks enough stream-json
 // for the drain loop, and returns its path. Behaviour is chosen by the
@@ -54,6 +54,12 @@ idle() { if [ -n "$FAKECC_EXIT" ]; then exit 0; fi; exec sleep 3600; }
 emit "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"$uuid\",\"model\":\"fake\",\"tools\":[]}"
 result="{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turns\":1,\"session_id\":\"$uuid\",\"result\":\"ok\"}"
 
+# say and endturn build a turn whose text names it, so a test can tell WHICH
+# turn's answer it received. That is the whole question once turns can be
+# delivered out of step with the messages that caused them.
+say() { printf '{"type":"assistant","session_id":"%s","message":{"id":"msg_%s","role":"assistant","model":"fake","content":[{"type":"text","text":"%s"}]}}\n' "$uuid" "$1" "$1"; }
+endturn() { printf '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"session_id":"%s","result":"%s"}\n' "$uuid" "$1"; }
+
 case "$FAKECC_MODE" in
   wedge)
     # The turn never ends and the process never exits. exec so the thing
@@ -75,6 +81,25 @@ case "$FAKECC_MODE" in
     emit "$result"
     idle
     ;;
+  unprompted)
+    # A real claude reads the prompt, then answers it.
+    IFS= read -r _prompt
+    say answered-first
+    endturn r-first
+    # The turn Claude Code starts on its OWN. When a background Task finishes
+    # it injects a <task-notification> into its own conversation and runs a
+    # turn on it — no stdin is read first, which is the entire point. The
+    # harness reads stdout only while servicing a request it initiated, so
+    # nothing is listening when this lands.
+    sleep "$FAKECC_UNPROMPTED_DELAY_SEC"
+    say answered-unprompted
+    endturn r-unprompted
+    # Healthy from here on: one turn per line of stdin.
+    while IFS= read -r _line; do
+      say answered-next
+      endturn r-next
+    done
+    ;;
 esac
 `
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
@@ -89,9 +114,13 @@ esac
 const canaryUUID = "6a1c9f2e-8b41-4d0a-9f77-2c5e13ab7f40"
 
 // spawnCanary starts the fake through the real spawn path and wires a Harness
-// exactly as handleStart does, so the drain loop under test sees a genuine
-// subprocess, pipe and reader goroutine.
-func spawnCanary(t *testing.T, mode string, idle time.Duration, extraArgs ...string) *Harness {
+// exactly as handleStart does — lifetime reader goroutine included — so the
+// turn loop under test sees a genuine subprocess, pipe and reader.
+//
+// Returns the harness and the waiter for the turn the initial prompt starts.
+// The waiter is armed before the write, as handleStart arms it, because a fast
+// turn can end before the write call returns.
+func spawnCanary(t *testing.T, mode string, idle time.Duration, extraArgs ...string) (*Harness, <-chan struct{}) {
 	t.Helper()
 	path := fakeClaude(t)
 	argvLog := filepath.Join(t.TempDir(), "argv")
@@ -115,22 +144,25 @@ func spawnCanary(t *testing.T, mode string, idle time.Duration, extraArgs ...str
 	})
 	h.proc = proc
 	h.events = proc.ReadEvents(h.ctx)
+	go h.readStreamJSON(proc, h.events)
+	waiter := h.registerTurnWaiter()
 	if err := proc.WriteMessage("hello"); err != nil {
 		t.Fatalf("write prompt: %v", err)
 	}
-	return h
+	return h, waiter
 }
 
-// drainWithin runs one turn and fails if it does not end in the given window —
-// the hang this watchdog exists to break.
-func drainWithin(t *testing.T, h *Harness, limit time.Duration) {
+// turnEndsWithin waits out one turn and fails if it does not end in the given
+// window — the hang this watchdog exists to break. It no longer does the
+// reading; the lifetime reader does that, and this only waits.
+func turnEndsWithin(t *testing.T, h *Harness, waiter <-chan struct{}, limit time.Duration) {
 	t.Helper()
 	done := make(chan struct{})
-	go func() { h.drainUntilResult(); close(done) }()
+	go func() { h.awaitTurnEnd(waiter); close(done) }()
 	select {
 	case <-done:
 	case <-time.After(limit):
-		t.Fatalf("drainUntilResult did not return within %s", limit)
+		t.Fatalf("awaitTurnEnd did not return within %s", limit)
 	}
 }
 
@@ -170,13 +202,13 @@ func TestCanaryWatchdogKillsARealWedgedProcess(t *testing.T) {
 	get, restore := swapEmit()
 	defer restore()
 
-	h := spawnCanary(t, "wedge", 2*time.Second)
+	h, waiter := spawnCanary(t, "wedge", 2*time.Second)
 	pid := h.proc.cmd.Process.Pid
 	if !pidAlive(pid) {
 		t.Fatal("fake claude was not running at the start of the turn")
 	}
 
-	drainWithin(t, h, 20*time.Second)
+	turnEndsWithin(t, h, waiter, 20*time.Second)
 
 	if n := idleTimeouts(get()); n != 1 {
 		t.Fatalf("expected exactly one TURN_IDLE_TIMEOUT, got %d", n)
@@ -201,10 +233,10 @@ func TestCanaryWatchdogSparesATurnSendingKeepAlives(t *testing.T) {
 
 	t.Setenv("FAKECC_TICKS", "6")
 	t.Setenv("FAKECC_TICK_SEC", "1")
-	h := spawnCanary(t, "keepalive", 2*time.Second)
+	h, waiter := spawnCanary(t, "keepalive", 2*time.Second)
 	pid := h.proc.cmd.Process.Pid
 
-	drainWithin(t, h, 30*time.Second)
+	turnEndsWithin(t, h, waiter, 30*time.Second)
 
 	events := get()
 	if n := idleTimeouts(events); n != 0 {

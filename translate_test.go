@@ -455,6 +455,30 @@ func TestTranslateSystemNormalizesTaskStatus(t *testing.T) {
 			frame:      `{"type":"system","subtype":"task_updated","task_id":"a66ecc868c9c5c8db","patch":{"status":"in_progress"},"session_id":"741b7725"}`,
 			wantStatus: "in_progress",
 		},
+		// The next two frames are the SAME task (bmmxgu8ao), verbatim from the
+		// event store: CC reports it "stopped" and then patches it to "killed".
+		// Both are the canonical cancelled. Until they were mapped,
+		// TaskStatusIsTerminal recognized neither and the task never settled.
+		{
+			name:       "stopped is cancelled",
+			frame:      `{"type":"system","subtype":"task_notification","task_id":"bmmxgu8ao","tool_use_id":"toolu_014vDBbaWGQJdmGU6QhVH6fh","status":"stopped","output_file":"","summary":"wait for ingest curl to finish","session_id":"fbb3090f"}`,
+			wantStatus: msg.TaskStatusCancelled,
+			wantSummry: "wait for ingest curl to finish",
+		},
+		{
+			name:       "killed is cancelled too — same task, patched a moment later",
+			frame:      `{"type":"system","subtype":"task_updated","task_id":"bmmxgu8ao","patch":{"status":"killed","end_time":1776671433547},"session_id":"fbb3090f"}`,
+			wantStatus: msg.TaskStatusCancelled,
+		},
+		{
+			name: "a status with no mapping passes through verbatim",
+			// Unknown must not become "" and must not be guessed at: an empty
+			// status says nothing, and TaskStatusIsTerminal already declines to
+			// settle a word it does not know. Carrying it makes the new status
+			// visible to whoever reads the event.
+			frame:      `{"type":"system","subtype":"task_updated","task_id":"a66ecc868c9c5c8db","patch":{"status":"quiesced"},"session_id":"741b7725"}`,
+			wantStatus: "quiesced",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

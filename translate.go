@@ -310,6 +310,49 @@ func parseInitInfo(raw json.RawMessage) *msg.SessionInfo {
 	return info
 }
 
+// canonicalTaskStatus maps Claude Code's task status vocabulary onto the
+// canonical one in msg. llm-bridge owns the vocabulary; this is where CC's
+// words become it.
+//
+// "stopped" and "killed" are one outcome narrated twice for the same task:
+// task_notification reports "stopped" with the summary, then task_updated
+// patches the record to "killed" with an end_time. The bridge draws no
+// distinction between the two, so both land on TaskStatusCancelled.
+//
+// Measured over the whole event store: completed 7931, failed 256, stopped 105,
+// killed 90. Neither stopped nor killed was recognized, and TaskStatusIsTerminal
+// rejects what it does not know, so roughly 195 tasks stayed "running" forever —
+// their sessions never settled and the live status line never let them go. CC
+// never says "cancelled", so the canonical value was unreachable from this
+// harness.
+var canonicalTaskStatus = map[string]string{
+	"completed":   msg.TaskStatusCompleted,
+	"failed":      msg.TaskStatusFailed,
+	"stopped":     msg.TaskStatusCancelled,
+	"killed":      msg.TaskStatusCancelled,
+	"cancelled":   msg.TaskStatusCancelled,
+	"in_progress": msg.TaskStatusInProgress,
+}
+
+// taskStatusOf picks the status off whichever field the subtype spells it in and
+// returns the canonical name for it.
+//
+// A status with no mapping passes through verbatim rather than being dropped or
+// guessed at: TaskStatusIsTerminal treats what it does not recognize as
+// non-terminal, so an unknown word leaves the task open, which is the safe
+// direction. It also keeps the unknown word visible to whoever reads the event,
+// instead of hiding a new CC status behind an empty field.
+func taskStatusOf(topLevel, patched string) string {
+	status := topLevel
+	if status == "" {
+		status = patched
+	}
+	if canonical, ok := canonicalTaskStatus[status]; ok {
+		return canonical
+	}
+	return status
+}
+
 func translateSystem(ev ccStreamEvent, sid string, raw json.RawMessage) []msg.Event {
 	var events []msg.Event
 
@@ -408,7 +451,8 @@ func translateSystem(ev ccStreamEvent, sid string, raw json.RawMessage) []msg.Ev
 		// That difference is CC's, not the bridge's, so it is normalized here
 		// onto SystemEvent.TaskStatus rather than left on Raw for every
 		// consumer to rediscover. It used to be left on Raw, and bridge-server
-		// duly re-parsed the frame to get it back.
+		// duly re-parsed the frame to get it back. taskStatusOf settles both
+		// the spelling and the vocabulary — see the map above it.
 		//
 		// Only task_notification carries the summary and the transcript path.
 		// task_updated is the state change; task_notification is the report.
@@ -423,10 +467,7 @@ func translateSystem(ev ccStreamEvent, sid string, raw json.RawMessage) []msg.Ev
 			} `json:"patch"`
 		}
 		_ = json.Unmarshal(raw, &tu)
-		status := tu.Status
-		if status == "" {
-			status = tu.Patch.Status
-		}
+		status := taskStatusOf(tu.Status, tu.Patch.Status)
 		events = append(events, makeEvent(sid, msg.EventSystem, raw, func(e *msg.Event) {
 			e.System = &msg.SystemEvent{
 				Subtype:        ev.Subtype,
