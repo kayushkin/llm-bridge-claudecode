@@ -104,6 +104,14 @@ func main() {
 		return
 	}
 
+	// -oneshot runs a stateless single-turn call on the Claude Code
+	// subscription login. Reads a msg.OneShotRequest JSON from stdin, writes
+	// a msg.OneShotResponse JSON to stdout, and exits. No session, no events.
+	// See oneshot.go for the contract and its credential-ambiguity refusals.
+	if len(os.Args) > 1 && os.Args[1] == "-oneshot" {
+		os.Exit(runOneShot())
+	}
+
 	if len(os.Args) > 1 && os.Args[1] == "-discover" {
 		project := ""
 		if len(os.Args) > 2 {
