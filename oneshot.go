@@ -22,13 +22,13 @@ package main
 //     would bill the API key while the caller believes it is on the
 //     subscription.
 //
-// Deviation from the msg.OneShotRequest.Schema doc: the doc says the bridge
-// is expected to hard-force a tool call. The claude CLI has no forced-tool
-// print mode, so schema conformance is requested by instruction and the
-// reply is validated as JSON here; field-level conformance is checked by the
-// caller's decode. A reply truncated at the output-token cap fails that
-// validation loudly instead of parsing as a shorter valid answer, and
-// stop_reason is passed through so callers can keep their max_tokens guards.
+// Schema conformance uses the CLI's own --json-schema flag, which is a
+// forced tool call underneath (stop_reason reports "tool_use"), satisfying
+// msg.OneShotRequest's hard-force requirement natively. The reply is still
+// validated as exactly one JSON object here: a reply truncated at the
+// output-token cap fails that validation loudly instead of parsing as a
+// shorter valid answer, and stop_reason is passed through so callers can
+// keep their max_tokens guards.
 
 import (
 	"context"
@@ -82,21 +82,22 @@ func runOneShot() int {
 		return 1
 	}
 
-	system := req.SystemPrompt
+	// --max-turns 1 forbids agentic tool round-trips: a model that tries to
+	// use a tool instead of answering ends the run with an error we surface,
+	// rather than silently doing work nobody asked a classifier to do.
+	args := []string{"-p", "--output-format", "json", "--max-turns", "1"}
 	if len(req.Schema) > 0 {
 		if !json.Valid(req.Schema) {
 			writeOneShotError("request schema is not valid JSON")
 			return 1
 		}
-		system += "\n\nYou must answer with a single JSON object conforming to this JSON Schema:\n" +
-			string(req.Schema) +
-			"\nOutput only the JSON object — no prose, no markdown fences, no explanation."
+		// --json-schema is a forced tool call underneath (the CLI reports
+		// stop_reason "tool_use"), so this satisfies msg.OneShotRequest's
+		// hard-force requirement natively. Measured by the 2026-08-17
+		// transport-comparison session (scheduler branch
+		// feat/codex-subscription-client, internal/claudecodeheadless).
+		args = append(args, "--json-schema", string(req.Schema))
 	}
-
-	// --max-turns 1 forbids agentic tool round-trips: a model that tries to
-	// use a tool instead of answering ends the run with an error we surface,
-	// rather than silently doing work nobody asked a classifier to do.
-	args := []string{"-p", "--output-format", "json", "--max-turns", "1"}
 	model := req.Model
 	if model == "" {
 		model = cfg.Model
@@ -104,10 +105,10 @@ func runOneShot() int {
 	if model != "" {
 		args = append(args, "--model", model)
 	}
-	if system != "" {
+	if req.SystemPrompt != "" {
 		// Full replacement, not --append-system-prompt: a classifier wants
 		// its own instructions, not Claude Code's agentic preamble.
-		args = append(args, "--system-prompt", system)
+		args = append(args, "--system-prompt", req.SystemPrompt)
 	}
 
 	// Transcripts group under the cwd's project dir. A dedicated directory
