@@ -209,9 +209,37 @@ type Harness struct {
 	turnOTelAssistant   []string // OTel assistant_response segments buffered this turn
 
 	// lastActivityNano is the Unix-nano time of the most recent emitted event
-	// (either channel). The drainUntilResult watchdog compares against it to
+	// (either channel). The awaitTurnEnd watchdog compares against it to
 	// detect a turn that has gone fully silent while the process is still alive.
 	lastActivityNano atomic.Int64
+
+	// turnWaiter is how a request-driven turn learns that its turn ended. The
+	// reader goroutine closes it at the next turn boundary and clears it.
+	//
+	// It is nil whenever no request is waiting, and that is the point:
+	// Claude Code starts turns nobody asked for — when a background Task
+	// finishes it injects a <task-notification> into its own conversation and
+	// runs a turn with nothing written to its stdin. Those turns must still be
+	// read and emitted, so reading cannot be something only a waiting request
+	// does. See handler_unprompted_turn_canary_test.go.
+	waiterMu   sync.Mutex
+	turnWaiter chan struct{}
+
+	// killedByWatchdog records that the idle watchdog killed the process on
+	// purpose, so the reader's channel-closed path does not also report it as
+	// an unexpected death. Cleared on the next spawn.
+	killedByWatchdog atomic.Bool
+
+	// stateMu guards the session-identity and chain-rotation fields —
+	// sessionID, pendingWALID, pendingIntent, pendingParent — against the
+	// reader goroutine.
+	//
+	// Every one of these used to be touched only by the dispatcher goroutine,
+	// because reading Claude Code's stdout happened inline in the request
+	// handler. Now readStreamJSON runs for the life of the process and writes
+	// sessionID when CC announces one, while handleStart writes the same
+	// fields on a respawn. Never hold this across a blocking wait.
+	stateMu sync.Mutex
 }
 
 // turnWatchdogInterval is how often drainUntilResult wakes to check whether an
@@ -274,12 +302,14 @@ func (h *Harness) recordChainOnInit(newHarnessID, rolloutPath string) {
 	if h.state == nil || h.bridgeSessionID == "" {
 		return
 	}
+	h.stateMu.Lock()
 	intent := h.pendingIntent
 	parent := h.pendingParent
 	walID := h.pendingWALID
 	h.pendingWALID = 0
 	h.pendingIntent = ""
 	h.pendingParent = ""
+	h.stateMu.Unlock()
 
 	switch intent {
 	case "start", "fork":
@@ -391,7 +421,7 @@ func (h *Harness) forward(e msg.Event) {
 		e.BridgeSessionID = h.bridgeSessionID
 	}
 	if e.HarnessSessionID == "" {
-		e.HarnessSessionID = h.sessionID
+		e.HarnessSessionID = h.currentSessionID()
 	}
 	// The stream-json translators stamp Harness at each construction site, but
 	// the in-process OTel receiver's translators (otel.go) do not — those events
@@ -402,6 +432,35 @@ func (h *Harness) forward(e msg.Event) {
 		e.Harness = harness
 	}
 	emitEvent(e)
+}
+
+// currentSessionID reads the Claude Code session UUID under stateMu. The
+// reader goroutine writes it when CC announces one, so no other goroutine may
+// read the field directly.
+func (h *Harness) currentSessionID() string {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+	return h.sessionID
+}
+
+// setSessionID records the Claude Code session UUID under stateMu.
+func (h *Harness) setSessionID(id string) {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+	h.sessionID = id
+}
+
+// clearPendingChain drops any staged chain rotation and reports whether a WAL
+// row was left pending, so the caller can orphan it. Callers must not hold
+// stateMu, and must not emit while holding it — forward reads sessionID.
+func (h *Harness) clearPendingChain() int64 {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+	walID := h.pendingWALID
+	h.pendingWALID = 0
+	h.pendingIntent = ""
+	h.pendingParent = ""
+	return walID
 }
 
 // markActivity records "the harness just produced something" for the
@@ -446,7 +505,7 @@ func (h *Harness) flushRecoveredAssistant() {
 	h.turnOTelAssistant = nil
 	h.turnMu.Unlock()
 
-	log.Printf("[claudecode] recovering %d assistant text segment(s) from OTel; stream-json produced none this turn (session=%s)", len(texts), h.sessionID)
+	log.Printf("[claudecode] recovering %d assistant text segment(s) from OTel; stream-json produced none this turn (session=%s)", len(texts), h.currentSessionID())
 	for i, t := range texts {
 		h.forward(msg.Event{
 			Type:      msg.EventBlock,
@@ -547,9 +606,9 @@ func (h *Harness) handleStart(params StartParams) error {
 	// Prefer the explicit HarnessSessionID; fall back to legacy SessionID
 	// when older callers (or our own internal respawns) only set that field.
 	if params.HarnessSessionID != "" {
-		h.sessionID = params.HarnessSessionID
+		h.setSessionID(params.HarnessSessionID)
 	} else {
-		h.sessionID = params.SessionID
+		h.setSessionID(params.SessionID)
 	}
 
 	// Adopt bridge-server's stable id from the new field if present. For older
@@ -803,9 +862,11 @@ func (h *Harness) handleStart(params StartParams) error {
 		if err != nil {
 			return fmt.Errorf("insert WAL: %w", err)
 		}
+		h.stateMu.Lock()
 		h.pendingWALID = walID
 		h.pendingIntent = "start"
 		h.pendingParent = ""
+		h.stateMu.Unlock()
 	}
 
 	// Fork chain rotation: same WAL machinery as cold-start, but intent='fork'
@@ -828,9 +889,11 @@ func (h *Harness) handleStart(params StartParams) error {
 		if err != nil {
 			return fmt.Errorf("insert WAL: %w", err)
 		}
+		h.stateMu.Lock()
 		h.pendingWALID = walID
 		h.pendingIntent = "fork"
 		h.pendingParent = params.Fork
+		h.stateMu.Unlock()
 	}
 
 	// Resume chain rotation: CC's --resume keeps the same session UUID, so
@@ -840,9 +903,11 @@ func (h *Harness) handleStart(params StartParams) error {
 	// (treated as fork-in-disguise: insert a kind='resume' rollout row). No
 	// WAL row is opened; resume is a no-op for the WAL.
 	if params.Resume && h.state != nil && h.bridgeSessionID != "" {
+		h.stateMu.Lock()
 		h.pendingWALID = 0
 		h.pendingIntent = "resume"
 		h.pendingParent = h.sessionID
+		h.stateMu.Unlock()
 	}
 
 	// Start the per-process OTLP receiver before spawning so the listening
@@ -861,14 +926,11 @@ func (h *Harness) handleStart(params StartParams) error {
 		// Spawn failed before CC could mint a session UUID — the chain
 		// rotation never happened. Orphan any pending WAL row and clear
 		// staged intent so the next call doesn't read stale state.
-		if h.state != nil && h.pendingWALID != 0 {
-			if oErr := h.state.OrphanWAL(h.pendingWALID); oErr != nil {
+		if walID := h.clearPendingChain(); walID != 0 && h.state != nil {
+			if oErr := h.state.OrphanWAL(walID); oErr != nil {
 				log.Printf("[harness] orphan WAL after spawn failure: %v", oErr)
 			}
 		}
-		h.pendingWALID = 0
-		h.pendingIntent = ""
-		h.pendingParent = ""
 		h.emit(msg.Event{
 			Type:      msg.EventError,
 			Harness:   harness,
@@ -881,26 +943,35 @@ func (h *Harness) handleStart(params StartParams) error {
 		return err
 	}
 	h.proc = proc
+	h.killedByWatchdog.Store(false)
 
-	// Start a single event reader for the lifetime of this process.
+	// One reader for the lifetime of this process, started before anything is
+	// written to it. It reads every turn, including the ones Claude Code
+	// starts on its own with nothing on stdin.
 	h.events = proc.ReadEvents(h.ctx)
+	go h.readStreamJSON(proc, h.events)
 
 	// Send the initial user message — either as plain text (Prompt) or as a
 	// canonical content-block array (Blocks). Mutual-exclusion was checked
-	// at function entry.
+	// at function entry. The waiter is armed before the write because a fast
+	// turn can end before the write call returns.
 	switch {
 	case len(params.Blocks) > 0:
+		waiter := h.registerTurnWaiter()
 		if err := proc.WriteMessageBlocks(params.Blocks); err != nil {
 			log.Printf("failed to write initial blocks: %v", err)
+			h.signalTurnEnd()
 			return err
 		}
-		h.drainUntilResult()
+		h.awaitTurnEnd(waiter)
 	case params.Prompt != "":
+		waiter := h.registerTurnWaiter()
 		if err := proc.WriteMessage(params.Prompt); err != nil {
 			log.Printf("failed to write initial prompt: %v", err)
+			h.signalTurnEnd()
 			return err
 		}
-		h.drainUntilResult()
+		h.awaitTurnEnd(waiter)
 	}
 	// If neither, just return — CC is ready and waiting for a message.
 	return nil
@@ -916,13 +987,18 @@ func (h *Harness) handleMessage(params MessageParams) error {
 		// Process died or was never started. Respawn with --resume, forwarding
 		// whichever of Content/Blocks the caller provided.
 		return h.handleStart(StartParams{
-			HarnessSessionID: h.sessionID,
+			HarnessSessionID: h.currentSessionID(),
 			Prompt:           params.Content,
 			Blocks:           params.Blocks,
 			Resume:           true,
 			WorkDir:          h.workDir,
 		})
 	}
+
+	// Arm the waiter before the write: a fast turn can end before the write
+	// call returns, and a waiter armed afterwards would miss its own turn's
+	// end and block until the next one.
+	waiter := h.registerTurnWaiter()
 
 	// Write user message to the existing CC process's stdin.
 	var err error
@@ -932,11 +1008,12 @@ func (h *Harness) handleMessage(params MessageParams) error {
 		err = h.proc.WriteMessage(params.Content)
 	}
 	if err != nil {
+		h.signalTurnEnd()
 		return fmt.Errorf("write message: %w", err)
 	}
 
-	// Stream events for this turn.
-	h.drainUntilResult()
+	// The reader is already emitting this turn's events; wait for its end.
+	h.awaitTurnEnd(waiter)
 	return nil
 }
 
@@ -970,10 +1047,12 @@ func (h *Harness) handleCompact(params CompactParams) error {
 	if params.Summary != "" {
 		cmd = "/compact " + params.Summary
 	}
+	waiter := h.registerTurnWaiter()
 	if err := h.proc.WriteMessage(cmd); err != nil {
+		h.signalTurnEnd()
 		return fmt.Errorf("compact: write /compact: %w", err)
 	}
-	h.drainUntilResult()
+	h.awaitTurnEnd(waiter)
 	return nil
 }
 
@@ -986,11 +1065,11 @@ func (h *Harness) handleResume() error {
 	// Defensive: if h.sessionID was lost (e.g. bridge restart between
 	// start and resume), recover it from state.db. The persisted
 	// current_harness_id is the latest known UUID for this bridge_session_id.
-	resumeID := h.sessionID
+	resumeID := h.currentSessionID()
 	if resumeID == "" && h.state != nil && h.bridgeSessionID != "" {
 		if row, err := h.state.GetSession(h.bridgeSessionID); err == nil && row.CurrentHarnessID != "" {
 			resumeID = row.CurrentHarnessID
-			h.sessionID = resumeID
+			h.setSessionID(resumeID)
 		}
 	}
 	return h.handleStart(StartParams{
@@ -1174,42 +1253,32 @@ func (h *Harness) Shutdown() {
 	}
 }
 
-// drainUntilResult reads events from the shared event channel until a result
-// or error event is seen, indicating the current turn is complete.
-// The channel persists across turns — only one goroutine reads from it.
-// drainUntilResult streams one turn's stream-json events, emitting each, and
-// returns when the turn ends. A turn ends three ways: a stream-json result/
-// error event (the normal path); the event channel closing (process exited);
-// or the idle watchdog firing when the process is alive but has produced no
-// event for Config.TurnIdleTimeout — the wedged-turn case that previously hung
-// forever. Every exit flushes any OTel-only assistant text first, so a message
-// stream-json dropped still reaches the user.
-func (h *Harness) drainUntilResult() {
+// readStreamJSON reads Claude Code's stdout for the whole life of the process,
+// translating and emitting every event, and marking each turn boundary.
+//
+// It runs on its own goroutine, started once per spawn. That is the whole point
+// of it. Reading used to happen only inside the handler for a request the
+// harness had itself initiated, so between turns nobody was reading — and
+// Claude Code does not only speak when spoken to. A finished background Task
+// makes CC inject a <task-notification> into its own conversation and run a
+// turn with nothing written to its stdin. That turn's frames sat unread; the
+// next real turn drained them, returned on the stale result, and left its own
+// frames behind. Every answer from then on was one turn late, which is what a
+// user saw as "the reply only shows up when I send the next message".
+//
+// A request that wants to know when its turn ended waits via awaitTurnEnd.
+// Nothing here depends on anyone waiting.
+func (h *Harness) readStreamJSON(proc *CCProcess, events <-chan json.RawMessage) {
 	h.beginTurn()
-
-	// tick fires the idle watchdog. Left nil (never fires) when the watchdog is
-	// disabled, so the select degrades to the original block-until-channel loop.
-	// The interval checks at least twice per timeout so a stall is caught
-	// promptly, capped at turnWatchdogInterval so a long timeout doesn't poll
-	// needlessly often.
-	var tick <-chan time.Time
-	if h.cfg != nil && h.cfg.TurnIdleTimeout > 0 {
-		interval := turnWatchdogInterval
-		if half := h.cfg.TurnIdleTimeout / 2; half > 0 && half < interval {
-			interval = half
-		}
-		t := time.NewTicker(interval)
-		defer t.Stop()
-		tick = t.C
-	}
-
 	for {
 		select {
-		case raw, ok := <-h.events:
+		case raw, ok := <-events:
 			if !ok {
-				// Channel closed — process exited.
+				// Channel closed — process exited. Release any waiter first so
+				// a request cannot outlive the process it was waiting on.
 				h.flushRecoveredAssistant()
-				h.handleProcessExit()
+				h.handleProcessExit(proc)
+				h.signalTurnEnd()
 				return
 			}
 			// A line on stdout is the process working, whatever it turns into.
@@ -1220,7 +1289,7 @@ func (h *Harness) drainUntilResult() {
 			// here" was read as wedged and killed.
 			h.markActivity()
 
-			translated := translateEvent(raw, h.sessionID, &h.agg, h.tracker)
+			translated := translateEvent(raw, h.currentSessionID(), &h.agg, h.tracker)
 			for _, ev := range translated {
 				h.emit(ev)
 
@@ -1231,7 +1300,7 @@ func (h *Harness) drainUntilResult() {
 						SessionID string `json:"session_id"`
 					}
 					if json.Unmarshal(raw, &init) == nil && init.SessionID != "" {
-						h.sessionID = init.SessionID
+						h.setSessionID(init.SessionID)
 						// Apply staged chain rotation. Cold-start / fork commit
 						// the pending WAL and write a rollout row; resume bumps
 						// sessions.updated_at (and writes a kind='resume'
@@ -1253,20 +1322,91 @@ func (h *Harness) drainUntilResult() {
 					}
 				}
 
-				// A result or error event means this turn is done.
+				// A result or error event ends the turn — whether or not
+				// anyone asked for it. Flush recovery, release any waiter,
+				// and reset the per-turn bookkeeping for the next one.
 				if ev.Type == msg.EventResult || ev.Type == msg.EventError {
 					h.flushRecoveredAssistant()
-					return
+					h.signalTurnEnd()
+					h.beginTurn()
 				}
 			}
+
+		case <-h.ctx.Done():
+			h.signalTurnEnd()
+			return
+		}
+	}
+}
+
+// registerTurnWaiter arms a waiter for the turn a caller is about to start, and
+// returns the channel to wait on. It must be called BEFORE writing to Claude
+// Code's stdin: a fast turn can end before the write call returns, and a waiter
+// armed afterwards would miss its own turn's end and block until the next one.
+func (h *Harness) registerTurnWaiter() chan struct{} {
+	h.waiterMu.Lock()
+	defer h.waiterMu.Unlock()
+	// Release anything already waiting rather than stranding it. Two turns in
+	// flight at once is not a shape this harness has, but dropping a waiter on
+	// the floor would hang a request forever if it ever happened.
+	if h.turnWaiter != nil {
+		close(h.turnWaiter)
+	}
+	h.turnWaiter = make(chan struct{})
+	return h.turnWaiter
+}
+
+// signalTurnEnd releases the waiting request, if there is one. A turn Claude
+// Code started by itself has no waiter and this is a no-op — the turn's events
+// have already been emitted by the reader, which is all an unprompted turn
+// needs.
+func (h *Harness) signalTurnEnd() {
+	h.waiterMu.Lock()
+	defer h.waiterMu.Unlock()
+	if h.turnWaiter != nil {
+		close(h.turnWaiter)
+		h.turnWaiter = nil
+	}
+}
+
+// awaitTurnEnd blocks until the turn armed by registerTurnWaiter ends, or until
+// the idle watchdog decides the process is wedged.
+//
+// A turn ends three ways: a stream-json result/error event (the normal path);
+// the event channel closing (process exited); or this watchdog firing when the
+// process is alive but has produced no event at all for Config.TurnIdleTimeout.
+// The reader flushes any OTel-only assistant text at the first two, so a
+// message stream-json dropped still reaches the user; this path flushes it for
+// the third.
+func (h *Harness) awaitTurnEnd(waiter <-chan struct{}) {
+	// tick fires the idle watchdog. Left nil (never fires) when the watchdog is
+	// disabled, so the select degrades to a plain block-until-the-turn-ends.
+	// The interval checks at least twice per timeout so a stall is caught
+	// promptly, capped at turnWatchdogInterval so a long timeout doesn't poll
+	// needlessly often.
+	var tick <-chan time.Time
+	if h.cfg != nil && h.cfg.TurnIdleTimeout > 0 {
+		interval := turnWatchdogInterval
+		if half := h.cfg.TurnIdleTimeout / 2; half > 0 && half < interval {
+			interval = half
+		}
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		tick = t.C
+	}
+
+	for {
+		select {
+		case <-waiter:
+			return
 
 		case <-tick:
 			if h.sinceActivity() < h.cfg.TurnIdleTimeout {
 				continue
 			}
 			if h.proc == nil || !h.proc.Alive() {
-				// Process is gone; let the channel-closed branch above run the
-				// real exit handling on the next iteration.
+				// Process is gone; the reader's channel-closed path runs the
+				// real exit handling and will release this waiter.
 				continue
 			}
 			// Process alive but the turn produced nothing at all for the whole
@@ -1277,7 +1417,7 @@ func (h *Harness) drainUntilResult() {
 			// output can't bleed into the next turn. The next message respawns
 			// via --resume, which reloads CC's rollout, so the work isn't lost.
 			h.flushRecoveredAssistant()
-			log.Printf("[claudecode] turn idle timeout (%s) session=%s; killing wedged process", h.cfg.TurnIdleTimeout, h.sessionID)
+			log.Printf("[claudecode] turn idle timeout (%s) session=%s; killing wedged process", h.cfg.TurnIdleTimeout, h.currentSessionID())
 			h.emit(msg.Event{
 				Type:      msg.EventError,
 				Harness:   harness,
@@ -1288,6 +1428,9 @@ func (h *Harness) drainUntilResult() {
 				},
 			})
 			if h.proc != nil {
+				// Tell the reader this death was deliberate, so it does not
+				// also report PROCESS_DIED for a process we just killed.
+				h.killedByWatchdog.Store(true)
 				_ = h.proc.Kill()
 			}
 			return
@@ -1302,8 +1445,8 @@ func (h *Harness) drainUntilResult() {
 // turn was draining: orphan any pending chain-rotation WAL row and surface a
 // PROCESS_DIED error. Split out of drainUntilResult so the channel-closed exit
 // path stays readable alongside the watchdog path.
-func (h *Harness) handleProcessExit() {
-	if h.proc == nil || h.proc.Alive() {
+func (h *Harness) handleProcessExit(proc *CCProcess) {
+	if proc == nil || proc.Alive() {
 		return
 	}
 	// Process died before delivering an init event for a still-pending
@@ -1311,21 +1454,26 @@ func (h *Harness) handleProcessExit() {
 	// the next start (boot recovery would also catch it, but this
 	// avoids leaking pending rows for the lifetime of this bridge).
 	// Resume has no WAL row but still needs pending state cleared.
-	if h.state != nil && h.pendingWALID != 0 {
-		if oErr := h.state.OrphanWAL(h.pendingWALID); oErr != nil {
+	if walID := h.clearPendingChain(); walID != 0 && h.state != nil {
+		if oErr := h.state.OrphanWAL(walID); oErr != nil {
 			log.Printf("[harness] orphan WAL after process died: %v", oErr)
 		}
 	}
-	h.pendingWALID = 0
-	h.pendingIntent = ""
-	h.pendingParent = ""
+	// The watchdog kills a wedged process on purpose and has already reported
+	// the stall as TURN_IDLE_TIMEOUT. Reporting the same death again as
+	// PROCESS_DIED would tell the user the process failed when in fact we
+	// ended it. Only reachable now that a reader outlives the turn and sees
+	// the channel close at all.
+	if h.killedByWatchdog.Load() {
+		return
+	}
 	h.emit(msg.Event{
 		Type:      msg.EventError,
 		Harness:   harness,
 		Timestamp: time.Now(),
 		Error: &msg.ErrorEvent{
 			Code:    "PROCESS_DIED",
-			Message: fmt.Sprintf("Claude Code process exited unexpectedly: %v", h.proc.Err()),
+			Message: fmt.Sprintf("Claude Code process exited unexpectedly: %v", proc.Err()),
 		},
 	})
 }

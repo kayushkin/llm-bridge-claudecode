@@ -122,13 +122,15 @@ func TestWatchdog_UnblocksWedgedTurn(t *testing.T) {
 		ctx:    ctx,
 	}
 
+	h.beginTurn()
+	waiter := h.registerTurnWaiter()
 	done := make(chan struct{})
-	go func() { h.drainUntilResult(); close(done) }()
+	go func() { h.awaitTurnEnd(waiter); close(done) }()
 
 	select {
 	case <-done:
 	case <-time.After(3 * time.Second):
-		t.Fatal("drainUntilResult did not return — watchdog failed to fire")
+		t.Fatal("awaitTurnEnd did not return — watchdog failed to fire")
 	}
 
 	var got *msg.ErrorEvent
@@ -158,8 +160,10 @@ func TestWatchdog_RecoversFinalMessageOnStall(t *testing.T) {
 		ctx:    ctx,
 	}
 
+	h.beginTurn()
+	waiter := h.registerTurnWaiter()
 	done := make(chan struct{})
-	go func() { h.drainUntilResult(); close(done) }()
+	go func() { h.awaitTurnEnd(waiter); close(done) }()
 
 	// Deliver the OTel-only final message after the turn has begun.
 	time.Sleep(15 * time.Millisecond)
@@ -168,7 +172,7 @@ func TestWatchdog_RecoversFinalMessageOnStall(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(3 * time.Second):
-		t.Fatal("drainUntilResult did not return")
+		t.Fatal("awaitTurnEnd did not return")
 	}
 
 	rec := countRecovered(get())
