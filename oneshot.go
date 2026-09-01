@@ -82,10 +82,28 @@ func runOneShot() int {
 		return 1
 	}
 
-	// --max-turns 1 forbids agentic tool round-trips: a model that tries to
-	// use a tool instead of answering ends the run with an error we surface,
-	// rather than silently doing work nobody asked a classifier to do.
-	args := []string{"-p", "--output-format", "json", "--max-turns", "1"}
+	// The intent here is that a classifier answers and does nothing else. That
+	// is enforced by --disallowed-tools, not by the turn limit.
+	//
+	// ⚠️ --max-turns 1 does NOT work with --json-schema, and the two were
+	// combined here until it was measured. The schema is a forced tool call
+	// underneath, so producing the answer COSTS a turn: with a limit of 1 the
+	// run ends before the call completes and the CLI returns
+	// is_error:true, num_turns:2 and no result at all. Reproduced directly:
+	//
+	//   claude -p --output-format json --max-turns 1 --json-schema '{…}' "Say ok"
+	//     → is_error true, num_turns 2, result null
+	//   the same with --max-turns 2
+	//     → is_error false, result {"answer":"ok"}
+	//
+	// It broke every schema-forced call on this host, which is every classifier
+	// — 15 minutes apart, for a day, each one leaving real mail unfiled.
+	args := []string{"-p", "--output-format", "json", "--max-turns", "2"}
+	// Blocking the tools is what actually stops a classifier doing work nobody
+	// asked for. Left to itself a model handed a large digest will reach for
+	// Read or Bash; with these denied it can only answer.
+	args = append(args, "--disallowed-tools",
+		"Bash,Read,Write,Edit,NotebookEdit,Glob,Grep,WebFetch,WebSearch,Task,TodoWrite")
 	if len(req.Schema) > 0 {
 		if !json.Valid(req.Schema) {
 			writeOneShotError("request schema is not valid JSON")
