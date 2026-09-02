@@ -82,28 +82,39 @@ func runOneShot() int {
 		return 1
 	}
 
-	// The intent here is that a classifier answers and does nothing else. That
-	// is enforced by --disallowed-tools, not by the turn limit.
+	// A classifier answers and does nothing else. That is enforced by giving it
+	// no tools and no inherited configuration, not by the turn limit.
 	//
-	// ⚠️ --max-turns 1 does NOT work with --json-schema, and the two were
-	// combined here until it was measured. The schema is a forced tool call
-	// underneath, so producing the answer COSTS a turn: with a limit of 1 the
-	// run ends before the call completes and the CLI returns
-	// is_error:true, num_turns:2 and no result at all. Reproduced directly:
+	// ⚠️ --max-turns 1 does NOT work with --json-schema. The schema is a forced
+	// tool call underneath, so producing the answer COSTS a turn: with a limit
+	// of 1 the run ends before the call completes and the CLI returns
+	// is_error:true, num_turns:2 and no result at all.
 	//
-	//   claude -p --output-format json --max-turns 1 --json-schema '{…}' "Say ok"
-	//     → is_error true, num_turns 2, result null
-	//   the same with --max-turns 2
-	//     → is_error false, result {"answer":"ok"}
-	//
-	// It broke every schema-forced call on this host, which is every classifier
-	// — 15 minutes apart, for a day, each one leaving real mail unfiled.
+	// The limit is deliberately not the safety mechanism, because raising it
+	// does not help: measured 2026-09-02 on a demo-mail-generator prompt,
+	// num_turns came back as the cap plus one at every cap (2→3, 3→4, 4→5),
+	// always with terminal_reason "max_turns". The model was not one turn
+	// short, it was looping — reading the failed run's own transcript showed
+	// it calling the Skill tool to load "internal-comms" (a prompt about
+	// writing email matches that skill's description) and then ToolSearch to
+	// hunt for a replacement for the Read it had been denied. It burned every
+	// turn it was given on the user's skills instead of answering.
 	args := []string{"-p", "--output-format", "json", "--max-turns", "2"}
-	// Blocking the tools is what actually stops a classifier doing work nobody
-	// asked for. Left to itself a model handed a large digest will reach for
-	// Read or Bash; with these denied it can only answer.
-	args = append(args, "--disallowed-tools",
-		"Bash,Read,Write,Edit,NotebookEdit,Glob,Grep,WebFetch,WebSearch,Task,TodoWrite")
+
+	// An allowlist of nothing, not a denylist. The denylist that used to sit
+	// here named eleven tools and missed Skill and ToolSearch, so a classifier
+	// could still reach the user's skills — the whole failure above. Any tool
+	// added to the CLI would reopen it the same way, so name what is allowed:
+	// nothing. --json-schema's forced call is injected by the CLI and still
+	// works under it (verified).
+	args = append(args, "--tools", "")
+
+	// A stateless classifier call must not inherit this machine's identity.
+	// Without these it loads the user's settings, CLAUDE.md, AGENTS.md, skills
+	// and MCP servers into every call: that is where the Skill tool came from,
+	// and it more than doubled the bill — the same prompt cost $0.066 with the
+	// inherited context and $0.0295 without.
+	args = append(args, "--setting-sources", "", "--strict-mcp-config")
 	if len(req.Schema) > 0 {
 		if !json.Valid(req.Schema) {
 			writeOneShotError("request schema is not valid JSON")
