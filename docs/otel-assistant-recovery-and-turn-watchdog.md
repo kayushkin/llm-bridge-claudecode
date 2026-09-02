@@ -92,7 +92,7 @@ watchdog-recovers-final-message.
 
 ---
 
-## Consumer contract — what dash / dashv2 must handle
+## Consumer contract — what dash's chat page must handle
 
 These events already fit the existing `msg.Event` wire shape; the point is that
 some are **new or newly-frequent** and the frontend should render them sensibly.
@@ -134,7 +134,7 @@ A normal assistant text block with two extra extension flags:
   subagents. Safe to ignore if unstyled — just don't treat an unknown
   `system.subtype` as an error.
 
-### General rule for dashv2
+### General rule for the chat page
 Handle unknown `error.code` and `system.subtype` values gracefully (generic
 render), and never let an OTel-sourced (`extensions.source == "otel"`) event be
 silently dropped by a stricter allowlist — that is precisely the class of bug
@@ -146,7 +146,7 @@ this work fixed on the backend.
 
 Backend: review the branch, then build + restart `llm-bridge.service`. The
 recovery and watchdog take effect for new sessions after restart. `dash` /
-`dashv2` need no change to *function* (the recovered block and new errors render
+dash's chat page needs no change to *function* (the recovered block and new errors render
 under existing generic handling), but the three items above make them render
 *well* and, for `TURN_IDLE_TIMEOUT`, correctly clear the stuck state.
 
