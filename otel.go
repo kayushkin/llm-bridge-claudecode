@@ -79,6 +79,12 @@ func (r *OTelReceiver) Env() []string {
 		"OTEL_METRIC_EXPORT_INTERVAL=1000",
 		"OTEL_LOGS_EXPORT_INTERVAL=1000",
 		"OTEL_LOG_USER_PROMPTS=1",
+		// Without this the `response` attribute on every assistant_response is
+		// the literal string "<REDACTED>" (measured 2026-09-03), and the
+		// recovery below can only ever surface that. Today's CLI falls back
+		// to OTEL_LOG_USER_PROMPTS when this is unset; naming the flag is
+		// what we mean, and it survives the fallback going away.
+		"OTEL_LOG_ASSISTANT_RESPONSES=1",
 		"OTEL_SERVICE_NAME=llm-bridge-claudecode",
 	}
 }
@@ -384,7 +390,36 @@ func translateAssistantResponse(attrs map[string]string, ts time.Time) (msg.Even
 		},
 	}
 	tagOTelSource(&ev)
+	// Which model call this answer came from. Claude Code makes side calls
+	// of its own — the session title, compaction, memory extraction — and
+	// each of those is an assistant_response too, indistinguishable from the
+	// conversation by text alone: one all-time recovery on this box surfaced
+	// `{"title": "Failed to fetch error on new chat startup"}` as the model's
+	// final answer. Carried so the consumer can tell them apart; see
+	// Harness.flushRecoveredAssistant.
+	if source := attrs["query_source"]; source != "" {
+		ev.Extensions[otelQuerySourceExtension] = json.RawMessage(strconv.Quote(source))
+	}
 	return ev, true
+}
+
+// otelQuerySourceExtension is the Extensions key carrying the OTel
+// `query_source` attribute: the reason Claude Code made the model call this
+// event came from.
+const otelQuerySourceExtension = "query_source"
+
+// otelQuerySource returns the query_source stamped on an OTel-sourced event,
+// or "" when the event carries none.
+func otelQuerySource(e msg.Event) string {
+	raw, ok := e.Extensions[otelQuerySourceExtension]
+	if !ok {
+		return ""
+	}
+	var source string
+	if err := json.Unmarshal(raw, &source); err != nil {
+		return ""
+	}
+	return source
 }
 
 // translateToolDecision maps the OTel `claude_code.tool_decision` event

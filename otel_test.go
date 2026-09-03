@@ -325,7 +325,8 @@ func TestOTelReceiver_AssistantResponseTaggedBlock(t *testing.T) {
 						"attributes": [
 							{"key": "event.name",      "value": {"stringValue": "assistant_response"}},
 							{"key": "response",        "value": {"stringValue": "Want me to (a) write the doc?"}},
-							{"key": "response_length", "value": {"stringValue": "29"}}
+							{"key": "response_length", "value": {"stringValue": "29"}},
+							{"key": "query_source",    "value": {"stringValue": "sdk"}}
 						]
 					},
 					{
@@ -355,6 +356,11 @@ func TestOTelReceiver_AssistantResponseTaggedBlock(t *testing.T) {
 	}
 	if string(e.Extensions["source"]) != `"otel"` {
 		t.Errorf("missing otel source tag: %v", e.Extensions)
+	}
+	// The query_source rides along, so the harness can tell the conversation's
+	// answer from Claude Code's own side calls (session title, compaction).
+	if got := otelQuerySource(e); got != "sdk" {
+		t.Errorf("query_source = %q; want \"sdk\" carried from the attribute", got)
 	}
 }
 
