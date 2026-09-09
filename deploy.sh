@@ -94,25 +94,44 @@ if [ -z "$DEFAULT_BRANCH" ]; then
   echo "       cannot establish that this deploy loses nothing. Refusing." >&2
   exit 1
 fi
-MISSING="$(git rev-list --count HEAD.."refs/heads/$DEFAULT_BRANCH")"
+# Compare against the REMOTE default tip, not the local ref. A local `main`
+# can itself be behind origin — nobody fetched — and then a check against
+# `refs/heads/main` passes while the build is behind the branch it claims to
+# contain. That is exactly how this repo came to sit one commit behind
+# origin/main on 2026-09-09 with every LOCAL guard green: the drift the guard
+# was built to stop had simply moved up one level, into local main. So fetch
+# the default branch (best-effort — offline is not fatal, but say so) and
+# compare against the tracking ref; fall back to the local ref only when there
+# is no origin to ask.
+git fetch --quiet origin "$DEFAULT_BRANCH" 2>/dev/null \
+  || echo "    ⚠️  could not fetch origin/$DEFAULT_BRANCH — comparing against the LOCAL ref, which may itself be stale" >&2
+if git rev-parse --verify --quiet "refs/remotes/origin/$DEFAULT_BRANCH" >/dev/null; then
+  COMPARE_REF="refs/remotes/origin/$DEFAULT_BRANCH"
+  COMPARE_DESC="origin/$DEFAULT_BRANCH"
+else
+  COMPARE_REF="refs/heads/$DEFAULT_BRANCH"
+  COMPARE_DESC="$DEFAULT_BRANCH (local; origin unreachable)"
+fi
+echo "    comparing HEAD against $COMPARE_DESC"
+MISSING="$(git rev-list --count "HEAD..$COMPARE_REF")"
 if [ "$MISSING" -gt 0 ]; then
   if [ "${1:-}" = "--allow-unmerged" ]; then
     echo "    ⚠️  DEPLOYING ANYWAY (--allow-unmerged): HEAD is missing $MISSING commit(s)"
-    echo "        that $DEFAULT_BRANCH has:"
-    git log --oneline HEAD.."refs/heads/$DEFAULT_BRANCH" | sed 's/^/        /'
+    echo "        that $COMPARE_DESC has:"
+    git log --oneline "HEAD..$COMPARE_REF" | sed 's/^/        /'
   else
-    echo "REFUSING TO DEPLOY: HEAD is missing $MISSING commit(s) that $DEFAULT_BRANCH has:" >&2
-    git log --oneline HEAD.."refs/heads/$DEFAULT_BRANCH" | sed 's/^/    /' >&2
+    echo "REFUSING TO DEPLOY: HEAD is missing $MISSING commit(s) that $COMPARE_DESC has:" >&2
+    git log --oneline "HEAD..$COMPARE_REF" | sed 's/^/    /' >&2
     echo "" >&2
     echo "A binary built here would UNDO that work for every session — this exact" >&2
     echo "shape stranded user sessions on 2026-08-31 and 2026-09-01 (the parked" >&2
     echo "llm-bridge-claudecode branch missing the unprompted-turn fix)." >&2
-    echo "Merge $DEFAULT_BRANCH into this branch first (git merge $DEFAULT_BRANCH)," >&2
+    echo "Merge $COMPARE_DESC into this branch first (git merge $COMPARE_REF)," >&2
     echo "or pass --allow-unmerged if losing it is genuinely intended." >&2
     exit 1
   fi
 fi
-echo "    HEAD contains all of $DEFAULT_BRANCH"
+echo "    HEAD contains all of $COMPARE_DESC"
 
 echo "==> Building $BIN_NAME..."
 go build -o "$BIN_NAME" .
