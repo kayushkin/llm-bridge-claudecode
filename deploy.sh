@@ -59,9 +59,9 @@ export PATH="$HOME/.local/share/mise/shims:$PATH"
 # So the check is: the commit being deployed must contain everything the
 # default branch has. Not "must BE main" — deploying a feature branch that has
 # MERGED main in is fine, and is exactly how the 2026-09-01 repair shipped.
-# The default branch is resolved the same way the repo-deploy guard resolves
-# it (origin/HEAD, else main, else master), so this script and that guard can
-# never call different things stale.
+# The default branch is main or master as origin has it, and origin/HEAD only
+# when origin has neither — see resolve_default_branch for why origin/HEAD
+# cannot go first.
 #
 # --allow-unmerged skips the refusal for a deliberate, named exception —
 # printing loudly what is being skipped, because the silent version of this
@@ -72,20 +72,47 @@ export PATH="$HOME/.local/share/mise/shims:$PATH"
 # now also checks the RUNNING binary's ancestry every morning. This guard
 # closes the front door; the judge watches the window.
 # ---------------------------------------------------------------------------
+# Which branch is "the default"? Ask the REMOTE's branches, not origin/HEAD.
+# origin/HEAD is whatever branch the remote had checked out when this clone was
+# made — and a clone of a LOCAL checkout (`git clone ~/repos/llm-bridge-claudecode`)
+# inherits that checkout's CURRENT branch as its "default". That is how the
+# 2026-09-09 redeploy refused with "HEAD is missing 18 commits that
+# origin/fix/discovery-reads-the-configured-claude-directory has": the guard was
+# comparing main against a parked feature branch it had been told was the
+# default. So: a branch named main or master on origin wins outright, and
+# origin/HEAD is consulted only when the remote has neither.
 resolve_default_branch() {
   local name
-  name="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null)"
-  name="${name#origin/}"
-  if [ -n "$name" ] && git rev-parse --verify --quiet "refs/heads/$name" >/dev/null; then
-    echo "$name"; return
-  fi
+  git fetch --quiet origin 'refs/heads/main:refs/remotes/origin/main' 2>/dev/null || true
+  git fetch --quiet origin 'refs/heads/master:refs/remotes/origin/master' 2>/dev/null || true
   for name in main master; do
-    if git rev-parse --verify --quiet "refs/heads/$name" >/dev/null; then
+    if git rev-parse --verify --quiet "refs/remotes/origin/$name" >/dev/null \
+      || git rev-parse --verify --quiet "refs/heads/$name" >/dev/null; then
       echo "$name"; return
     fi
   done
+  name="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null)"
+  name="${name#origin/}"
+  if [ -n "$name" ]; then
+    echo "$name"; return
+  fi
   echo ""
 }
+
+# A clone whose origin is a path on this disk is not looking at the source of
+# truth — it is looking at another checkout, which can be parked on any branch
+# and behind the real remote by any amount. Refuse rather than compare against
+# it; point origin at the real remote first (git remote set-url origin <url>).
+ORIGIN_URL="$(git remote get-url origin 2>/dev/null || true)"
+case "$ORIGIN_URL" in
+  /*|file://*|.*)
+    echo "ERROR: origin is a local path ($ORIGIN_URL), not the real remote. The ancestry" >&2
+    echo "       guard would compare against another checkout's branches, which is how the" >&2
+    echo "       2026-09-09 redeploy refused against a parked feature branch. Run" >&2
+    echo "       'git remote set-url origin <the real remote>' in this clone, then retry." >&2
+    exit 1
+    ;;
+esac
 
 echo "==> Checking ancestry against the default branch..."
 DEFAULT_BRANCH="$(resolve_default_branch)"
