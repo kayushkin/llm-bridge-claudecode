@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/kayushkin/llm-bridge/msg"
 )
@@ -36,14 +38,11 @@ import (
 // minted by bridge-server.
 //
 // projectDir filters the result to sessions whose latest rollout is under
-// `~/.claude/projects/<encoded(projectDir)>/`. Empty projectDir returns
-// every session.
+// `<projectsRoot()>/<encoded(projectDir)>/` — that is, under
+// `$CLAUDE_CONFIG_DIR/projects` when the variable is set and
+// `~/.claude/projects` otherwise. Empty projectDir returns every session.
 func discoverSessions(projectDir string) ([]msg.StoredSession, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil, err
-	}
-	projectsDir := filepath.Join(home, ".claude", "projects")
+	projectsDir := projectsRoot()
 
 	st, err := OpenState(DefaultStatePath())
 	if err != nil {
@@ -271,6 +270,10 @@ func classifySubagentPath(path string) (source, project, parent string, ok bool)
 
 // parseSessionHead scans a CC session JSONL file to extract the first user
 // prompt, timestamp, and turn count.
+//
+// A line over the scanner's ceiling ends the scan where it sits, so the counts
+// returned describe the file up to that line and nothing after it. That is
+// reported, not propagated — see the end of the function for why.
 func parseSessionHead(path string) (prompt string, ts time.Time, turns int) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -279,6 +282,13 @@ func parseSessionHead(path string) (prompt string, ts time.Time, turns int) {
 	defer f.Close()
 
 	scanner := bufio.NewScanner(f)
+	// The largest line this accepts is 1024*1024 - 1 bytes, not 1024*1024. A
+	// line of exactly the cap fills the buffer with no newline in it, so the
+	// token-too-long check fires before the split can succeed. The two spellings
+	// are the starting buffer and the cap, not two separate ceilings — the
+	// effective one is the larger of the two, and the zero-length starting slice
+	// only sets how much is allocated up front. Pinned from both sides by
+	// TestParseSessionHeadReadsTheLongestLineItsCeilingAllows.
 	scanner.Buffer(make([]byte, 0, 256*1024), 1024*1024)
 
 	for scanner.Scan() {
@@ -302,7 +312,7 @@ func parseSessionHead(path string) (prompt string, ts time.Time, turns int) {
 			if prompt == "" {
 				prompt = extractUserContent(entry.Message)
 				if prompt != "" {
-					prompt = truncate(prompt, 200)
+					prompt = truncateAtRuneBoundary(prompt, 200)
 				}
 				if ts.IsZero() && entry.Timestamp != "" {
 					ts, _ = time.Parse(time.RFC3339Nano, entry.Timestamp)
@@ -311,10 +321,30 @@ func parseSessionHead(path string) (prompt string, ts time.Time, turns int) {
 		}
 	}
 
+	// bufio.Scanner ends a scan on ErrTooLong exactly as it ends one at EOF —
+	// Scan() returns false — so without this read an over-long line is
+	// indistinguishable from a clean end of file, and a session with 500 user
+	// turns behind one long line reports the turns it managed to reach as if
+	// that were the whole file.
+	//
+	// Deliberately NOT propagated. This function has no error return, and the
+	// two callers cannot agree on what one would mean: coldImportRollouts calls
+	// it from inside a filepath.WalkDir callback, where a returned error aborts
+	// the entire import and drops every session after this one. Losing a turn
+	// count is worth reporting; losing the rest of the walk is not. Whether an
+	// over-ceiling line should be skipped or should kill the read is the open
+	// fleet question 6fbf83b3 — this changes nothing there, it only stops the
+	// failure being silent.
+	if err := scanner.Err(); err != nil {
+		log.Printf("parseSessionHead: %s: scan stopped early: %v; "+
+			"reporting the first %d turn(s) only — any turn after the over-long line is not counted",
+			path, err, turns)
+	}
+
 	return prompt, ts, turns
 }
 
-// findRolloutForUUID does a best-effort scan of ~/.claude/projects/*/<uuid>.jsonl
+// findRolloutForUUID does a best-effort scan of <projectsRoot()>/*/<uuid>.jsonl
 // for a file matching the given Claude Code session UUID. Returns "" if not
 // found — caller treats that as "rollout file not yet on disk" and proceeds
 // without the path. The path can be backfilled later by re-globbing.
@@ -322,11 +352,7 @@ func findRolloutForUUID(uuid string) string {
 	if uuid == "" {
 		return ""
 	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
-	projectsDir := filepath.Join(home, ".claude", "projects")
+	projectsDir := projectsRoot()
 	target := uuid + ".jsonl"
 	var found string
 	_ = filepath.WalkDir(projectsDir, func(path string, d os.DirEntry, err error) error {
@@ -358,11 +384,33 @@ func ccProjectToPath(name string) string {
 	return "/" + strings.ReplaceAll(strings.TrimPrefix(name, "-"), "-", "/")
 }
 
-func truncate(s string, max int) string {
-	if len(s) <= max {
+// truncateAtRuneBoundary returns the longest prefix of s that is no longer than
+// maxBytes and does not end part-way through a multi-byte UTF-8 sequence.
+//
+// Cutting a Go string at a fixed byte offset splits whatever rune straddles that
+// offset, and the result is not valid UTF-8. Nothing reports it: encoding/json
+// substitutes U+FFFD rather than failing, so the reader sees a replacement
+// character and no error is raised anywhere along the way. The one caller here
+// cuts a discovered session's first user message down to a label, and that label
+// is encoded into msg.StoredSession.Prompt and crosses to bridge-server — so a
+// split rune survives the request and a reload does not fix it.
+//
+// The walk-back costs at most three byte comparisons and allocates nothing,
+// which is why it is preferred here over converting to []rune.
+func truncateAtRuneBoundary(s string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(s) <= maxBytes {
 		return s
 	}
-	return s[:max]
+	// s[cut] is the first byte past the prefix. While it is a continuation
+	// byte, a rune straddles the cut, so move the cut earlier.
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
 }
 
 // extractUserContent extracts text from a CC user message.

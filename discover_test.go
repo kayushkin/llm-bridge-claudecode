@@ -384,3 +384,45 @@ func TestClassifySubagentPathReportsParent(t *testing.T) {
 		})
 	}
 }
+
+// TestDiscover_HonoursClaudeConfigDirOverride pins the two halves of this
+// package agreeing about where Claude Code keeps its transcripts.
+//
+// `claudeConfigDir` documents CLAUDE_CONFIG_DIR as the override and
+// transcriptPath has always honoured it, but discoverSessions and
+// findRolloutForUUID each re-derived `~/.claude/projects` from
+// os.UserHomeDir() and ignored the variable. With the override set the two
+// disagreed: discovery listed the sessions under the home directory while a
+// resume looked for their transcripts under the override, so every session
+// discovery reported was one whose transcript could not be found.
+//
+// Both trees are populated here on purpose. A test that only planted the
+// override's rollout would pass against code that read either location.
+func TestDiscover_HonoursClaudeConfigDirOverride(t *testing.T) {
+	homeProjects, _ := withCCHome(t)
+	writeJSONL(t, filepath.Join(homeProjects, "-tmp-home", "uuid-under-home.jsonl"), "under home")
+
+	override := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", override)
+	writeJSONL(t, filepath.Join(override, "projects", "-tmp-override", "uuid-under-override.jsonl"), "under override")
+
+	got, err := discoverSessions("")
+	if err != nil {
+		t.Fatalf("discoverSessions: %v", err)
+	}
+
+	ids := make([]string, 0, len(got))
+	for _, s := range got {
+		ids = append(ids, s.HarnessSessionID)
+	}
+	if len(got) != 1 || ids[0] != "uuid-under-override" {
+		t.Fatalf("discovered %v, want exactly [uuid-under-override] — discovery is not reading CLAUDE_CONFIG_DIR, so it disagrees with transcriptPath about where transcripts live", ids)
+	}
+
+	if p := findRolloutForUUID("uuid-under-override"); p == "" {
+		t.Error("findRolloutForUUID could not locate the override's rollout; it is still scanning the home directory")
+	}
+	if p := findRolloutForUUID("uuid-under-home"); p != "" {
+		t.Errorf("findRolloutForUUID found %q under the home directory while CLAUDE_CONFIG_DIR points elsewhere", p)
+	}
+}

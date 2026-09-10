@@ -198,15 +198,33 @@ type Harness struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	// Turn-scoped assistant-text recovery. In -p mode each model text segment
-	// arrives on both stream-json (authoritative) and OTel (source=otel copy).
-	// emit forwards the stream-json copy and buffers the OTel copy; at turn end
-	// flushRecoveredAssistant surfaces the buffer only if stream-json produced
-	// no assistant text — recovering the message when stream-json drops the
-	// final turn, without duplicating on the healthy path. Guarded by turnMu.
-	turnMu              sync.Mutex
-	turnStreamAssistant bool     // stream-json delivered assistant text this turn
-	turnOTelAssistant   []string // OTel assistant_response segments buffered this turn
+	// Assistant-text recovery. In -p mode each model text segment arrives on
+	// both stream-json (authoritative) and OTel (source=otel copy). emit
+	// forwards the stream-json copy and buffers the OTel copy; at turn end
+	// flushRecoveredAssistant surfaces every buffered segment whose text
+	// stream-json did NOT deliver — recovering a final message stream-json
+	// dropped, without duplicating on the healthy path. Guarded by turnMu.
+	//
+	// Per SEGMENT, not per turn. This used to be one bool, "stream-json said
+	// something this turn", and the buffer was thrown away whenever it was
+	// true — so a turn that narrated once and then lost its final answer, the
+	// exact case recovery exists for, recovered nothing. Measured in
+	// log-store 2026-09-03: 19 of the 20 idle-timeout turns all-time had
+	// earlier stream text and a model call after it.
+	turnMu sync.Mutex
+	// deliveredText is the assistant text stream-json delivered in the
+	// current turn, whitespace-normalised, with a count per distinct text.
+	// deliveredBefore is the previous turn's. Both are consulted at flush
+	// because Claude Code's exporter batches for about a second, so the OTel
+	// copy of a turn's last segment routinely lands AFTER that turn's result
+	// — in the next turn's buffer, where it must still be recognised as
+	// already delivered rather than recovered.
+	deliveredText   map[string]int
+	deliveredBefore map[string]int
+	// pendingOTel is every OTel assistant_response not yet reconciled
+	// against the delivered text. Cleared only by flushRecoveredAssistant,
+	// never by beginTurn, for the same batching reason.
+	pendingOTel []msg.Event
 
 	// lastActivityNano is the Unix-nano time of the most recent emitted event
 	// (either channel). The awaitTurnEnd watchdog compares against it to
@@ -399,12 +417,15 @@ func (h *Harness) emit(e msg.Event) {
 			// turn end whether it's needed. (In PTY mode the sidecar — not this
 			// emit — handles OTel, so PTY assistant text is never intercepted.)
 			h.turnMu.Lock()
-			h.turnOTelAssistant = append(h.turnOTelAssistant, e.Block.Block.Text.Text)
+			h.pendingOTel = append(h.pendingOTel, e)
 			h.turnMu.Unlock()
 			return
 		}
 		h.turnMu.Lock()
-		h.turnStreamAssistant = true
+		if h.deliveredText == nil {
+			h.deliveredText = map[string]int{}
+		}
+		h.deliveredText[normaliseAssistantText(e.Block.Block.Text.Text)]++
 		h.turnMu.Unlock()
 	}
 
@@ -476,36 +497,80 @@ func (h *Harness) sinceActivity() time.Duration {
 	return time.Duration(time.Now().UnixNano() - h.lastActivityNano.Load())
 }
 
-// beginTurn resets per-turn recovery state and the activity clock. Called at
-// the top of drainUntilResult so each turn's stream-json/OTel bookkeeping and
-// idle timer start clean.
+// beginTurn rolls the per-turn recovery state forward and resets the activity
+// clock. Called at the top of readStreamJSON and after every turn end so each
+// turn's stream-json bookkeeping and idle timer start clean.
+//
+// It rolls the delivered-text record forward rather than dropping it, and it
+// leaves the OTel buffer alone: the OTel copy of a turn's last segment lands
+// about a second late, which is usually after that turn's result and therefore
+// here, in the next turn. Dropping the record would make that late copy look
+// undelivered and recover it into the wrong turn; dropping the buffer would
+// throw away an answer that a wedged next turn could still surface.
 func (h *Harness) beginTurn() {
 	h.markActivity()
 	h.turnMu.Lock()
-	h.turnStreamAssistant = false
-	h.turnOTelAssistant = nil
+	h.deliveredBefore = h.deliveredText
+	h.deliveredText = map[string]int{}
 	h.turnMu.Unlock()
 }
 
-// flushRecoveredAssistant surfaces the buffered OTel assistant text for the
-// turn that is ending — but only when stream-json delivered no assistant text
-// of its own. On the healthy path stream-json carried the message, so the
-// buffer is dropped and nothing double-renders. When stream-json dropped the
-// turn (process wedged, stdout silent), this is what makes the model's final
-// message visible instead of the session looking frozen. Idempotent: clears the
-// buffer, so calling it more than once per turn is safe.
+// flushRecoveredAssistant surfaces every buffered OTel assistant segment that
+// stream-json did not deliver, in this turn or the previous one. On the
+// healthy path every segment was delivered, so the buffer is dropped and
+// nothing double-renders. When stream-json dropped a segment — usually the
+// final answer after a turn that had already narrated (process wedged, stdout
+// silent) — this is what makes it visible instead of the session looking
+// frozen. Idempotent: clears the buffer, so calling it more than once is safe.
+//
+// A segment is delivered when its whitespace-normalised text equals one
+// stream-json delivered. Measured 2026-09-03 on a live turn: with
+// OTEL_LOG_ASSISTANT_RESPONSES set the OTel `response` is byte-identical to
+// the stream-json text block, one per block. Each match consumes one delivery,
+// so a turn that says the same thing twice and loses the second still recovers
+// it.
+//
+// Segments from Claude Code's own side calls — the session title, compaction,
+// memory extraction — are skipped: they are assistant_response events too, and
+// text matching cannot tell them from the conversation because nothing on
+// stream-json ever matches them. A segment with no query_source at all is
+// treated as conversation, so an older CLI that did not stamp one still
+// recovers.
 func (h *Harness) flushRecoveredAssistant() {
 	h.turnMu.Lock()
-	if h.turnStreamAssistant || len(h.turnOTelAssistant) == 0 {
-		h.turnOTelAssistant = nil
+	pending := h.pendingOTel
+	h.pendingOTel = nil
+	if len(pending) == 0 {
 		h.turnMu.Unlock()
 		return
 	}
-	texts := h.turnOTelAssistant
-	h.turnOTelAssistant = nil
+	var texts []string
+	var matched, sideCalls int
+	for _, e := range pending {
+		if source := otelQuerySource(e); source != "" && source != conversationQuerySource {
+			sideCalls++
+			continue
+		}
+		text := e.Block.Block.Text.Text
+		key := normaliseAssistantText(text)
+		switch {
+		case h.deliveredText[key] > 0:
+			h.deliveredText[key]--
+			matched++
+		case h.deliveredBefore[key] > 0:
+			h.deliveredBefore[key]--
+			matched++
+		default:
+			texts = append(texts, text)
+		}
+	}
 	h.turnMu.Unlock()
 
-	log.Printf("[claudecode] recovering %d assistant text segment(s) from OTel; stream-json produced none this turn (session=%s)", len(texts), h.currentSessionID())
+	if len(texts) == 0 {
+		return
+	}
+	log.Printf("[claudecode] recovering %d assistant text segment(s) from OTel that stream-json never delivered (%d matched a delivered segment, %d side-call responses skipped; session=%s)",
+		len(texts), matched, sideCalls, h.currentSessionID())
 	for i, t := range texts {
 		h.forward(msg.Event{
 			Type:      msg.EventBlock,
@@ -523,6 +588,22 @@ func (h *Harness) flushRecoveredAssistant() {
 			},
 		})
 	}
+}
+
+// conversationQuerySource is the OTel query_source Claude Code stamps on the
+// model calls of the conversation itself when driven over the SDK surface —
+// `--input-format stream-json`, which is how this harness runs it. Measured
+// 2026-09-03 on claude-code 2.x: the reply to the prompt carried "sdk", the
+// session-title call "generate_session_title", and the CLI bundle names some
+// thirty more side-call sources. Not a list of those: the conversation is one
+// value, and everything else is a side call.
+const conversationQuerySource = "sdk"
+
+// normaliseAssistantText is the key two copies of one segment are matched on:
+// the text with runs of whitespace collapsed and the ends trimmed, so a
+// trailing newline on one copy does not make it a different answer.
+func normaliseAssistantText(text string) string {
+	return strings.Join(strings.Fields(text), " ")
 }
 
 // isAssistantTextEvent reports whether e is a model text block (the only block
