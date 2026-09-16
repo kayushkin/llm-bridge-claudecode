@@ -51,6 +51,18 @@ import (
 // killed process.
 const oneShotTimeout = 5 * time.Minute
 
+// oneshotWorkingDirectory is the directory every oneshot call runs claude -p
+// in. It is defined here once because two things depend on it agreeing: the
+// oneshot mode that runs there, and discovery, which recognises a transcript
+// as a oneshot call by the Claude Code project directory this path encodes to.
+func oneshotWorkingDirectory() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".llm-bridge-claudecode", "oneshot"), nil
+}
+
 func runOneShot() int {
 	raw, err := io.ReadAll(os.Stdin)
 	if err != nil {
@@ -142,13 +154,18 @@ func runOneShot() int {
 
 	// Transcripts group under the cwd's project dir. A dedicated directory
 	// keeps ~480 machine calls/day from polluting the discover scan of any
-	// real repo's session history.
-	workDir := ""
-	if home, err := os.UserHomeDir(); err == nil {
-		d := filepath.Join(home, ".llm-bridge-claudecode", "oneshot")
-		if err := os.MkdirAll(d, 0o755); err == nil {
-			workDir = d
-		}
+	// real repo's session history, and is how discovery recognises these
+	// transcripts as oneshot calls. Running anywhere else would file the
+	// transcript under some other project as an ordinary discovered session,
+	// so a directory that cannot be made is an error, not a shrug.
+	workDir, err := oneshotWorkingDirectory()
+	if err != nil {
+		writeOneShotError("oneshot working directory: " + err.Error())
+		return 1
+	}
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		writeOneShotError("create oneshot working directory: " + err.Error())
+		return 1
 	}
 
 	env := os.Environ()
@@ -163,9 +180,7 @@ func runOneShot() int {
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Stdin = strings.NewReader(req.Prompt)
 	cmd.Env = env
-	if workDir != "" {
-		cmd.Dir = workDir
-	}
+	cmd.Dir = workDir
 	out, err := cmd.Output()
 	if err != nil {
 		detail := ""

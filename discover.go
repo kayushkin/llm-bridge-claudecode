@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log"
 	"os"
@@ -44,6 +45,11 @@ import (
 func discoverSessions(projectDir string) ([]msg.StoredSession, error) {
 	projectsDir := projectsRoot()
 
+	oneshotDirectory, err := oneshotWorkingDirectory()
+	if err != nil {
+		return nil, fmt.Errorf("oneshot working directory: %w", err)
+	}
+
 	st, err := OpenState(DefaultStatePath())
 	if err != nil {
 		return nil, err
@@ -70,7 +76,7 @@ func discoverSessions(projectDir string) ([]msg.StoredSession, error) {
 		if err != nil {
 			return nil, err
 		}
-		ss := buildStoredSession(sess, rollouts)
+		ss := buildStoredSession(sess, rollouts, oneshotDirectory)
 		if projectPrefix != "" {
 			if ss.Path == "" || !strings.HasPrefix(ss.Path, projectPrefix) {
 				continue
@@ -174,7 +180,11 @@ func loadKnownHarnessIDs(st *State) (map[string]struct{}, error) {
 // comes from the LATEST rollout's on-disk file when available; if the file
 // is missing or rollouts are empty the StoredSession still ships with
 // whatever the state.db rows themselves carry.
-func buildStoredSession(sess SessionRow, rollouts []RolloutRow) msg.StoredSession {
+//
+// oneshotDirectory is the working directory oneshot mode runs claude -p in
+// (oneshotWorkingDirectory). A top-level transcript filed under its project
+// directory is a oneshot call and is tagged msg.PurposeOneshot.
+func buildStoredSession(sess SessionRow, rollouts []RolloutRow, oneshotDirectory string) msg.StoredSession {
 	out := msg.StoredSession{
 		HarnessSessionID: sess.CurrentHarnessID,
 		BridgeSessionID:  sess.BridgeSessionID,
@@ -208,6 +218,12 @@ func buildStoredSession(sess SessionRow, rollouts []RolloutRow) msg.StoredSessio
 			out.Source = source
 			out.Project = project
 			out.ParentHarnessSessionID = parent
+		} else if isOneshotTranscriptPath(path, oneshotDirectory) {
+			// A stateless model call made through oneshot mode. The project
+			// is the working directory itself: decoding the directory name
+			// cannot recover it, because the encoding folds '.' into '-'.
+			out.Source = msg.PurposeOneshot
+			out.Project = oneshotDirectory
 		} else {
 			// Project is encoded into the parent directory name.
 			out.Project = ccProjectToPath(filepath.Base(filepath.Dir(path)))
@@ -266,6 +282,23 @@ func classifySubagentPath(path string) (source, project, parent string, ok bool)
 		source = "workflow-subagent"
 	}
 	return source, ccProjectToPath(parts[subIdx-2]), parts[subIdx-1], true
+}
+
+// isOneshotTranscriptPath reports whether a rollout path is a top-level
+// transcript in the Claude Code project directory for oneshotDirectory:
+//
+//	<projects>/<encoded(oneshotDirectory)>/<uuid>.jsonl
+//
+// The comparison is on the encoded directory name, computed forward with
+// pathToCCProject, never by decoding the name back into a path — the encoding
+// is lossy ('.' and '/' both become '-'), so a decoded name is not the path.
+// Subagent layouts nest deeper and are classified by classifySubagentPath
+// before this is consulted.
+func isOneshotTranscriptPath(path, oneshotDirectory string) bool {
+	if oneshotDirectory == "" {
+		return false
+	}
+	return filepath.Base(filepath.Dir(path)) == pathToCCProject(oneshotDirectory)
 }
 
 // parseSessionHead scans a CC session JSONL file to extract the first user
@@ -369,9 +402,31 @@ func findRolloutForUUID(uuid string) string {
 }
 
 // pathToCCProject converts a filesystem path to Claude Code's project directory name.
-// /home/user/repos → -home-user-repos
+// /home/user/repos → -home-user-repos, /home/user/.cache → -home-user--cache
+//
+// Claude Code replaces every character outside [a-zA-Z0-9] with '-' (read from
+// the CLI bundle: path.replace(/[^a-zA-Z0-9]/g, "-")). It runs on UTF-16 code
+// units, so a character outside the Basic Multilingual Plane becomes two
+// dashes. This used to replace only '/', which gave the wrong name for any
+// path containing '.', '_' or a space — ~/.llm-bridge-claudecode/oneshot among
+// them.
+//
+// Not reproduced: Claude Code truncates a name longer than 200 characters and
+// appends a hash of the path. No working directory on this host is that long.
 func pathToCCProject(path string) string {
-	return strings.ReplaceAll(path, "/", "-")
+	var b strings.Builder
+	b.Grow(len(path))
+	for _, r := range path {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r > 0xFFFF:
+			b.WriteString("--")
+		default:
+			b.WriteByte('-')
+		}
+	}
+	return b.String()
 }
 
 // ccProjectToPath converts a CC project directory name back to a filesystem path.

@@ -140,7 +140,7 @@ func TestBuildStoredSessionReadsTheLatestRolloutNotTheFirst(t *testing.T) {
 		t.Fatalf("GetSession: %v", err)
 	}
 
-	ss := buildStoredSession(*row, rs)
+	ss := buildStoredSession(*row, rs, "")
 	if ss.Path != secondPath {
 		t.Errorf("path = %q, want the LATEST rollout %q", ss.Path, secondPath)
 	}

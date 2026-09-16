@@ -270,7 +270,7 @@ func TestColdImport_BackfillPathOnEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetSession: %v", err)
 	}
-	ss := buildStoredSession(*row, rs)
+	ss := buildStoredSession(*row, rs, "")
 	if ss.Path != rolloutPath {
 		t.Fatalf("path should be backfilled to %q, got %q", rolloutPath, ss.Path)
 	}
