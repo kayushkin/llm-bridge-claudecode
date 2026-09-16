@@ -115,18 +115,6 @@ func runOneShot() int {
 	// and it more than doubled the bill — the same prompt cost $0.066 with the
 	// inherited context and $0.0295 without.
 	args = append(args, "--setting-sources", "", "--strict-mcp-config")
-
-	// And it must not leave a transcript behind. Without this every call wrote a
-	// Claude Code session file, and llm-bridge-server's discovery scan imported each
-	// one as an `external`/`discovered` session: 52,706 transcripts (831 MB) under
-	// ~/.claude/projects/-home-kayushkincom--llm-bridge-claudecode-oneshot and
-	// 24,570 imported sessions in one week, measured 2026-09-16. The kanban
-	// classifier then spent 7 of its 10 model calls per tick classifying those —
-	// its own earlier calls — and each of those calls wrote another. The dedicated
-	// working directory below was meant to keep them out of real repos' history;
-	// it never kept them out of discovery. Verified: with this flag the CLI writes
-	// no .jsonl, only an empty memory/ directory.
-	args = append(args, "--no-session-persistence")
 	if len(req.Schema) > 0 {
 		if !json.Valid(req.Schema) {
 			writeOneShotError("request schema is not valid JSON")
