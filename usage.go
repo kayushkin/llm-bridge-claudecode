@@ -11,6 +11,12 @@ import (
 type UsageAggregator struct {
 	calls     []msg.TokenUsage
 	toolCalls int
+
+	// cumulativeCostUSD is the last `total_cost_usd` the CLI reported. Claude
+	// Code's figure is cumulative for the CLI process, and msg.ResultEvent.Cost
+	// is one turn's cost, so each result emits the difference. Not cleared by
+	// Reset, which runs between turns: it lives as long as the process does.
+	cumulativeCostUSD float64
 }
 
 // ccAssistantUsage is the usage block inside a CC assistant message.
@@ -91,12 +97,27 @@ func (a *UsageAggregator) Finalize(raw json.RawMessage) (msg.TokenUsage, *msg.Co
 		usage.ContextTokens = last.InputTokens + last.CacheReadTokens + last.CacheWriteTokens
 	}
 
-	var cost *msg.Cost
-	if result.TotalCost > 0 {
-		cost = &msg.Cost{TotalUSD: result.TotalCost}
-	}
+	return usage, a.turnCost(result.TotalCost)
+}
 
-	return usage, cost
+// turnCost converts the CLI's cumulative `total_cost_usd` into this turn's cost.
+//
+// A total lower than the previous one means the CLI process started over (a
+// resume in the same harness process), so its whole total is this turn's. A zero
+// total is a turn the CLI did not price, and reports no cost.
+func (a *UsageAggregator) turnCost(cumulativeUSD float64) *msg.Cost {
+	if cumulativeUSD <= 0 {
+		return nil
+	}
+	turnUSD := cumulativeUSD - a.cumulativeCostUSD
+	if cumulativeUSD < a.cumulativeCostUSD {
+		turnUSD = cumulativeUSD
+	}
+	a.cumulativeCostUSD = cumulativeUSD
+	if turnUSD <= 0 {
+		return nil
+	}
+	return &msg.Cost{TotalUSD: turnUSD}
 }
 
 // APICallUsages returns the per-call breakdown.
