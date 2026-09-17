@@ -502,3 +502,60 @@ func TestTranslateSystemNormalizesTaskStatus(t *testing.T) {
 		})
 	}
 }
+
+// The frame below is the one Claude Code sent on 2026-09-17 from a session
+// whose turn then ended with all three subagents still searching. Nothing read
+// the list, the session was reported idle, and a bridge redeploy killed it
+// without resuming it.
+func TestTranslateSystemSurfacesTheRunningBackgroundTaskList(t *testing.T) {
+	raw := json.RawMessage(`{"type":"system","subtype":"background_tasks_changed","tasks":[` +
+		`{"task_id":"af9b03cbb5668505d","task_type":"local_agent","description":"Map dash frontend and proxies"},` +
+		`{"task_id":"bq136qbl3","task_type":"local_bash","description":"Wait for the full test run to finish"}],` +
+		`"uuid":"5588506c","session_id":"ebb0996a"}`)
+	events := translateEvent(raw, "s1", &UsageAggregator{}, nil)
+	if len(events) != 1 || events[0].System == nil {
+		t.Fatalf("want one system event, got %+v", events)
+	}
+	system := events[0].System
+	if system.Subtype != msg.SystemSubtypeBackgroundTasksChanged {
+		t.Fatalf("subtype = %q", system.Subtype)
+	}
+	want := []msg.BackgroundTask{
+		{TaskID: "af9b03cbb5668505d", TaskType: msg.TaskTypeLocalAgent, Description: "Map dash frontend and proxies"},
+		{TaskID: "bq136qbl3", TaskType: msg.TaskTypeLocalBash, Description: "Wait for the full test run to finish"},
+	}
+	if len(system.BackgroundTasks) != len(want) {
+		t.Fatalf("BackgroundTasks = %+v, want %+v", system.BackgroundTasks, want)
+	}
+	for i := range want {
+		if system.BackgroundTasks[i] != want[i] {
+			t.Errorf("task %d = %+v, want %+v", i, system.BackgroundTasks[i], want[i])
+		}
+	}
+}
+
+// An empty list is the harness saying nothing is running any more, and it
+// must arrive as that: the subtype with no tasks.
+func TestTranslateSystemForwardsAnEmptyBackgroundTaskList(t *testing.T) {
+	raw := json.RawMessage(`{"type":"system","subtype":"background_tasks_changed","tasks":[]}`)
+	events := translateEvent(raw, "s1", &UsageAggregator{}, nil)
+	if len(events) != 1 || events[0].System == nil {
+		t.Fatalf("want one system event, got %+v", events)
+	}
+	if got := events[0].System; got.Subtype != msg.SystemSubtypeBackgroundTasksChanged || len(got.BackgroundTasks) != 0 {
+		t.Errorf("got %+v, want the subtype with no tasks", got)
+	}
+}
+
+// A list that cannot be read must not be forwarded as an empty one, which
+// would report running work as finished.
+func TestTranslateSystemDoesNotReadAnUnparseableTaskListAsEmpty(t *testing.T) {
+	raw := json.RawMessage(`{"type":"system","subtype":"background_tasks_changed","tasks":"three"}`)
+	events := translateEvent(raw, "s1", &UsageAggregator{}, nil)
+	if len(events) != 1 || events[0].System == nil {
+		t.Fatalf("want one system event, got %+v", events)
+	}
+	if events[0].System.Subtype == msg.SystemSubtypeBackgroundTasksChanged {
+		t.Error("an unparseable list went out under the subtype that means \"this is the whole list\"")
+	}
+}

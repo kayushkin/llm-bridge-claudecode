@@ -507,6 +507,46 @@ func translateSystem(ev ccStreamEvent, sid string, raw json.RawMessage) []msg.Ev
 			}
 		}))
 
+	case msg.SystemSubtypeBackgroundTasksChanged:
+		// Claude Code's own list of every background task running now —
+		// subagents, workflows, backgrounded shell commands — resent in full
+		// each time it changes. bridge-server reads it to tell a session whose
+		// turn ended with work still running from one that is idle; left on Raw,
+		// it was read by nothing and such a session was reported idle.
+		//
+		// An empty list means nothing is running, so a frame that does not parse
+		// must not be forwarded as one: that would report work as finished on
+		// the strength of a frame nobody could read. It goes out under its own
+		// subtype instead, which leaves the server's view where it was.
+		var changed struct {
+			Tasks []struct {
+				TaskID      string `json:"task_id"`
+				TaskType    string `json:"task_type"`
+				Description string `json:"description"`
+			} `json:"tasks"`
+		}
+		if err := json.Unmarshal(raw, &changed); err != nil {
+			log.Printf("[llm-bridge-claudecode] background_tasks_changed frame did not parse, forwarding it unread: %v", err)
+			events = append(events, makeEvent(sid, msg.EventSystem, raw, func(e *msg.Event) {
+				e.System = &msg.SystemEvent{Subtype: "background_tasks_changed_unparsed", Message: err.Error()}
+			}))
+			break
+		}
+		tasks := make([]msg.BackgroundTask, 0, len(changed.Tasks))
+		for _, task := range changed.Tasks {
+			tasks = append(tasks, msg.BackgroundTask{
+				TaskID:      task.TaskID,
+				TaskType:    task.TaskType,
+				Description: task.Description,
+			})
+		}
+		events = append(events, makeEvent(sid, msg.EventSystem, raw, func(e *msg.Event) {
+			e.System = &msg.SystemEvent{
+				Subtype:         msg.SystemSubtypeBackgroundTasksChanged,
+				BackgroundTasks: tasks,
+			}
+		}))
+
 	default:
 		// Forward all other system subtypes (compact_boundary, task_*, status, etc.)
 		events = append(events, makeEvent(sid, msg.EventSystem, raw, func(e *msg.Event) {
