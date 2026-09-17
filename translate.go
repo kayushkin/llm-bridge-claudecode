@@ -482,6 +482,31 @@ func translateSystem(ev ccStreamEvent, sid string, raw json.RawMessage) []msg.Ev
 	case "hook_started", "hook_progress", "hook_response":
 		events = append(events, translateHook(ev, sid, raw)...)
 
+	case "status":
+		// What Claude Code says it is doing on its own initiative. The one
+		// value seen is "compacting", repeated about every 30s while an
+		// AUTOMATIC compaction runs, then a frame with a null status and a
+		// compact_result. Until this case existed the frame was forwarded
+		// with the subtype alone, the status survived only on Raw, and a
+		// session compacting for 90 seconds read as tool_running throughout
+		// (measured 2026-09-16 on br_1789576721656282047).
+		//
+		// A null status is also what a permission-mode change sends, so an
+		// empty Status here means "nothing being reported", not "a compaction
+		// just ended" — CompactResult is what says that.
+		var st struct {
+			Status        string `json:"status"`
+			CompactResult string `json:"compact_result"`
+		}
+		_ = json.Unmarshal(raw, &st)
+		events = append(events, makeEvent(sid, msg.EventSystem, raw, func(e *msg.Event) {
+			e.System = &msg.SystemEvent{
+				Subtype:       ev.Subtype,
+				Status:        st.Status,
+				CompactResult: st.CompactResult,
+			}
+		}))
+
 	default:
 		// Forward all other system subtypes (compact_boundary, task_*, status, etc.)
 		events = append(events, makeEvent(sid, msg.EventSystem, raw, func(e *msg.Event) {
@@ -742,9 +767,26 @@ func translateResult(ev ccStreamEvent, sid string, raw json.RawMessage, agg *Usa
 	return events
 }
 
+// translateRateLimit promotes the provider's verdict off Raw. It used to
+// forward the subtype alone, so nothing downstream could tell an "allowed"
+// frame (9,122 of 9,971 stored on 2026-09-17) from the 25 "rejected" ones that
+// each ended a turn in an error.
 func translateRateLimit(sid string, raw json.RawMessage) []msg.Event {
+	var rl struct {
+		Info struct {
+			Status        string `json:"status"`
+			RateLimitType string `json:"rateLimitType"`
+			ResetsAt      int64  `json:"resetsAt"`
+		} `json:"rate_limit_info"`
+	}
+	_ = json.Unmarshal(raw, &rl)
 	return []msg.Event{makeEvent(sid, msg.EventSystem, raw, func(e *msg.Event) {
-		e.System = &msg.SystemEvent{Subtype: "rate_limit"}
+		e.System = &msg.SystemEvent{
+			Subtype:           "rate_limit",
+			RateLimitStatus:   rl.Info.Status,
+			RateLimitType:     rl.Info.RateLimitType,
+			RateLimitResetsAt: rl.Info.ResetsAt,
+		}
 	})}
 }
 
