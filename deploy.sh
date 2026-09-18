@@ -196,22 +196,42 @@ install -m 0755 "$BIN_NAME" "$USER_BIN"
 echo "==> Restarting $SERVICE..."
 sudo systemctl restart "$SERVICE"
 
-echo "==> Verifying..."
-sleep 2
-if ! systemctl is-active --quiet "$SERVICE"; then
-  echo "ERROR: $SERVICE failed to start"
-  journalctl -u "$SERVICE" -n 15 --no-pager 2>&1
+# Every route but /health is gated since 2026-09-17, so a bare curl on
+# /sessions is refused with 401 and says nothing about whether the server is
+# up. The readiness poll reads the service token the unit carries — the same
+# host-local file llm-bridge-server's deploy.sh reads — and proves both that a
+# gated route answers it and that a bare call is refused. The old bare check
+# failed the first deploy after the gate landed (2026-09-18) with the service
+# running fine, and its exit stopped a wrapper that had the server deploy queued
+# behind it.
+TOKEN_FILE="${LLM_BRIDGE_TOKEN_FILE:-/home/kayushkincom/.config/principal-gating-tokens.env}"
+SERVICE_TOKEN="${LLMBRIDGE_SERVICE_TOKEN:-}"
+if [ -z "$SERVICE_TOKEN" ] && [ -r "$TOKEN_FILE" ]; then
+  SERVICE_TOKEN="$(sed -n 's/^LLMBRIDGE_SERVICE_TOKEN=//p' "$TOKEN_FILE" | head -1)"
+fi
+if [ -z "$SERVICE_TOKEN" ]; then
+  echo "ERROR: no LLMBRIDGE_SERVICE_TOKEN to verify with (looked in the environment and $TOKEN_FILE)"
   exit 1
 fi
-echo "    $SERVICE is running"
 
-# HTTP up — the listener is bound and serving.
-if ! curl -fsS http://localhost:8160/sessions >/dev/null 2>&1; then
-  echo "ERROR: $SERVICE not responding on :8160/sessions"
-  journalctl -u "$SERVICE" -n 30 --no-pager
+echo "==> Verifying..."
+READY=""
+for _ in $(seq 1 30); do
+  if curl -fsS -H "X-LLM-Bridge-Service-Token: $SERVICE_TOKEN" http://localhost:8160/sessions >/dev/null 2>&1; then READY=1; break; fi
+  if ! systemctl is-active --quiet "$SERVICE"; then break; fi
+  sleep 1
+done
+if [ -z "$READY" ]; then
+  echo "ERROR: $SERVICE is not answering the service token on :8160/sessions after 30s"
+  journalctl -u "$SERVICE" -n 30 --no-pager 2>&1
   exit 1
 fi
-echo "    smoke test OK"
+echo "    $SERVICE is running and answering the service token on :8160"
+if [ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8160/sessions)" != "401" ]; then
+  echo "ERROR: /sessions answered an unauthenticated call with something other than 401"
+  exit 1
+fi
+echo "    an unauthenticated /sessions is refused"
 
 echo "==> Done."
 
