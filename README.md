@@ -47,6 +47,8 @@ The binary runs in one of two modes, selected by llm-bridge-server:
   (`-otel-sidecar`, see `sidecar.go`) and the **rollout tailer** (`rollout.go`).
   See [PTY-COVERAGE.md](PTY-COVERAGE.md) for exactly which events each path
   produces versus stream-json mode.
+  Because it passes no flags, PTY mode does not honour a session's
+  `disabled_tools`: every built-in tool stays on.
 
 ### Persistent Bidirectional Process
 
@@ -646,7 +648,7 @@ Per-session flags wired through `StartParams` (each is added only when the corre
 | `--betas <flag...>` | `betas` |
 | `--effort <level>` | `effort` (low / medium / high / xhigh / max) |
 | `--max-budget-usd <n>` | `max_budget_usd` |
-| `--disallowed-tools <t...>` | `disallowed_tools` |
+| `--disallowed-tools=<t>` (one per name) | `disabled_tools` — kept across respawns; the `=` form stops the variadic flag swallowing the next argument |
 | `--tools <t...>` | `tools` (`""` disables all, `"default"` enables all) |
 | `--disable-slash-commands` | `disable_slash_commands` |
 | `--no-session-persistence` | `no_session_persistence` |

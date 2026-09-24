@@ -102,7 +102,7 @@ type StartParams struct {
 	// Additional Claude Code CLI flags
 	Effort                 string          `json:"effort,omitempty"`                   // --effort: reasoning effort (low/medium/high/xhigh/max)
 	MaxBudgetUSD           float64         `json:"max_budget_usd,omitempty"`           // --max-budget-usd: per-session cost cap
-	DisallowedTools        []string        `json:"disallowed_tools,omitempty"`         // --disallowed-tools: tool deny-list
+	DisabledTools          []string        `json:"disabled_tools,omitempty"`           // --disallowed-tools=<name>, one per name: built-in tools Claude Code must not offer
 	Tools                  []string        `json:"tools,omitempty"`                    // --tools: exact built-in tool set ("" disables all, "default" enables all)
 	DisableSlashCommands   bool            `json:"disable_slash_commands,omitempty"`   // --disable-slash-commands
 	NoSessionPersistence   bool            `json:"no_session_persistence,omitempty"`   // --no-session-persistence: ephemeral session
@@ -161,6 +161,7 @@ type Harness struct {
 	workDir         string                 // persisted across respawns (for resumed sessions)
 	autoApprove     *bool                  // persisted across respawns
 	allowedTools    []string               // persisted across respawns
+	disabledTools   []string               // start's disabled_tools, persisted across respawns
 
 	// Start-time prompt flags persisted across respawns so they can be
 	// surfaced in SessionInfo after every init (CC never echoes them back).
@@ -718,6 +719,9 @@ func (h *Harness) handleStart(params StartParams) error {
 	if params.AllowedTools != nil {
 		h.allowedTools = params.AllowedTools
 	}
+	if params.DisabledTools != nil {
+		h.disabledTools = params.DisabledTools
+	}
 	if params.WorkDir != "" {
 		h.workDir = params.WorkDir
 	}
@@ -839,10 +843,11 @@ func (h *Harness) handleStart(params StartParams) error {
 	if params.MaxBudgetUSD > 0 {
 		extraArgs = append(extraArgs, "--max-budget-usd", strconv.FormatFloat(params.MaxBudgetUSD, 'f', -1, 64))
 	}
-	if len(params.DisallowedTools) > 0 {
-		extraArgs = append(extraArgs, "--disallowed-tools")
-		extraArgs = append(extraArgs, params.DisallowedTools...)
-	}
+	// One --disallowed-tools=<name> per name, never the space-separated form:
+	// the flag is variadic, so "--disallowed-tools a b" goes on eating every
+	// following bare argument as another tool name. h.disabledTools, not
+	// params, so a respawn keeps the list the session started with.
+	extraArgs = append(extraArgs, disallowedToolsArgs(h.disabledTools)...)
 	if len(params.Tools) > 0 {
 		extraArgs = append(extraArgs, "--tools")
 		extraArgs = append(extraArgs, params.Tools...)
@@ -1056,6 +1061,17 @@ func (h *Harness) handleStart(params StartParams) error {
 	}
 	// If neither, just return — CC is ready and waiting for a message.
 	return nil
+}
+
+// disallowedToolsArgs renders the session's disabled tools as Claude Code
+// flags, one --disallowed-tools=<name> per name. The joined "=" form binds
+// exactly one value, so the flag cannot swallow a following argument.
+func disallowedToolsArgs(disabledTools []string) []string {
+	args := make([]string, 0, len(disabledTools))
+	for _, name := range disabledTools {
+		args = append(args, "--disallowed-tools="+name)
+	}
+	return args
 }
 
 // handleMessage sends a follow-up message to the running Claude Code process.
