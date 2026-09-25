@@ -1395,6 +1395,7 @@ func (h *Harness) Shutdown() {
 // Nothing here depends on anyone waiting.
 func (h *Harness) readStreamJSON(proc *CCProcess, events <-chan json.RawMessage) {
 	h.beginTurn()
+	finishedTaskWaiters := newFinishedTaskWaiterStopper()
 	for {
 		select {
 		case raw, ok := <-events:
@@ -1413,6 +1414,13 @@ func (h *Harness) readStreamJSON(proc *CCProcess, events <-chan json.RawMessage)
 			// quiet on everything except the frame that exists to say "still
 			// here" was read as wedged and killed.
 			h.markActivity()
+
+			for _, waiterTaskID := range finishedTaskWaiters.observe(raw) {
+				stopFinishedTaskWaiter(proc, waiterTaskID)
+			}
+			if requestID, refusal, refused := stopTaskRefusal(raw); refused {
+				log.Printf("[finished-task-waiter] ERROR: Claude Code refused stop_task %s: %s", requestID, refusal)
+			}
 
 			translated := translateEvent(raw, h.currentSessionID(), &h.agg, h.tracker)
 			for _, ev := range translated {
@@ -1461,6 +1469,17 @@ func (h *Harness) readStreamJSON(proc *CCProcess, events <-chan json.RawMessage)
 			h.signalTurnEnd()
 			return
 		}
+	}
+}
+
+// stopFinishedTaskWaiter asks Claude Code to stop a foreground command that is
+// watching the output file of a task that has already finished, so the task's
+// notice can reach the agent. See finished_task_waiters.go.
+func stopFinishedTaskWaiter(proc *CCProcess, waiterTaskID string) {
+	requestID := fmt.Sprintf("%s%d-%s", stopTaskRequestIDPrefix, time.Now().UnixMilli(), waiterTaskID)
+	log.Printf("[finished-task-waiter] stopping task %s: it watches the output of a task that has finished", waiterTaskID)
+	if err := proc.WriteControl(requestID, "stop_task", map[string]any{"task_id": waiterTaskID}); err != nil {
+		log.Printf("[finished-task-waiter] ERROR: stop_task %s write failed: %v", waiterTaskID, err)
 	}
 }
 
