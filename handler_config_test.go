@@ -87,6 +87,18 @@ func (c *capturedStdin) requests(t *testing.T) []ccControlRequest {
 	return out
 }
 
+// changeRequests drops the get_settings requests that follow a model or effort
+// change (reported_effort.go), leaving the requests that change something.
+func changeRequests(reqs []ccControlRequest) []ccControlRequest {
+	var out []ccControlRequest
+	for _, req := range reqs {
+		if req.Request["subtype"] != "get_settings" {
+			out = append(out, req)
+		}
+	}
+	return out
+}
+
 // liveHarness builds a harness whose Claude Code process is alive and whose
 // stdin is captured, with a process-wide CLAUDE_MODEL default in place.
 func liveHarness(defaultModel string) (*Harness, *capturedStdin) {
@@ -112,7 +124,7 @@ func TestTheServersOwnConfigPayloadSetsTheModel(t *testing.T) {
 		t.Fatalf("session config rejected: %v", err)
 	}
 
-	reqs := stdin.requests(t)
+	reqs := changeRequests(stdin.requests(t))
 	if len(reqs) != 1 {
 		t.Fatalf("expected 1 control request on stdin, got %d", len(reqs))
 	}
@@ -192,8 +204,11 @@ func TestAnEffortChangeReachesTheRunningProcess(t *testing.T) {
 	}
 
 	reqs := stdin.requests(t)
-	if len(reqs) != 1 {
-		t.Fatalf("expected 1 control request on stdin, got %d", len(reqs))
+	if len(reqs) != 2 {
+		t.Fatalf("expected apply_flag_settings then get_settings on stdin, got %d requests", len(reqs))
+	}
+	if got := reqs[1].Request["subtype"]; got != "get_settings" || !strings.HasPrefix(reqs[1].RequestID, reportedEffortRequestIDPrefix) {
+		t.Fatalf("second request = %+v, want a get_settings asking for the effort Claude Code now reports", reqs[1])
 	}
 	if got := reqs[0].Request["subtype"]; got != "apply_flag_settings" {
 		t.Fatalf("control subtype = %v, want apply_flag_settings", got)
@@ -261,7 +276,7 @@ func TestAModelChangeSurvivesItsUnappliableSiblings(t *testing.T) {
 	if strings.Contains(err.Error(), "model") || strings.Contains(err.Error(), "effort") {
 		t.Fatalf("model and effort were applied but reported as a failure: %v", err)
 	}
-	reqs := stdin.requests(t)
+	reqs := changeRequests(stdin.requests(t))
 	if len(reqs) != 2 || reqs[0].Request["model"] != "claude-opus-4-5" || reqs[1].Request["subtype"] != "apply_flag_settings" {
 		t.Fatalf("the model and effort changes did not reach Claude Code: %+v", reqs)
 	}
@@ -282,7 +297,7 @@ func TestSubtypeDispatchStillWorks(t *testing.T) {
 		t.Fatalf("unknown subtype pass-through rejected: %v", err)
 	}
 
-	reqs := stdin.requests(t)
+	reqs := changeRequests(stdin.requests(t))
 	if len(reqs) != 2 {
 		t.Fatalf("expected 2 control requests, got %d", len(reqs))
 	}

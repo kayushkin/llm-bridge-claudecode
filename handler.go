@@ -180,6 +180,12 @@ type Harness struct {
 	// handleResume passes no effort of its own.
 	effort string
 
+	// sessionInfo is the last SessionInfo emitted, kept so the effort Claude
+	// Code reports after init or after a change goes out on a copy of it
+	// (reported_effort.go) — the server replaces the stored info wholesale.
+	// Read and written only by the event loop.
+	sessionInfo *msg.SessionInfo
+
 	// settings and permissionMode are the session's permission gate, and they
 	// are persisted for the same reason as model: both are spawn-time flags,
 	// so a respawn that does not carry them starts an UNGATED process.
@@ -1240,7 +1246,8 @@ func (h *Harness) handleSetModel(params SetModelParams) error {
 		return err
 	}
 	h.model = params.Model
-	return nil
+	// Claude Code resolves effort per model, so a new model can mean a new level.
+	return requestReportedEffort(h.proc)
 }
 
 // handleSetEffort changes a running session's reasoning effort through the
@@ -1254,7 +1261,7 @@ func (h *Harness) handleSetEffort(effort string) error {
 		return err
 	}
 	h.effort = effort
-	return nil
+	return requestReportedEffort(h.proc)
 }
 
 // handleControl sends a generic control_request to Claude Code's stdin. The
@@ -1449,6 +1456,26 @@ func (h *Harness) readStreamJSON(proc *CCProcess, events <-chan json.RawMessage)
 			if requestID, refusal, refused := stopTaskRefusal(raw); refused {
 				log.Printf("[finished-task-waiter] ERROR: Claude Code refused stop_task %s: %s", requestID, refusal)
 			}
+			if effort, matched, err := reportedEffort(raw); matched {
+				switch {
+				case err != nil:
+					log.Printf("[session-info] ERROR: %v", err)
+				case h.sessionInfo == nil:
+					log.Printf("[session-info] ERROR: Claude Code reported effort %q before any init; nothing to attach it to", effort)
+				case effort == h.sessionInfo.Effort:
+					// Unchanged, including a model with no effort setting at all.
+				default:
+					info := *h.sessionInfo
+					info.Effort = effort
+					h.sessionInfo = &info
+					h.emit(msg.Event{
+						Type:      msg.EventSessionInfo,
+						Harness:   harness,
+						Timestamp: time.Now(),
+						Info:      &info,
+					})
+				}
+			}
 
 			translated := translateEvent(raw, h.currentSessionID(), &h.agg, h.tracker)
 			for _, ev := range translated {
@@ -1474,12 +1501,16 @@ func (h *Harness) readStreamJSON(proc *CCProcess, events <-chan json.RawMessage)
 						if info.WorkingDir == "" {
 							info.WorkingDir = h.workDir
 						}
+						h.sessionInfo = info
 						h.emit(msg.Event{
 							Type:      msg.EventSessionInfo,
 							Harness:   harness,
 							Timestamp: time.Now(),
 							Info:      info,
 						})
+						if err := requestReportedEffort(proc); err != nil {
+							log.Printf("[session-info] ERROR: ask Claude Code for its effort: %v", err)
+						}
 					}
 				}
 
