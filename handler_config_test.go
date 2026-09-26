@@ -179,19 +179,57 @@ func TestStartParamsModelBeatsTheEnvDefault(t *testing.T) {
 	}
 }
 
-// TestSpawnTimeFlagsAreReportedNotSwallowed covers effort / max_budget /
-// disabled_tools: Claude Code takes them as CLI flags at spawn, so a running
-// session cannot honour them. They must come back as an error and a system
-// event, never as a silent success.
+// TestAnEffortChangeReachesTheRunningProcess pins the live effort path: the
+// server's config payload becomes an apply_flag_settings control request
+// carrying effortLevel, the caller is told it applied, and the choice is kept
+// for the next spawn — handleResume passes no effort of its own.
+func TestAnEffortChangeReachesTheRunningProcess(t *testing.T) {
+	events := captureEvents(t)
+
+	h, stdin := liveHarness("claude-sonnet-4-5")
+	if err := h.handleConfig(json.RawMessage(`{"effort":"xhigh"}`)); err != nil {
+		t.Fatalf("effort change rejected: %v", err)
+	}
+
+	reqs := stdin.requests(t)
+	if len(reqs) != 1 {
+		t.Fatalf("expected 1 control request on stdin, got %d", len(reqs))
+	}
+	if got := reqs[0].Request["subtype"]; got != "apply_flag_settings" {
+		t.Fatalf("control subtype = %v, want apply_flag_settings", got)
+	}
+	settings, _ := reqs[0].Request["settings"].(map[string]any)
+	if got := settings["effortLevel"]; got != "xhigh" {
+		t.Fatalf("control settings = %+v, want effortLevel xhigh", reqs[0].Request["settings"])
+	}
+	if h.effort != "xhigh" {
+		t.Fatalf("effort not recorded for respawn: %q", h.effort)
+	}
+
+	var acked bool
+	for _, e := range events() {
+		if e.Type == msg.EventSystem && e.System != nil && e.System.Subtype == "config_updated" {
+			acked = strings.Contains(e.System.Message, "effort=xhigh")
+		}
+	}
+	if !acked {
+		t.Fatal("no config_updated event naming effort=xhigh")
+	}
+}
+
+// TestSpawnTimeFlagsAreReportedNotSwallowed covers max_budget / disabled_tools:
+// Claude Code takes them as CLI flags at spawn, so a running session cannot
+// honour them. They must come back as an error and a system event, never as a
+// silent success.
 func TestSpawnTimeFlagsAreReportedNotSwallowed(t *testing.T) {
 	events := captureEvents(t)
 
 	h, stdin := liveHarness("claude-sonnet-4-5")
-	err := h.handleConfig(json.RawMessage(`{"effort":"high","max_budget":5,"disabled_tools":["Bash"]}`))
+	err := h.handleConfig(json.RawMessage(`{"max_budget":5,"disabled_tools":["Bash"]}`))
 	if err == nil {
 		t.Fatal("changing spawn-time flags mid-session reported success")
 	}
-	for _, want := range []string{"effort", "max_budget", "disabled_tools"} {
+	for _, want := range []string{"max_budget", "disabled_tools"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("error %q does not name %s", err, want)
 		}
@@ -212,20 +250,20 @@ func TestSpawnTimeFlagsAreReportedNotSwallowed(t *testing.T) {
 }
 
 // TestAModelChangeSurvivesItsUnappliableSiblings is the mixed payload the chat
-// UI actually sends on a new pane: model plus the saved budget default. The
-// model must still land.
+// UI actually sends on a new pane: model and effort plus the saved budget
+// default. Model and effort must still land.
 func TestAModelChangeSurvivesItsUnappliableSiblings(t *testing.T) {
 	h, stdin := liveHarness("claude-sonnet-4-5")
 	err := h.handleConfig(json.RawMessage(`{"model":"claude-opus-4-5","effort":"high","max_budget":5}`))
 	if err == nil {
 		t.Fatal("expected the unappliable fields to be reported")
 	}
-	if strings.Contains(err.Error(), "model") {
-		t.Fatalf("model was applied but reported as a failure: %v", err)
+	if strings.Contains(err.Error(), "model") || strings.Contains(err.Error(), "effort") {
+		t.Fatalf("model and effort were applied but reported as a failure: %v", err)
 	}
 	reqs := stdin.requests(t)
-	if len(reqs) != 1 || reqs[0].Request["model"] != "claude-opus-4-5" {
-		t.Fatalf("the model change did not reach Claude Code: %+v", reqs)
+	if len(reqs) != 2 || reqs[0].Request["model"] != "claude-opus-4-5" || reqs[1].Request["subtype"] != "apply_flag_settings" {
+		t.Fatalf("the model and effort changes did not reach Claude Code: %+v", reqs)
 	}
 	if h.modelForSpawn() != "claude-opus-4-5" {
 		t.Fatalf("model not recorded for respawn: %q", h.modelForSpawn())

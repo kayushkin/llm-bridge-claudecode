@@ -174,6 +174,12 @@ type Harness struct {
 	// to the process-wide CLAUDE_MODEL default and change model mid-chat.
 	model string
 
+	// effort is the session's reasoning effort — from the start params, or from
+	// a later live change (apply_flag_settings). Persisted across respawns for
+	// the same reason as model: --effort is how a new process learns it, and
+	// handleResume passes no effort of its own.
+	effort string
+
 	// settings and permissionMode are the session's permission gate, and they
 	// are persisted for the same reason as model: both are spawn-time flags,
 	// so a respawn that does not carry them starts an UNGATED process.
@@ -748,6 +754,9 @@ func (h *Harness) handleStart(params StartParams) error {
 	if params.Model != "" {
 		h.model = params.Model
 	}
+	if params.Effort != "" {
+		h.effort = params.Effort
+	}
 	if params.Settings != "" {
 		h.settings = params.Settings
 	}
@@ -859,8 +868,8 @@ func (h *Harness) handleStart(params StartParams) error {
 	if params.DisplayName != "" && !strings.HasPrefix(params.DisplayName, "/") {
 		extraArgs = append(extraArgs, "--name", params.DisplayName)
 	}
-	if params.Effort != "" {
-		extraArgs = append(extraArgs, "--effort", params.Effort)
+	if h.effort != "" {
+		extraArgs = append(extraArgs, "--effort", h.effort)
 	}
 	if params.MaxBudgetUSD > 0 {
 		extraArgs = append(extraArgs, "--max-budget-usd", strconv.FormatFloat(params.MaxBudgetUSD, 'f', -1, 64))
@@ -1234,6 +1243,20 @@ func (h *Harness) handleSetModel(params SetModelParams) error {
 	return nil
 }
 
+// handleSetEffort changes a running session's reasoning effort through the
+// apply_flag_settings control request and records the choice, so the next
+// respawn passes the same --effort.
+func (h *Harness) handleSetEffort(effort string) error {
+	if err := h.handleControl(ControlParams{
+		Subtype: "apply_flag_settings",
+		Payload: map[string]any{"settings": map[string]any{"effortLevel": effort}},
+	}); err != nil {
+		return err
+	}
+	h.effort = effort
+	return nil
+}
+
 // handleControl sends a generic control_request to Claude Code's stdin. The
 // subtype identifies the command; the payload is merged into the request body.
 func (h *Harness) handleControl(params ControlParams) error {
@@ -1297,10 +1320,12 @@ func (h *Harness) handleConfig(raw json.RawMessage) error {
 }
 
 // handleSessionConfig applies the bridge-server's session-config payload to a
-// running session. Only the model can change under a live Claude Code process:
-// --effort, --max-budget-usd and --disallowed-tools are spawn-time CLI flags,
-// so a request to change them mid-session is reported as not applied rather
-// than dropped. Every request answers with a system event naming exactly what
+// running session. Model and effort change under a live Claude Code process
+// (set_model, and apply_flag_settings with effortLevel — measured against
+// Claude Code 2.1.282, whose get_settings then reports the new effort).
+// --max-budget-usd and --disallowed-tools are spawn-time CLI flags, so a
+// request to change them mid-session is reported as not applied rather than
+// dropped. Every request answers with a system event naming exactly what
 // changed, so the caller never has to assume it worked.
 func (h *Harness) handleSessionConfig(raw json.RawMessage) error {
 	var params SessionConfigParams
@@ -1316,7 +1341,10 @@ func (h *Harness) handleSessionConfig(raw json.RawMessage) error {
 		applied = append(applied, "model="+params.Model)
 	}
 	if params.Effort != "" {
-		startTimeOnly = append(startTimeOnly, "effort")
+		if err := h.handleSetEffort(params.Effort); err != nil {
+			return fmt.Errorf("config: set effort to %q: %w", params.Effort, err)
+		}
+		applied = append(applied, "effort="+params.Effort)
 	}
 	if params.MaxBudget != nil {
 		startTimeOnly = append(startTimeOnly, "max_budget")
