@@ -6,45 +6,20 @@ set -euo pipefail
 # It lives in healthcheck/scripts/deploy-gate.sh. Do not inline or copy it.
 ( cd "$(dirname "$0")" && "$HOME/bin/deploy-gate" check )
 
-# Re-exec inside a fresh systemd transient unit so the deploy survives
-# `systemctl restart llm-bridge.service`. When the deploy is triggered by
-# an agent running inside llm-bridge.service (this harness is spawned as a
-# subprocess of that service), the agent's bash is in the service's cgroup;
-# `setsid nohup` does NOT escape systemd's control-group kill, so the
-# restart takes the deploy with it. A transient unit lives in its own
-# cgroup under system.slice and is untouched by the service restart.
-if [ -z "${DEPLOY_DETACHED:-}" ]; then
-  # Log lives under $HOME (not /tmp) because systemd transient units get a
-  # PrivateTmp namespace, so the unit can't write to the host's /tmp.
-  LOG="$HOME/.cache/llm-bridge-claudecode-deploy.log"
-  mkdir -p "$(dirname "$LOG")"
-  : >"$LOG"
-  UNIT="llm-bridge-claudecode-deploy-$$.service"
-  # Resolve $0 to an absolute path — the transient unit doesn't inherit our
-  # working directory, so a relative ./deploy.sh would fail to find itself.
-  SCRIPT="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
-  sudo systemd-run \
-    --collect \
-    --unit="$UNIT" \
-    --description="llm-bridge-claudecode deploy ($USER)" \
-    --uid="$(id -u)" \
-    --gid="$(id -g)" \
-    --setenv=DEPLOY_DETACHED=1 \
-    --setenv=HOME="$HOME" \
-    --setenv=PATH="$PATH" \
-    --property=StandardOutput=append:"$LOG" \
-    --property=StandardError=append:"$LOG" \
-    bash "$SCRIPT" "$@" >/dev/null
-  echo "detached deploy (unit=$UNIT), tail -f $LOG"
-  echo "  status: systemctl status $UNIT"
-  echo "  logs:   journalctl -u $UNIT -f"
-  exit 0
-fi
+# This deploy does not restart llm-bridge.service, so it runs in the caller's
+# own shell and the caller sees how it ended. It used to restart the bridge to
+# make the next spawn pick up the new binary, which it does anyway: the bridge
+# looks the wrapper up on PATH and runs it afresh at every spawn
+# (llm-bridge-server internal/harness/manager.go, Available). The restart
+# killed every live session on the host for nothing, and an agent that deployed
+# this and then llm-bridge-server restarted the bridge twice in one turn
+# (br_1790462284393059025, 2026-09-26). That also meant detaching into a
+# transient unit, whose pasted copy had stopped carrying the session id into
+# the ledger.
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 BIN_NAME="llm-bridge-claudecode"
 USER_BIN="$HOME/bin/$BIN_NAME"
-SERVICE="llm-bridge.service"
 
 cd "$REPO_DIR"
 
@@ -190,48 +165,21 @@ echo "==> Installing binary to $USER_BIN..."
 mkdir -p "$(dirname "$USER_BIN")"
 install -m 0755 "$BIN_NAME" "$USER_BIN"
 
-# Restart llm-bridge.service so running harness subprocesses are dropped and
-# the next spawn picks up the new binary. The transient unit we re-exec'd
-# into above is in a different cgroup, so this restart does not kill us.
-echo "==> Restarting $SERVICE..."
-sudo systemctl restart "$SERVICE"
-
-# Every route but /health is gated since 2026-09-17, so a bare curl on
-# /sessions is refused with 401 and says nothing about whether the server is
-# up. The readiness poll reads the service token the unit carries — the same
-# host-local file llm-bridge-server's deploy.sh reads — and proves both that a
-# gated route answers it and that a bare call is refused. The old bare check
-# failed the first deploy after the gate landed (2026-09-18) with the service
-# running fine, and its exit stopped a wrapper that had the server deploy queued
-# behind it.
-TOKEN_FILE="${LLM_BRIDGE_TOKEN_FILE:-/home/kayushkincom/.config/principal-gating-tokens.env}"
-SERVICE_TOKEN="${LLMBRIDGE_SERVICE_TOKEN:-}"
-if [ -z "$SERVICE_TOKEN" ] && [ -r "$TOKEN_FILE" ]; then
-  SERVICE_TOKEN="$(sed -n 's/^LLMBRIDGE_SERVICE_TOKEN=//p' "$TOKEN_FILE" | head -1)"
-fi
-if [ -z "$SERVICE_TOKEN" ]; then
-  echo "ERROR: no LLMBRIDGE_SERVICE_TOKEN to verify with (looked in the environment and $TOKEN_FILE)"
-  exit 1
-fi
-
-echo "==> Verifying..."
-READY=""
-for _ in $(seq 1 30); do
-  if curl -fsS -H "X-LLM-Bridge-Service-Token: $SERVICE_TOKEN" http://localhost:8160/sessions >/dev/null 2>&1; then READY=1; break; fi
-  if ! systemctl is-active --quiet "$SERVICE"; then break; fi
-  sleep 1
+# install replaces the file rather than writing into it, so a wrapper that is
+# running keeps the binary it started with, and /proc shows that binary as
+# deleted. Those sessions switch to this build when their process next starts:
+# after the idle reaper stops it, or on a resume. Name them, so nobody mistakes
+# a live session's behaviour for this build's.
+echo "==> Wrappers still running the previous binary..."
+still_on_previous_binary=0
+for exe in /proc/[0-9]*/exe; do
+  [ "$(readlink "$exe" 2>/dev/null)" = "$USER_BIN (deleted)" ] || continue
+  pid_dir="$(dirname "$exe")"
+  session="$(tr '\0' '\n' <"$pid_dir/environ" 2>/dev/null | sed -n 's/^LLM_BRIDGE_SESSION_ID=//p')"
+  echo "    pid ${pid_dir#/proc/} session ${session:-unknown (started before the bridge named sessions to their children)}"
+  still_on_previous_binary=$((still_on_previous_binary + 1))
 done
-if [ -z "$READY" ]; then
-  echo "ERROR: $SERVICE is not answering the service token on :8160/sessions after 30s"
-  journalctl -u "$SERVICE" -n 30 --no-pager 2>&1
-  exit 1
-fi
-echo "    $SERVICE is running and answering the service token on :8160"
-if [ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8160/sessions)" != "401" ]; then
-  echo "ERROR: /sessions answered an unauthenticated call with something other than 401"
-  exit 1
-fi
-echo "    an unauthenticated /sessions is refused"
+echo "    $still_on_previous_binary; new spawns get $BUILD_REV"
 
 echo "==> Done."
 
