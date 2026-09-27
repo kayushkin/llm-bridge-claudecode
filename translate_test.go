@@ -559,3 +559,42 @@ func TestTranslateSystemDoesNotReadAnUnparseableTaskListAsEmpty(t *testing.T) {
 		t.Error("an unparseable list went out under the subtype that means \"this is the whole list\"")
 	}
 }
+
+// A Read of an image file comes back as a tool_result whose content is an
+// array holding an image block, with no text (measured on
+// br_1790464488069936397, 2026-09-27). The image has to survive into the
+// canonical event, or no client can show what the agent looked at.
+func TestToolResultCarriesItsImage(t *testing.T) {
+	frame := ccStreamEvent{
+		Type: "user",
+		Message: json.RawMessage(`{"role":"user","content":[{"tool_use_id":"toolu_1","type":"tool_result","content":[` +
+			`{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}},` +
+			`{"type":"text","text":"read 1 image"}]}]}`),
+	}
+	events := translateUserFrame(frame, "br_1", nil)
+	if len(events) != 1 || events[0].ToolResult == nil {
+		t.Fatalf("events = %+v, want one tool_result", events)
+	}
+	result := events[0].ToolResult
+	if result.Output != "read 1 image" {
+		t.Errorf("Output = %q, want the text block alone", result.Output)
+	}
+	if len(result.Content) != 1 || result.Content[0].Image == nil {
+		t.Fatalf("Content = %+v, want one image block", result.Content)
+	}
+	source := result.Content[0].Image.Source
+	if source.Kind != msg.MediaBase64 || source.MediaType != "image/png" || source.Data != "iVBORw0KGgo=" {
+		t.Errorf("image source = %+v", source)
+	}
+	if err := result.Content[0].Validate(); err != nil {
+		t.Errorf("carried image block does not validate: %v", err)
+	}
+}
+
+func TestToolResultWithOnlyTextCarriesNoContent(t *testing.T) {
+	for _, content := range []string{`"plain output"`, `[{"type":"text","text":"x"}]`, ``} {
+		if got := decodeToolResultMedia(json.RawMessage(content)); got != nil {
+			t.Errorf("decodeToolResultMedia(%s) = %+v, want nil", content, got)
+		}
+	}
+}

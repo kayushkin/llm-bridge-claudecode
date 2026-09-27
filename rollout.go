@@ -256,6 +256,7 @@ func translateRolloutEntry(stored ccStoredEvent) []msg.Event {
 					ToolResult: &msg.ToolResultEvent{
 						ToolID:  b.ToolUseID,
 						Output:  decodeToolResultContent(b.Content),
+						Content: decodeToolResultMedia(b.Content),
 						IsError: b.IsError,
 					},
 				})

@@ -168,6 +168,7 @@ func translateUserFrame(ev ccStreamEvent, sid string, raw json.RawMessage) []msg
 			e.ToolResult = &msg.ToolResultEvent{
 				ToolID:  block.ToolUseID,
 				Output:  decodeToolResultContent(block.Content),
+				Content: decodeToolResultMedia(block.Content),
 				IsError: block.IsError,
 			}
 		}))
@@ -242,6 +243,53 @@ func decodeToolResultContent(content json.RawMessage) string {
 		}
 	}
 	return strings.Join(parts, "\n")
+}
+
+// decodeToolResultMedia returns a tool_result's image blocks as canonical
+// blocks: a screenshot, or an image file the agent read. Text is
+// decodeToolResultContent's, and a bare-string result carries no images.
+//
+// A block whose source this cannot express is dropped with a log line rather
+// than passed on half-built — a canonical image with no data draws nothing and
+// fails Validate downstream.
+func decodeToolResultMedia(content json.RawMessage) []msg.ContentBlock {
+	if len(content) == 0 || content[0] != '[' {
+		return nil
+	}
+	var blocks []struct {
+		Type   string `json:"type"`
+		Source struct {
+			Type      string `json:"type"`
+			MediaType string `json:"media_type"`
+			Data      string `json:"data"`
+			URL       string `json:"url"`
+		} `json:"source"`
+	}
+	if json.Unmarshal(content, &blocks) != nil {
+		return nil
+	}
+	var out []msg.ContentBlock
+	for i, b := range blocks {
+		if b.Type != "image" {
+			continue
+		}
+		var source msg.MediaSource
+		switch b.Source.Type {
+		case "base64":
+			source = msg.MediaSource{Kind: msg.MediaBase64, MediaType: b.Source.MediaType, Data: b.Source.Data}
+		case "url":
+			source = msg.MediaSource{Kind: msg.MediaURL, MediaType: b.Source.MediaType, Data: b.Source.URL}
+		default:
+			log.Printf("[translate] tool_result image block %d: source type %q not carried", i, b.Source.Type)
+			continue
+		}
+		if source.Data == "" {
+			log.Printf("[translate] tool_result image block %d: empty %s source, not carried", i, b.Source.Type)
+			continue
+		}
+		out = append(out, msg.ContentBlock{Type: msg.BlockImage, Image: &msg.ImageBlock{Source: source}})
+	}
+	return out
 }
 
 // extractUserText pulls the plain text out of a CC user message's content,
