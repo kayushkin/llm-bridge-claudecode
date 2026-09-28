@@ -34,6 +34,20 @@ type ccStreamEvent struct {
 	NumTurns          int               `json:"num_turns,omitempty"`
 	TotalCostUSD      float64           `json:"total_cost_usd,omitempty"`
 	PermissionDenials []json.RawMessage `json:"permission_denials,omitempty"`
+	// TerminalReason is Claude Code's own word for why the turn ended:
+	// "completed", "api_error", "aborted_streaming", "aborted_tools", ….
+	TerminalReason string `json:"terminal_reason,omitempty"`
+}
+
+// abortedTerminalReasons are the terminal reasons Claude Code gives a turn it
+// stopped because it was told to: the interrupt this harness sends when the
+// user stops a turn or sends a message into one. Claude Code still marks such a
+// result is_error with an "[ede_diagnostic] …" message, but nothing failed.
+// Measured in log-store on 2026-09-28: all 23 aborted results since the server
+// began recording interrupts (2026-08-04) came with a user_interrupt pause.
+var abortedTerminalReasons = map[string]bool{
+	"aborted_streaming": true,
+	"aborted_tools":     true,
 }
 
 // ccAssistantMessage is a CC assistant event's message payload.
@@ -788,7 +802,10 @@ func translateResult(ev ccStreamEvent, sid string, raw json.RawMessage, agg *Usa
 		break
 	}
 
-	if ev.IsError {
+	// An interrupted turn is reported as an ordinary result, not an error: the
+	// server marks a session and its turn failed on any error event, and the
+	// chat draws that turn red.
+	if ev.IsError && !abortedTerminalReasons[ev.TerminalReason] {
 		// Extract error details.
 		var errResult struct {
 			Errors []string `json:"errors"`

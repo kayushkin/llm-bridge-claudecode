@@ -598,3 +598,36 @@ func TestToolResultWithOnlyTextCarriesNoContent(t *testing.T) {
 		}
 	}
 }
+
+// The result Claude Code wrote when the user sent a message into a running turn
+// (br_1790618948251389077, 2026-09-28), trimmed to the fields translation reads.
+// It is is_error, but the turn was interrupted, not failed.
+func TestTranslateResult_AbortedTurnIsAResultNotAnError(t *testing.T) {
+	raw := json.RawMessage(`{"type":"result","subtype":"error_during_execution","is_error":true,"terminal_reason":"aborted_streaming","stop_reason":"tool_use","errors":["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use"],"num_turns":5,"duration_ms":48887,"session_id":"s1"}`)
+	events := translateEvent(raw, "s1", &UsageAggregator{}, nil)
+	for _, e := range events {
+		if e.Type == msg.EventError {
+			t.Fatalf("aborted turn emitted an error event: %+v", e.Error)
+		}
+	}
+	if len(events) == 0 || events[0].Type != msg.EventResult {
+		t.Fatalf("first event = %v, want a result", events)
+	}
+	if events[0].Result.IsError {
+		t.Error("aborted turn's result is marked is_error")
+	}
+	if events[0].Result.NumTurns != 5 {
+		t.Errorf("num_turns = %d, want 5", events[0].Result.NumTurns)
+	}
+}
+
+func TestTranslateResult_FailedTurnIsStillAnError(t *testing.T) {
+	raw := json.RawMessage(`{"type":"result","subtype":"error_max_budget_usd","is_error":true,"terminal_reason":"budget_exhausted","errors":["budget exhausted"],"session_id":"s1"}`)
+	events := translateEvent(raw, "s1", &UsageAggregator{}, nil)
+	if len(events) == 0 || events[0].Type != msg.EventError {
+		t.Fatalf("first event = %v, want an error", events)
+	}
+	if events[0].Error.Message != "budget exhausted" {
+		t.Errorf("message = %q, want %q", events[0].Error.Message, "budget exhausted")
+	}
+}
