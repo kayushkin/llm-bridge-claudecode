@@ -181,6 +181,30 @@ for exe in /proc/[0-9]*/exe; do
 done
 echo "    $still_on_previous_binary; new spawns get $BUILD_REV"
 
+# Runner machines (SSDawn in WSL, a Mac) run this wrapper too: llm-bridge-runner
+# downloads llm-bridge-claudecode-<os>-<arch> from the bridge's
+# /api/runner/binary, which reads LLMBRIDGE_RUNNER_ASSETS_DIR. Until 2026-10-14
+# nothing published those files, so runners kept an April build that passed
+# --permission-mode bypass, which Claude Code now refuses (todo 10e10d90).
+# Each build here carries the same provenance check as the local one.
+RUNNER_ASSETS_DIR="${LLMBRIDGE_RUNNER_ASSETS_DIR:-/usr/local/lib/llm-bridge-runner-binaries}"
+echo "==> Publishing runner builds to $RUNNER_ASSETS_DIR..."
+runner_build_dir="$(mktemp -d)"
+trap 'rm -rf "$runner_build_dir"' EXIT
+for target in "linux amd64" "linux arm64" "darwin amd64" "darwin arm64"; do
+  read -r target_os target_arch <<< "$target"
+  runner_build="$runner_build_dir/$BIN_NAME-$target_os-$target_arch"
+  GOOS="$target_os" GOARCH="$target_arch" go build -o "$runner_build" .
+  target_rev="$(go version -m "$runner_build" | awk -F= '$1 ~ /[[:space:]]vcs\.revision$/ {print $2}')"
+  if [ "$target_rev" != "$BUILD_REV" ]; then
+    echo "ERROR: the $target_os/$target_arch build carries vcs.revision '$target_rev', not $BUILD_REV. Refusing to publish." >&2
+    exit 1
+  fi
+  sudo install -m 0755 "$runner_build" "$RUNNER_ASSETS_DIR/$BIN_NAME-$target_os-$target_arch"
+  echo "    -> $RUNNER_ASSETS_DIR/$BIN_NAME-$target_os-$target_arch ($target_rev)"
+done
+echo "    runners pick it up at their next spawn (llm-bridge-runner refreshes a wrapper it downloaded when the bridge has a newer one)"
+
 echo "==> Done."
 
 # Last act: write this deploy to repo-store's ledger, so the next agent sees what is live.
