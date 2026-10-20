@@ -117,3 +117,16 @@ func TestALaunchThatIsNotAResumeIsSilentAndTouchesNothing(t *testing.T) {
 		t.Errorf("an ordinary pty launch wrote to stderr: %q", diagnostics.String())
 	}
 }
+
+func TestPTYResumePassesTheConversationToClaude(t *testing.T) {
+	got := ptyResumeArguments(resumeUUID)
+	if len(got) != 2 || got[0] != "--resume" || got[1] != resumeUUID {
+		t.Fatalf("ptyResumeArguments(%q) = %q, want [--resume %s]: without it claude opens a blank conversation", resumeUUID, got, resumeUUID)
+	}
+}
+
+func TestPTYResumeSkipsAnIDThatIsNotASessionUUID(t *testing.T) {
+	if got := ptyResumeArguments("not-a-uuid"); len(got) != 0 {
+		t.Fatalf("ptyResumeArguments(not-a-uuid) = %q, want none", got)
+	}
+}

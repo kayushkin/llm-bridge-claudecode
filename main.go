@@ -37,6 +37,7 @@ func execClaudePTY() {
 		os.Exit(127)
 	}
 
+	args := []string{bin}
 	if id := os.Getenv("LLMBRIDGE_PTY_RESUME_ID"); id != "" {
 		st, err := OpenState(DefaultStatePath())
 		if err != nil {
@@ -52,11 +53,25 @@ func execClaudePTY() {
 		changeToResumeDirectory(os.Stderr, id, func(uuid string) (string, bool) {
 			return transcriptWorkingDir(st, uuid)
 		}, os.Chdir)
+		args = append(args, ptyResumeArguments(id)...)
 	}
-	if err := syscall.Exec(bin, []string{bin}, os.Environ()); err != nil {
+	if err := syscall.Exec(bin, args, os.Environ()); err != nil {
 		fmt.Fprintf(os.Stderr, "llm-bridge-claudecode pty: exec %s: %v\n", bin, err)
 		os.Exit(127)
 	}
+}
+
+// ptyResumeArguments is what tells claude which conversation to open. The
+// directory change above only makes that conversation findable; without
+// --resume, claude opens a blank one there, writes it to a new file, and the
+// pty sidecar, which tails the resumed conversation's file, reports nothing.
+// An id that is not a session uuid gets no flag, matching the diagnostic
+// changeToResumeDirectory writes for it.
+func ptyResumeArguments(resumeID string) []string {
+	if !isClaudeSessionUUID(resumeID) {
+		return nil
+	}
+	return []string{"--resume", resumeID}
 }
 
 // changeToResumeDirectory moves the process into the directory a resumed
