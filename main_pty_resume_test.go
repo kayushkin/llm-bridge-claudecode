@@ -118,15 +118,20 @@ func TestALaunchThatIsNotAResumeIsSilentAndTouchesNothing(t *testing.T) {
 	}
 }
 
-func TestPTYResumePassesTheConversationToClaude(t *testing.T) {
-	got := ptyResumeArguments(resumeUUID)
-	if len(got) != 2 || got[0] != "--resume" || got[1] != resumeUUID {
-		t.Fatalf("ptyResumeArguments(%q) = %q, want [--resume %s]: without it claude opens a blank conversation", resumeUUID, got, resumeUUID)
+func TestPTYArgumentsPassModelAndConversationToClaude(t *testing.T) {
+	cases := []struct {
+		model, resume string
+		want          []string
+	}{
+		{"", "", nil},
+		{"", resumeUUID, []string{"--resume", resumeUUID}},
+		{"claude-haiku-4-5-20251001", resumeUUID, []string{"--model", "claude-haiku-4-5-20251001", "--resume", resumeUUID}},
+		{"claude-haiku-4-5-20251001", "not-a-uuid", []string{"--model", "claude-haiku-4-5-20251001"}},
 	}
-}
-
-func TestPTYResumeSkipsAnIDThatIsNotASessionUUID(t *testing.T) {
-	if got := ptyResumeArguments("not-a-uuid"); len(got) != 0 {
-		t.Fatalf("ptyResumeArguments(not-a-uuid) = %q, want none", got)
+	for _, c := range cases {
+		got := ptyArguments(c.model, c.resume)
+		if strings.Join(got, " ") != strings.Join(c.want, " ") {
+			t.Errorf("ptyArguments(%q, %q) = %q, want %q", c.model, c.resume, got, c.want)
+		}
 	}
 }

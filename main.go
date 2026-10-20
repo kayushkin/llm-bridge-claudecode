@@ -37,7 +37,7 @@ func execClaudePTY() {
 		os.Exit(127)
 	}
 
-	args := []string{bin}
+	args := append([]string{bin}, ptyArguments(os.Getenv("LLMBRIDGE_PTY_MODEL"), os.Getenv("LLMBRIDGE_PTY_RESUME_ID"))...)
 	if id := os.Getenv("LLMBRIDGE_PTY_RESUME_ID"); id != "" {
 		st, err := OpenState(DefaultStatePath())
 		if err != nil {
@@ -53,7 +53,6 @@ func execClaudePTY() {
 		changeToResumeDirectory(os.Stderr, id, func(uuid string) (string, bool) {
 			return transcriptWorkingDir(st, uuid)
 		}, os.Chdir)
-		args = append(args, ptyResumeArguments(id)...)
 	}
 	if err := syscall.Exec(bin, args, os.Environ()); err != nil {
 		fmt.Fprintf(os.Stderr, "llm-bridge-claudecode pty: exec %s: %v\n", bin, err)
@@ -61,17 +60,23 @@ func execClaudePTY() {
 	}
 }
 
-// ptyResumeArguments is what tells claude which conversation to open. The
-// directory change above only makes that conversation findable; without
-// --resume, claude opens a blank one there, writes it to a new file, and the
-// pty sidecar, which tails the resumed conversation's file, reports nothing.
-// An id that is not a session uuid gets no flag, matching the diagnostic
+// ptyArguments are claude's arguments in pty mode: --model with the session's
+// model, and --resume with its conversation. The directory change in
+// execClaudePTY only makes that conversation findable; without --resume,
+// claude opens a blank one there, writes it to a new file, and the pty
+// sidecar, which tails the resumed conversation's file, reports nothing.
+// Without --model it ran on its own default instead of the session's. An id
+// that is not a session uuid gets no --resume, matching the diagnostic
 // changeToResumeDirectory writes for it.
-func ptyResumeArguments(resumeID string) []string {
-	if !isClaudeSessionUUID(resumeID) {
-		return nil
+func ptyArguments(model, resumeID string) []string {
+	var args []string
+	if model != "" {
+		args = append(args, "--model", model)
 	}
-	return []string{"--resume", resumeID}
+	if isClaudeSessionUUID(resumeID) {
+		args = append(args, "--resume", resumeID)
+	}
+	return args
 }
 
 // changeToResumeDirectory moves the process into the directory a resumed
