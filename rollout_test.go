@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/kayushkin/llm-bridge/msg"
 )
@@ -45,6 +46,40 @@ func TestTranslateRolloutEntry_UserText(t *testing.T) {
 	}
 	if ev.HarnessSessionID != "sess-aaa" {
 		t.Errorf("HarnessSessionID = %q", ev.HarnessSessionID)
+	}
+}
+
+// A prompt typed into Claude Code's own screen is stored with its content as a
+// bare string, not an array of blocks. This is the shape a pty session writes
+// for every message the person types.
+func TestTranslateRolloutEntry_UserTextStoredAsString(t *testing.T) {
+	stored := storedFrom(t, `{
+		"type": "user",
+		"uuid": "u-2",
+		"sessionId": "sess-aaa",
+		"timestamp": "2026-10-20T00:03:20Z",
+		"message": {"role": "user", "content": "typed in the terminal"}
+	}`)
+	out := translateRolloutEntry(stored)
+	if len(out) != 1 {
+		t.Fatalf("expected 1 event for a string-content prompt, got %d: the dash would never show it", len(out))
+	}
+	if out[0].Type != msg.EventUserMessage || out[0].Result == nil || out[0].Result.Text != "typed in the terminal" {
+		t.Errorf("event = %+v, want user_message with the typed text", out[0])
+	}
+}
+
+func TestTranslateUserEvent_StringContentIsImported(t *testing.T) {
+	stored := storedFrom(t, `{
+		"type": "user",
+		"uuid": "u-3",
+		"sessionId": "sess-aaa",
+		"timestamp": "2026-10-20T00:03:20Z",
+		"message": {"role": "user", "content": "typed in the terminal"}
+	}`)
+	out := translateUserEvent(stored, "sess-aaa", time.Time{})
+	if len(out) != 1 || out[0].Result == nil || out[0].Result.Text != "typed in the terminal" {
+		t.Fatalf("translateUserEvent = %+v, want one user_message with the typed text", out)
 	}
 }
 

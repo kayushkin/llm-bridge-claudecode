@@ -21,10 +21,33 @@ type ccStoredEvent struct {
 // ccStoredMessage is the message payload in stored events.
 type ccStoredMessage struct {
 	Role       string                `json:"role"`
-	Content    []ccStoredContentBlock `json:"content"`
+	Content    ccStoredContent       `json:"content"`
 	Model      string                `json:"model,omitempty"`
 	Usage      ccStoredUsage         `json:"usage,omitempty"`
 	StopReason string                `json:"stop_reason,omitempty"`
+}
+
+// ccStoredContent is a stored message's content. Claude Code writes it in two
+// forms: an array of blocks, and a bare string for a prompt typed into its own
+// screen. Decoding only the array made every typed prompt fail to unmarshal,
+// and the readers drop a message that fails, so the pty sidecar never showed
+// a prompt typed in the terminal and imported histories lost them too (433 of
+// 1,472 user entries in 400 transcripts on 2026-10-20). A string becomes one
+// text block.
+type ccStoredContent []ccStoredContentBlock
+
+func (c *ccStoredContent) UnmarshalJSON(b []byte) error {
+	var text string
+	if err := json.Unmarshal(b, &text); err == nil {
+		*c = ccStoredContent{{Type: "text", Text: text}}
+		return nil
+	}
+	var blocks []ccStoredContentBlock
+	if err := json.Unmarshal(b, &blocks); err != nil {
+		return err
+	}
+	*c = blocks
+	return nil
 }
 
 // ccStoredContentBlock is a content block in a stored message.
