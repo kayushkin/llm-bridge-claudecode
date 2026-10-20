@@ -120,30 +120,8 @@ func coldImportRollouts(st *State, projectsDir string) error {
 		if _, ok := known[id]; ok {
 			return nil
 		}
-
 		info, _ := d.Info()
-		_, ts, _ := parseSessionHead(path)
-		created := ts
-		if created.IsZero() && info != nil {
-			created = info.ModTime()
-		}
-
-		// Synthetic chain: bridge_session_id = harness_session_id, single
-		// rollout at sequence 0 with kind 'start' and no parent. When the
-		// user later resumes via the bridge, recordChainOnInit will append
-		// a kind='resume' rollout (under the defensive UUID-rotation guard)
-		// or simply touch updated_at if CC keeps the same UUID.
-		if err := st.UpsertSession(id, id); err != nil {
-			return err
-		}
-		if err := st.InsertRollout(RolloutRow{
-			HarnessSessionID: id,
-			BridgeSessionID:  id,
-			RolloutPath:      path,
-			Sequence:         0,
-			Kind:             "start",
-			CreatedAt:        created,
-		}); err != nil {
+		if err := coldImportRollout(st, id, path, info); err != nil {
 			return err
 		}
 		known[id] = struct{}{}
@@ -153,6 +131,111 @@ func coldImportRollouts(st *State, projectsDir string) error {
 		return walkErr
 	}
 	return nil
+}
+
+// coldImportRollout records one transcript this harness has no row for.
+//
+// Synthetic chain: bridge_session_id = harness_session_id, single rollout at
+// sequence 0 with kind 'start' and no parent. When the user later resumes via
+// the bridge, recordChainOnInit will append a kind='resume' rollout (under the
+// defensive UUID-rotation guard) or simply touch updated_at if CC keeps the
+// same UUID.
+func coldImportRollout(st *State, id, path string, info fs.FileInfo) error {
+	_, ts, _ := parseSessionHead(path)
+	created := ts
+	if created.IsZero() && info != nil {
+		created = info.ModTime()
+	}
+	if err := st.UpsertSession(id, id); err != nil {
+		return err
+	}
+	return st.InsertRollout(RolloutRow{
+		HarnessSessionID: id,
+		BridgeSessionID:  id,
+		RolloutPath:      path,
+		Sequence:         0,
+		Kind:             "start",
+		CreatedAt:        created,
+	})
+}
+
+// discoverSessionsChangedSince is -changed-since: the sessions whose
+// transcript file was written after since, in -discover's shape. It exists so
+// llm-bridge-server can notice a conversation run in a terminal while it is up.
+// -discover parses every transcript (175s and 668MB for 69,195 of them on
+// 2026-10-20), so it runs once at server start; this stats every file but
+// parses only the changed ones (0.2s for the same tree).
+func discoverSessionsChangedSince(since time.Time) ([]msg.StoredSession, error) {
+	projectsDir := projectsRoot()
+	changed := map[string]string{} // harness session id → transcript path
+	walkErr := filepath.WalkDir(projectsDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) || errors.Is(err, fs.ErrPermission) {
+				return nil
+			}
+			return err
+		}
+		if d.IsDir() || !strings.HasSuffix(d.Name(), ".jsonl") {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil || !info.ModTime().After(since) {
+			return nil
+		}
+		changed[strings.TrimSuffix(d.Name(), ".jsonl")] = path
+		return nil
+	})
+	if walkErr != nil && !errors.Is(walkErr, fs.ErrNotExist) {
+		return nil, walkErr
+	}
+	if len(changed) == 0 {
+		return []msg.StoredSession{}, nil
+	}
+
+	oneshotDirectory, err := oneshotWorkingDirectory()
+	if err != nil {
+		return nil, fmt.Errorf("oneshot working directory: %w", err)
+	}
+	st, err := OpenState(DefaultStatePath())
+	if err != nil {
+		return nil, err
+	}
+	defer st.Close()
+
+	out := make([]msg.StoredSession, 0, len(changed))
+	for id, path := range changed {
+		// One indexed lookup per changed file: listing every session's
+		// rollouts, as -discover does, took 4s of the first version's 6s.
+		bridgeSessionID, known, err := st.BridgeSessionIDForHarness(id)
+		if err != nil {
+			return nil, err
+		}
+		if !known {
+			info, _ := os.Stat(path)
+			if err := coldImportRollout(st, id, path, info); err != nil {
+				return nil, err
+			}
+			bridgeSessionID = id
+		}
+		sess, err := st.GetSession(bridgeSessionID)
+		if err != nil {
+			return nil, err
+		}
+		if sess == nil {
+			return nil, fmt.Errorf("rollout %s names bridge session %s, which state.db has no row for", id, bridgeSessionID)
+		}
+		rollouts, err := st.ListRollouts(bridgeSessionID)
+		if err != nil {
+			return nil, err
+		}
+		stored := buildStoredSession(*sess, rollouts, oneshotDirectory)
+		// The file that changed names the conversation, and the server
+		// matches on it. The state row's current id can be empty, as it is
+		// for a session the bridge started that has not reported one.
+		stored.HarnessSessionID = id
+		out = append(out, stored)
+	}
+	return out, nil
 }
 
 // loadKnownHarnessIDs returns the set of harness_session_ids already present

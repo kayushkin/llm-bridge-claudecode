@@ -13,7 +13,9 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
+	"github.com/kayushkin/llm-bridge/msg"
 	"github.com/kayushkin/llm-bridge/ndjson"
 )
 
@@ -143,6 +145,30 @@ var emitEvent = func(ev any) {
 	os.Stdout.Write(data)
 }
 
+// runChangedSince parses -changed-since's one argument, runs discover and
+// prints the sessions as one JSON array, as -discover does.
+func runChangedSince(args []string, discover func(time.Time) ([]msg.StoredSession, error)) int {
+	if len(args) != 1 {
+		fmt.Fprintln(os.Stderr, "-changed-since: one RFC 3339 time is required")
+		return 2
+	}
+	since, err := time.Parse(time.RFC3339Nano, args[0])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "-changed-since: %v\n", err)
+		return 2
+	}
+	sessions, err := discover(since)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "-changed-since: %v\n", err)
+		return 1
+	}
+	if err := json.NewEncoder(os.Stdout).Encode(sessions); err != nil {
+		fmt.Fprintf(os.Stderr, "-changed-since: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "-version" {
 		fmt.Println(version)
@@ -188,6 +214,12 @@ func main() {
 		}
 		json.NewEncoder(os.Stdout).Encode(sessions)
 		os.Exit(0)
+	}
+
+	// -changed-since <RFC3339 time>: the sessions whose transcript changed
+	// after that time, in -discover's shape. See discover.go.
+	if len(os.Args) > 1 && os.Args[1] == "-changed-since" {
+		os.Exit(runChangedSince(os.Args[2:], discoverSessionsChangedSince))
 	}
 
 	if len(os.Args) > 2 && os.Args[1] == "-import-history" {
