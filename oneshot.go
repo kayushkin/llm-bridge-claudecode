@@ -31,6 +31,7 @@ package main
 // keep their max_tokens guards.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -112,6 +113,19 @@ func runOneShot() int {
 	// hunt for a replacement for the Read it had been denied. It burned every
 	// turn it was given on the user's skills instead of answering.
 	args := []string{"-p", "--output-format", "json", "--max-turns", "2"}
+	stdin := []byte(req.Prompt)
+	if len(req.Images) > 0 {
+		// Plain-text stdin cannot carry a picture, so a request with images
+		// is one stream-json user message, and the answer comes back as a
+		// stream whose result event is what --output-format json prints.
+		input, err := oneShotImageInput(req)
+		if err != nil {
+			writeOneShotError(err.Error())
+			return 1
+		}
+		args = []string{"-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--max-turns", "2"}
+		stdin = input
+	}
 
 	// An allowlist of nothing, not a denylist. The denylist that used to sit
 	// here named eleven tools and missed Skill and ToolSearch, so a classifier
@@ -178,7 +192,7 @@ func runOneShot() int {
 
 	start := time.Now()
 	cmd := exec.CommandContext(ctx, bin, args...)
-	cmd.Stdin = strings.NewReader(req.Prompt)
+	cmd.Stdin = bytes.NewReader(stdin)
 	cmd.Env = env
 	cmd.Dir = workDir
 	out, err := cmd.Output()
@@ -193,6 +207,13 @@ func runOneShot() int {
 		}
 		writeOneShotError(fmt.Sprintf("claude -p: %v%s (stdout: %s)", err, detail, truncateForError(string(out))))
 		return 1
+	}
+
+	if len(req.Images) > 0 {
+		if out, err = oneShotStreamResult(out); err != nil {
+			writeOneShotError(fmt.Sprintf("claude -p stream: %v", err))
+			return 1
+		}
 	}
 
 	var envelope struct {
