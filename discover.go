@@ -293,23 +293,24 @@ func buildStoredSession(sess SessionRow, rollouts []RolloutRow, oneshotDirectory
 
 	if path != "" {
 		out.Path = path
-		if source, project, parent, ok := classifySubagentPath(path); ok {
+		// The project is the working directory the transcript records. The
+		// name of the directory the transcript sits in cannot give it back:
+		// Claude Code writes '/', '-', '.', '_' and spaces all as '-', so
+		// /work/llm-bridge-server came back as /work/llm/bridge/server, the
+		// bridge stored that as the session's working directory, and the
+		// session could not be started again.
+		out.Project = readTranscriptWorkingDirectory(path)
+		if source, parent, ok := classifySubagentPath(path); ok {
 			// Structurally-spawned subagent. Tag it so bridge-server buckets it
 			// via SOURCE_FOLDERS instead of surfacing it as a top-level chat,
 			// and report the parent CC recorded in the path so bridge-server
 			// can resolve it to a session and write the lineage link.
 			out.Source = source
-			out.Project = project
 			out.ParentHarnessSessionID = parent
 		} else if isOneshotTranscriptPath(path, oneshotDirectory) {
-			// A stateless model call made through oneshot mode. The project
-			// is the working directory itself: decoding the directory name
-			// cannot recover it, because the encoding folds '.' into '-'.
+			// A stateless model call made through oneshot mode.
 			out.Source = msg.PurposeOneshot
 			out.Project = oneshotDirectory
-		} else {
-			// Project is encoded into the parent directory name.
-			out.Project = ccProjectToPath(filepath.Base(filepath.Dir(path)))
 		}
 		if info, err := os.Stat(path); err == nil {
 			out.UpdatedAt = info.ModTime()
@@ -327,8 +328,8 @@ func buildStoredSession(sess SessionRow, rollouts []RolloutRow, oneshotDirectory
 }
 
 // classifySubagentPath inspects a rollout file path for Claude Code's
-// subagent layout and, if matched, returns the structural source tag, the
-// project root, and the parent session's harness id. Two layouts exist:
+// subagent layout and, if matched, returns the structural source tag and the
+// parent session's harness id. Two layouts exist:
 //
 //	<projects>/<proj>/<parent-uuid>/subagents/agent-*.jsonl                   → "subagent"
 //	<projects>/<proj>/<parent-uuid>/subagents/workflows/<wf-id>/agent-*.jsonl → "workflow-subagent"
@@ -337,18 +338,17 @@ func buildStoredSession(sess SessionRow, rollouts []RolloutRow, oneshotDirectory
 // immediate parent, so the deeper Workflow-tool layout is classified too —
 // the original check only matched the one-level Task() layout, which left
 // workflow subagents untagged (empty type/purpose, origin falling back to the
-// harness name). The project is the directory two levels above `subagents`
-// (`<projects>/<proj>/<parent-uuid>/subagents` → `<proj>`), so it is correct
-// regardless of how deeply the agent file nests below `subagents`. Returns
-// ok=false when the path carries no `subagents` segment or is too shallow to
+// harness name). It does not report the project: the encoded `<proj>` name
+// cannot be decoded back into a path, so buildStoredSession reads the working
+// directory from the transcript instead. Returns ok=false when the path carries no `subagents` segment or is too shallow to
 // hold the `<proj>/<parent-uuid>/subagents` prefix.
 //
 // parent is the segment directly above `subagents`, which is the parent
 // session's own UUID — the same id its top-level rollout file is named for.
-// This function used to read parts[subIdx-2] for the project and simply skip
+// This function once read parts[subIdx-2] for the project and skipped
 // parts[subIdx-1], discarding the one piece of lineage Claude Code records on
 // disk; every discovered subagent then landed with no link to what spawned it.
-func classifySubagentPath(path string) (source, project, parent string, ok bool) {
+func classifySubagentPath(path string) (source, parent string, ok bool) {
 	parts := strings.Split(path, string(filepath.Separator))
 	subIdx := -1
 	for i, p := range parts {
@@ -358,13 +358,13 @@ func classifySubagentPath(path string) (source, project, parent string, ok bool)
 		}
 	}
 	if subIdx < 2 {
-		return "", "", "", false
+		return "", "", false
 	}
 	source = "subagent"
 	if subIdx+1 < len(parts) && parts[subIdx+1] == "workflows" {
 		source = "workflow-subagent"
 	}
-	return source, ccProjectToPath(parts[subIdx-2]), parts[subIdx-1], true
+	return source, parts[subIdx-1], true
 }
 
 // isOneshotTranscriptPath reports whether a rollout path is a top-level
@@ -460,6 +460,38 @@ func parseSessionHead(path string) (prompt string, ts time.Time, turns int) {
 	return prompt, ts, turns
 }
 
+// readTranscriptWorkingDirectory returns the first working directory a Claude
+// Code transcript records. Every user, assistant and attachment line carries a
+// "cwd" field; the queue-operation lines that can open a file do not, so it
+// reads until it finds one. It returns "" when the file cannot be read or holds
+// no cwd, and the caller then leaves the project empty rather than guess.
+func readTranscriptWorkingDirectory(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	// Same ceiling as parseSessionHead, for the same reason.
+	scanner.Buffer(make([]byte, 0, 256*1024), 1024*1024)
+	for scanner.Scan() {
+		var entry struct {
+			Cwd string `json:"cwd"`
+		}
+		if json.Unmarshal(scanner.Bytes(), &entry) != nil {
+			continue
+		}
+		if entry.Cwd != "" {
+			return entry.Cwd
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		log.Printf("readTranscriptWorkingDirectory: %s: scan stopped early: %v; reporting no working directory", path, err)
+	}
+	return ""
+}
+
 // findRolloutForUUID does a best-effort scan of <projectsRoot()>/*/<uuid>.jsonl
 // for a file matching the given Claude Code session UUID. Returns "" if not
 // found — caller treats that as "rollout file not yet on disk" and proceeds
@@ -510,16 +542,6 @@ func pathToCCProject(path string) string {
 		}
 	}
 	return b.String()
-}
-
-// ccProjectToPath converts a CC project directory name back to a filesystem path.
-// -home-user-repos → /home/user/repos
-func ccProjectToPath(name string) string {
-	if name == "" || name == "-" {
-		return "/"
-	}
-	// CC format: leading dash is the root /, subsequent dashes are path separators
-	return "/" + strings.ReplaceAll(strings.TrimPrefix(name, "-"), "-", "/")
 }
 
 // truncateAtRuneBoundary returns the longest prefix of s that is no longer than

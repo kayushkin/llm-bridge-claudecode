@@ -12,10 +12,23 @@ import (
 // line is enough for parseSessionHead to recover prompt + ts + a turn count.
 func writeJSONL(t *testing.T, path, prompt string) {
 	t.Helper()
+	writeJSONLWithWorkingDirectory(t, path, prompt, "")
+}
+
+// writeJSONLWithWorkingDirectory writes a transcript whose first line is the
+// queue-operation line Claude Code opens a file with, which has no cwd, and
+// whose user line records workingDirectory as its cwd when it is not empty.
+func writeJSONLWithWorkingDirectory(t *testing.T, path, prompt, workingDirectory string) {
+	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	body := `{"type":"user","timestamp":"2026-04-30T12:00:00Z","message":{"content":"` + prompt + `"}}` + "\n"
+	cwdField := ""
+	if workingDirectory != "" {
+		cwdField = `"cwd":"` + workingDirectory + `",`
+	}
+	body := `{"type":"queue-operation","operation":"enqueue"}` + "\n" +
+		`{"type":"user",` + cwdField + `"timestamp":"2026-04-30T12:00:00Z","message":{"content":"` + prompt + `"}}` + "\n"
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatalf("write %s: %v", path, err)
 	}
@@ -290,9 +303,9 @@ func TestDiscover_SubagentSourceTag(t *testing.T) {
 	// Top-level interactive session — should NOT be tagged.
 	writeJSONL(t, filepath.Join(projectsDir, "-tmp-proj", "uuid-top.jsonl"), "regular chat")
 	// Task subagent — sibling subagents/ dir under the parent UUID dir.
-	writeJSONL(t, filepath.Join(projectsDir, "-tmp-proj", "uuid-top", "subagents", "agent-abc.jsonl"), "Find the inber project")
+	writeJSONLWithWorkingDirectory(t, filepath.Join(projectsDir, "-tmp-proj", "uuid-top", "subagents", "agent-abc.jsonl"), "Find the inber project", "/tmp/proj")
 	// Workflow subagent — nested one level deeper under subagents/workflows/<wf>/.
-	writeJSONL(t, filepath.Join(projectsDir, "-tmp-proj", "uuid-top", "subagents", "workflows", "wf_xyz", "agent-wf1.jsonl"), "Review the diff")
+	writeJSONLWithWorkingDirectory(t, filepath.Join(projectsDir, "-tmp-proj", "uuid-top", "subagents", "workflows", "wf_xyz", "agent-wf1.jsonl"), "Review the diff", "/tmp/proj")
 
 	got, err := discoverSessions("")
 	if err != nil {
@@ -313,7 +326,7 @@ func TestDiscover_SubagentSourceTag(t *testing.T) {
 	if bySource["agent-wf1"] != "workflow-subagent" {
 		t.Fatalf("workflow subagent must be Source=workflow-subagent, got %q (full map: %v)", bySource["agent-wf1"], bySource)
 	}
-	// Project must resolve to the encoded grandparent regardless of nesting depth.
+	// Project is the cwd the transcript records, whatever the nesting depth.
 	if byProject["agent-abc"] != "/tmp/proj" {
 		t.Fatalf("Task subagent project = %q, want /tmp/proj", byProject["agent-abc"])
 	}
@@ -362,7 +375,7 @@ func TestClassifySubagentPathReportsParent(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			source, project, parent, ok := classifySubagentPath(tc.path)
+			source, parent, ok := classifySubagentPath(tc.path)
 			if ok != tc.wantOK {
 				t.Fatalf("ok = %v, want %v", ok, tc.wantOK)
 			}
@@ -377,9 +390,6 @@ func TestClassifySubagentPathReportsParent(t *testing.T) {
 			}
 			if parent != tc.wantParent {
 				t.Errorf("parent = %q, want %q", parent, tc.wantParent)
-			}
-			if project == "" {
-				t.Error("project is empty; the parent must not have been read in its place")
 			}
 		})
 	}
@@ -424,5 +434,38 @@ func TestDiscover_HonoursClaudeConfigDirOverride(t *testing.T) {
 	}
 	if p := findRolloutForUUID("uuid-under-home"); p != "" {
 		t.Errorf("findRolloutForUUID found %q under the home directory while CLAUDE_CONFIG_DIR points elsewhere", p)
+	}
+}
+
+// TestDiscover_ProjectIsTheWorkingDirectoryTheTranscriptRecords pins the
+// project to the transcript's cwd. Claude Code files a session started in
+// /work/llm-bridge-server under -work-llm-bridge-server; decoding that name
+// gave /work/llm/bridge/server, the bridge stored it as the session's working
+// directory, and the session could not be started again. A transcript with no
+// cwd reports no project rather than a guess.
+func TestDiscover_ProjectIsTheWorkingDirectoryTheTranscriptRecords(t *testing.T) {
+	projectsDir, _ := withCCHome(t)
+
+	writeJSONLWithWorkingDirectory(t, filepath.Join(projectsDir, "-work-llm-bridge-server", "uuid-dashed.jsonl"), "dashed", "/work/llm-bridge-server")
+	writeJSONLWithWorkingDirectory(t, filepath.Join(projectsDir, "-work-llm-bridge-server", "uuid-dashed", "subagents", "agent-dashed.jsonl"), "sub", "/work/llm-bridge-server/dash")
+	writeJSONL(t, filepath.Join(projectsDir, "-work-no-cwd", "uuid-no-cwd.jsonl"), "no cwd")
+
+	got, err := discoverSessions("")
+	if err != nil {
+		t.Fatalf("discoverSessions: %v", err)
+	}
+	byProject := map[string]string{}
+	for _, s := range got {
+		byProject[s.HarnessSessionID] = s.Project
+	}
+	want := map[string]string{
+		"uuid-dashed":  "/work/llm-bridge-server",
+		"agent-dashed": "/work/llm-bridge-server/dash",
+		"uuid-no-cwd":  "",
+	}
+	for id, wantProject := range want {
+		if byProject[id] != wantProject {
+			t.Errorf("%s: Project = %q, want %q", id, byProject[id], wantProject)
+		}
 	}
 }

@@ -22,8 +22,7 @@ import (
 
 // TestClassifySubagentPathShallowestPathTheGuardAccepts pins the lower bound of
 // `subIdx < 2` from above: two segments before `subagents` is the shallowest
-// path the guard lets through, and at that depth the project degenerates to "/"
-// because the segment it reads is the empty string before the leading slash.
+// path the guard lets through.
 //
 // This asserts what the function does at the boundary, not what it ought to do.
 // Whether a path this shallow should be classified at all is a separate
@@ -31,7 +30,7 @@ import (
 // and nothing noticed.
 func TestClassifySubagentPathShallowestPathTheGuardAccepts(t *testing.T) {
 	// parts: ["", "proj", "subagents", "agent-x.jsonl"] -> subIdx == 2.
-	source, project, parent, ok := classifySubagentPath("/proj/subagents/agent-x.jsonl")
+	source, parent, ok := classifySubagentPath("/proj/subagents/agent-x.jsonl")
 	if !ok {
 		t.Fatalf("ok = false at subIdx == 2; two segments above `subagents` is the shallowest depth the guard accepts, and raising it silently drops a whole layout")
 	}
@@ -41,27 +40,19 @@ func TestClassifySubagentPathShallowestPathTheGuardAccepts(t *testing.T) {
 	if parent != "proj" {
 		t.Errorf("parent = %q, want %q — the segment directly above `subagents`", parent, "proj")
 	}
-	if project != "/" {
-		t.Errorf("project = %q, want %q — at this depth the project segment is the empty string before the leading slash", project, "/")
-	}
 }
 
 // TestClassifySubagentPathRejectsAPathWithNoRoomForTheProject pins the same
-// guard from below. One segment above `subagents` leaves nothing for the
-// project to be read from, and `parts[subIdx-2]` would index -1.
-//
-// A Go slice index of -1 panics, so relaxing the guard to `< 1` does not return
-// a wrong answer — it takes the process down. `/subagents/agent-x.jsonl` is a
-// perfectly well-formed absolute path, which is what makes this worth a test
-// rather than a comment.
+// guard from below. One segment above `subagents` leaves no room for the
+// `<proj>/<parent-uuid>/subagents` layout, so the path is not a subagent's.
 func TestClassifySubagentPathRejectsAPathWithNoRoomForTheProject(t *testing.T) {
 	// parts: ["", "subagents", "agent-x.jsonl"] -> subIdx == 1.
-	source, project, parent, ok := classifySubagentPath("/subagents/agent-x.jsonl")
+	source, parent, ok := classifySubagentPath("/subagents/agent-x.jsonl")
 	if ok {
-		t.Fatalf("ok = true at subIdx == 1; there is no segment for the project here and reading one indexes past the start of the slice")
+		t.Fatalf("ok = true at subIdx == 1; there is no room for the project and parent segments here")
 	}
-	if source != "" || project != "" || parent != "" {
-		t.Errorf("a rejected path must report nothing, got source=%q project=%q parent=%q", source, project, parent)
+	if source != "" || parent != "" {
+		t.Errorf("a rejected path must report nothing, got source=%q parent=%q", source, parent)
 	}
 }
 
@@ -75,15 +66,12 @@ func TestClassifySubagentPathRejectsAPathWithNoRoomForTheProject(t *testing.T) {
 // shipped with nothing exercising it.
 func TestClassifySubagentPathBoundsTheWorkflowsLookahead(t *testing.T) {
 	// parts: ["", "proj", "uuid", "subagents"] -> subIdx == 3 == len(parts)-1.
-	source, project, parent, ok := classifySubagentPath("/proj/uuid/subagents")
+	source, parent, ok := classifySubagentPath("/proj/uuid/subagents")
 	if !ok {
 		t.Fatalf("ok = false; the path carries a `subagents` segment deep enough to classify")
 	}
 	if source != "subagent" {
 		t.Errorf("source = %q, want %q — there is no segment after `subagents`, so the workflow layout cannot match", source, "subagent")
-	}
-	if project != "/proj" {
-		t.Errorf("project = %q, want %q", project, "/proj")
 	}
 	if parent != "uuid" {
 		t.Errorf("parent = %q, want %q", parent, "uuid")
