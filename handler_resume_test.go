@@ -1,6 +1,12 @@
 package main
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
 
 // TestIsClaudeSessionUUID guards the resume/fork gate: only a canonical
 // 8-4-4-4-12 hex UUID may reach `claude --resume`. Sub-agent rollout ids
@@ -35,6 +41,54 @@ func TestIsClaudeSessionUUID(t *testing.T) {
 	for _, s := range invalid {
 		if isClaudeSessionUUID(s) {
 			t.Errorf("isClaudeSessionUUID(%q) = true, want false", s)
+		}
+	}
+}
+
+// A session stopped before its first turn has a Claude Code UUID but no saved
+// conversation, and `claude --resume` on it fails with "No conversation found
+// with session ID", losing the message. The harness must start that
+// conversation under the same UUID instead, and still resume one that exists.
+func TestResumeWithNoSavedConversationStartsItUnderTheSameUUID(t *testing.T) {
+	_, restore := swapEmit()
+	defer restore()
+
+	for _, saved := range []bool{false, true} {
+		path := fakeClaude(t)
+		argvLog := filepath.Join(t.TempDir(), "argv")
+		t.Setenv("FAKECC_MODE", "prompt")
+		t.Setenv("FAKECC_UUID", canaryUUID)
+		t.Setenv("FAKECC_ARGV_LOG", argvLog)
+		if saved {
+			writeTranscript(t, os.Getenv("CLAUDE_CONFIG_DIR"), t.TempDir(), canaryUUID)
+		}
+
+		h := NewHarness(&Config{ClaudePath: path, TurnIdleTimeout: 5 * time.Second})
+		if err := h.handleStart(StartParams{
+			BridgeSessionID:  "canary-bridge",
+			SessionID:        "canary-bridge",
+			HarnessSessionID: canaryUUID,
+			Resume:           true,
+			Prompt:           "hello",
+		}); err != nil {
+			t.Fatalf("saved=%v: handleStart: %v", saved, err)
+		}
+		if h.proc != nil {
+			_ = h.proc.Kill()
+		}
+		h.cancel()
+
+		argv, err := os.ReadFile(argvLog)
+		if err != nil {
+			t.Fatalf("read argv log: %v", err)
+		}
+		spawn := strings.TrimSpace(string(argv))
+		want, notWant := "--session-id "+canaryUUID, "--resume"
+		if saved {
+			want, notWant = "--resume "+canaryUUID, "--session-id"
+		}
+		if !strings.Contains(spawn, want) || strings.Contains(spawn, notWant) {
+			t.Fatalf("saved=%v: spawn = %q; want %q and no %q", saved, spawn, want, notWant)
 		}
 	}
 }

@@ -789,6 +789,15 @@ func (h *Harness) handleStart(params StartParams) error {
 	var continueUUID string
 
 	switch {
+	case params.Resume && isClaudeSessionUUID(resumeID) && !conversationSaved(h.state, resumeID) && params.SessionIDOverride == "":
+		// A session stopped before its first turn: Claude Code reported its
+		// UUID at start but saves a conversation only once a message comes, so
+		// `--resume` fails with "No conversation found with session ID" and the
+		// message is lost. Start the conversation under the same UUID instead,
+		// so the id the bridge holds stays the one Claude Code uses.
+		log.Printf("[harness] %s: no saved conversation for %s, so starting it with --session-id instead of --resume",
+			h.bridgeSessionID, resumeID)
+		extraArgs = append(extraArgs, "--session-id", resumeID)
 	case params.Resume && isClaudeSessionUUID(resumeID):
 		extraArgs = append(extraArgs, "--resume", resumeID)
 		continueUUID = resumeID

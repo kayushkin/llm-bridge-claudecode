@@ -85,6 +85,12 @@ func transcriptPath(st *State, uuid string) string {
 	return ""
 }
 
+// conversationSaved reports whether Claude Code has saved a conversation for
+// uuid anywhere it would look. A session that never had a turn has none.
+func conversationSaved(st *State, uuid string) bool {
+	return transcriptPath(st, uuid) != ""
+}
+
 // transcriptWorkingDir returns the directory `--resume uuid` must run in, and
 // whether one was found.
 //

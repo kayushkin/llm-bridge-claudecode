@@ -43,9 +43,17 @@ func fakeClaude(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "claude")
+	// The fake saves its conversation where Claude Code would, under a
+	// config directory of its own, so a respawn finds it and resumes it as
+	// the harness would a real one. Without this every respawn would look
+	// like a session stopped before its first turn.
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
 	script := `#!/bin/sh
 printf '%s\n' "$*" >> "$FAKECC_ARGV_LOG"
 uuid="$FAKECC_UUID"
+project="$CLAUDE_CONFIG_DIR/projects/$(printf '%s' "$PWD" | tr / -)"
+mkdir -p "$project"
+printf '{"type":"user","cwd":"%s","sessionId":"%s"}\n' "$PWD" "$uuid" >> "$project/$uuid.jsonl"
 emit() { printf '%s\n' "$1"; }
 # idle is how a real claude -p in stream-json mode waits for the next message:
 # still running, holding stdout open, saying nothing. FAKECC_EXIT
