@@ -14,7 +14,7 @@ import (
 // the test and restores the previous output, flags and prefix afterwards.
 //
 // The buffer is the thing under test here, not scaffolding: "the failure is
-// reported" is the behaviour this file exists to pin, and the only place that
+// reported" is the behavior this file exists to pin, and the only place that
 // report exists is the log. Asserting on it is therefore a real assertion, not
 // a reach guard on a precondition.
 func captureLog(t *testing.T) *bytes.Buffer {
@@ -39,7 +39,7 @@ func shortUserLine(n int) string {
 }
 
 // TestParseSessionHeadReportsAnOverLongLineInsteadOfDroppingItInSilence pins the
-// half of the ceiling behaviour that TestParseSessionHeadReadsTheLongestLineItsCeilingAllows
+// half of the ceiling behavior that TestParseSessionHeadReadsTheLongestLineItsCeilingAllows
 // deliberately does not: not WHAT is dropped, but whether anything says so.
 //
 // bufio.Scanner ends a scan on ErrTooLong exactly as it ends one at EOF —
@@ -118,7 +118,7 @@ func TestParseSessionHeadReportsAnOverLongLineInsteadOfDroppingItInSilence(t *te
 		}
 		if turns == wantAllTurns {
 			t.Errorf("turns = %d: the over-long line did not truncate the scan at all, so this fixture "+
-				"no longer reaches the behaviour under test", turns)
+				"no longer reaches the behavior under test", turns)
 		}
 
 		out := logged.String()

@@ -395,11 +395,11 @@ func TestClassifySubagentPathReportsParent(t *testing.T) {
 	}
 }
 
-// TestDiscover_HonoursClaudeConfigDirOverride pins the two halves of this
+// TestDiscover_HonorsClaudeConfigDirOverride pins the two halves of this
 // package agreeing about where Claude Code keeps its transcripts.
 //
 // `claudeConfigDir` documents CLAUDE_CONFIG_DIR as the override and
-// transcriptPath has always honoured it, but discoverSessions and
+// transcriptPath has always honored it, but discoverSessions and
 // findRolloutForUUID each re-derived `~/.claude/projects` from
 // os.UserHomeDir() and ignored the variable. With the override set the two
 // disagreed: discovery listed the sessions under the home directory while a
@@ -408,7 +408,7 @@ func TestClassifySubagentPathReportsParent(t *testing.T) {
 //
 // Both trees are populated here on purpose. A test that only planted the
 // override's rollout would pass against code that read either location.
-func TestDiscover_HonoursClaudeConfigDirOverride(t *testing.T) {
+func TestDiscover_HonorsClaudeConfigDirOverride(t *testing.T) {
 	homeProjects, _ := withCCHome(t)
 	writeJSONL(t, filepath.Join(homeProjects, "-tmp-home", "uuid-under-home.jsonl"), "under home")
 

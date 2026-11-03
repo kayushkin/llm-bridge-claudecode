@@ -106,7 +106,7 @@ func startUnpromptedCanary(t *testing.T) (*Harness, func() []msg.Event) {
 	h, waiter := spawnCanary(t, "unprompted", 0)
 
 	// Turn 1 is harness-initiated, so it completes normally either way. If
-	// this fails the rig is broken, not the behaviour under test.
+	// this fails the rig is broken, not the behavior under test.
 	turnEndsWithin(t, h, waiter, 20*time.Second)
 	if !containsText(resultTexts(get()), "r-first") {
 		t.Fatalf("the harness-initiated turn never completed; rig problem, not the defect. results=%q", resultTexts(get()))
@@ -161,7 +161,7 @@ func TestCanaryTurnAfterAnUnpromptedTurnAnswersTheNewMessage(t *testing.T) {
 }
 
 // TestFakeClaudeUnpromptedModeEmitsBothTurns guards the new rig mode. Both
-// canaries above read a silent fake as a behavioural result, so a mode that
+// canaries above read a silent fake as a behavioral result, so a mode that
 // emitted nothing would fail them for the wrong reason — and the second canary
 // would then be reporting a defect that its own fixture invented.
 func TestFakeClaudeUnpromptedModeEmitsBothTurns(t *testing.T) {

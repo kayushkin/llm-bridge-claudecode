@@ -136,7 +136,7 @@ func OpenState(path string) (*State, error) {
 		return nil, fmt.Errorf("create state.db dir: %w", err)
 	}
 	// modernc.org/sqlite only understands _pragma=NAME(VALUE), and it drops a
-	// DSN key it does not recognise instead of rejecting it — a mattn-style
+	// DSN key it does not recognize instead of rejecting it — a mattn-style
 	// ?_busy_timeout=5000 would apply nothing and report no error. These two
 	// belong in the DSN because the driver replays it on every connection the
 	// pool opens, so they survive a connection being recycled, where a pragma

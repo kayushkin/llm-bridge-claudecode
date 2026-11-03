@@ -20,7 +20,7 @@ import (
 // asks for a session to be resumed; how this harness finds the conversation is
 // its own business, and no layer above it should carry a path under ~/.claude.
 //
-// It became load-bearing when llm-bridge-server started honouring an
+// It became load-bearing when llm-bridge-server started honoring an
 // instance's working_dir (db47bc7). Local harnesses had been inheriting
 // bridge-server's own directory ("/"); they began getting the instance's
 // instead, and every conversation created before that became unreachable —

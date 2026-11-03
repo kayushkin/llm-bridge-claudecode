@@ -12,7 +12,7 @@ earlier passes of this sweep:
     identifier live. Deleting the walk-back orphans the `utf8` import, and
     `go test` runs vet, so the case would report a compile error instead of a
     score -- and a compile error hides whether any test would have caught the
-    behaviour.
+    behavior.
 
   * CAUGHT is split into assertion-fired and guard-fired. A test can go red
     because its own fixture blew up (t.Fatalf on a setup step) rather than
@@ -53,7 +53,7 @@ CASES = [
      "discover.go", CALLSITE,
      "if len(prompt) > 200 {\n\t\t\t\t\t\tprompt = prompt[:200]\n\t\t\t\t\t}", True),
     # Known-NEGATIVE control. maxBytes==0 already returns "" via the s[:cut]
-    # path with cut==0, so narrowing this guard is a behavioural no-op. A harness
+    # path with cut==0, so narrowing this guard is a behavioral no-op. A harness
     # that reports CAUGHT here is reporting CAUGHT for everything.
     ("CONTROL (no-op): the maxBytes guard narrows from <=0 to <0",
      "discover.go", "if maxBytes <= 0 {", "if maxBytes < 0 {", False),

@@ -26,7 +26,7 @@ import (
 // far end of the pipe, which is the one thing a test cannot supply honestly.
 
 // fakeClaude writes a stand-in `claude` binary that speaks enough stream-json
-// for the drain loop, and returns its path. Behaviour is chosen by the
+// for the drain loop, and returns its path. Behavior is chosen by the
 // FAKECC_MODE environment variable the harness inherits at spawn:
 //
 //	wedge     — announce the session, then fall silent while staying alive.
@@ -344,7 +344,7 @@ func TestCanaryWedgedTurnRespawnsWithResume(t *testing.T) {
 }
 
 // TestFakeClaudeIsRunnable guards the rig itself. Every canary below reads a
-// failure to launch as a behavioural result, so a fake that cannot execute on
+// failure to launch as a behavioral result, so a fake that cannot execute on
 // this host would turn the whole file green for the wrong reason.
 func TestFakeClaudeIsRunnable(t *testing.T) {
 	path := fakeClaude(t)

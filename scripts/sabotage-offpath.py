@@ -19,7 +19,7 @@ and re-earned here:
 
   * Known-NEGATIVE controls are first-class rows. Five of the numbers in this
     file are dominated -- something downstream already rejects the input the
-    mutation lets through -- so moving them is behaviour-preserving. A scorer
+    mutation lets through -- so moving them is behavior-preserving. A scorer
     that reports CAUGHT for those is reporting CAUGHT for everything, and a
     scorer that files them as holes reports gaps nothing can ever close.
 
@@ -107,7 +107,7 @@ CASES = [
 
     # ---- known-NEGATIVE controls -----------------------------------------
     # Each of these is dominated: something downstream already discards the
-    # input the mutation lets through. Moving them is behaviour-preserving, so
+    # input the mutation lets through. Moving them is behavior-preserving, so
     # UNNOTICED is the correct verdict and CAUGHT would mean this harness is
     # firing on noise. Probed directly -- see the module docstring.
     ("CONTROL (dominated): the not-found sentinel changes from -1 to 0, which "

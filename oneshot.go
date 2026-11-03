@@ -54,7 +54,7 @@ const oneShotTimeout = 5 * time.Minute
 
 // oneshotWorkingDirectory is the directory every oneshot call runs claude -p
 // in. It is defined here once because two things depend on it agreeing: the
-// oneshot mode that runs there, and discovery, which recognises a transcript
+// oneshot mode that runs there, and discovery, which recognizes a transcript
 // as a oneshot call by the Claude Code project directory this path encodes to.
 func oneshotWorkingDirectory() (string, error) {
 	home, err := os.UserHomeDir()
@@ -168,7 +168,7 @@ func runOneShot() int {
 
 	// Transcripts group under the cwd's project dir. A dedicated directory
 	// keeps ~480 machine calls/day from polluting the discover scan of any
-	// real repo's session history, and is how discovery recognises these
+	// real repo's session history, and is how discovery recognizes these
 	// transcripts as oneshot calls. Running anywhere else would file the
 	// transcript under some other project as an ordinary discovered session,
 	// so a directory that cannot be made is an error, not a shrug.

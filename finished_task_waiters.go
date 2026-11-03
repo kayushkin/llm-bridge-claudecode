@@ -19,7 +19,7 @@ import (
 // 19:33:28 and Claude Code emitted task_notification "completed" on stdout at
 // that second, but the notice stayed queued until the user interrupted at
 // 19:37:57. Reproduced with plain `claude` 2.1.280 and no bridge at all
-// (19:57:12 → 20:00:54), so the hold is Claude Code's own behaviour.
+// (19:57:12 → 20:00:54), so the hold is Claude Code's own behavior.
 //
 // Claude Code does register the watcher as a task of its own, and it accepts a
 // `stop_task` control request. Stopping the watcher returns its output so far

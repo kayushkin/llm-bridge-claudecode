@@ -234,7 +234,7 @@ func TestAnEffortChangeReachesTheRunningProcess(t *testing.T) {
 
 // TestSpawnTimeFlagsAreReportedNotSwallowed covers max_budget / disabled_tools:
 // Claude Code takes them as CLI flags at spawn, so a running session cannot
-// honour them. They must come back as an error and a system event, never as a
+// honor them. They must come back as an error and a system event, never as a
 // silent success.
 func TestSpawnTimeFlagsAreReportedNotSwallowed(t *testing.T) {
 	events := captureEvents(t)

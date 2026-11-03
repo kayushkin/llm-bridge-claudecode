@@ -15,7 +15,7 @@ import (
 // Holding a write transaction on the fresh file makes that race deterministic
 // rather than roughly-half-the-time. Against a conversion that cannot retry this
 // fails on every run, and it fails instantly: the 0s is the finding, because a
-// connection that had honoured its own 5s busy_timeout would have outlasted a
+// connection that had honored its own 5s busy_timeout would have outlasted a
 // 150ms lock. SQLite declines to run the busy handler for the lock upgrade the
 // conversion needs, so busy_timeout has nothing to give and the wait has to be
 // ours.
@@ -75,7 +75,7 @@ func TestOpenStateWaitsOutAConversionItLoses(t *testing.T) {
 // pragma has to actually reach SQLite. They arrive by two routes now —
 // busy_timeout and foreign_keys in the DSN, journal_mode as the one statement
 // switchJournalMode runs — and each route fails quietly in its own way.
-// modernc's driver drops a DSN key it does not recognise instead of rejecting
+// modernc's driver drops a DSN key it does not recognize instead of rejecting
 // it, so a mattn-style ?_busy_timeout=5000 leaves the setting at its default and
 // says nothing; and a lost journal_mode race can report the mode it stayed on
 // rather than an error.

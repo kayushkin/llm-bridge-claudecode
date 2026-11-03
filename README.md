@@ -47,7 +47,7 @@ The binary runs in one of three modes, selected by llm-bridge-server:
   (`-otel-sidecar`, see `sidecar.go`) and the **rollout tailer** (`rollout.go`).
   See [PTY-COVERAGE.md](PTY-COVERAGE.md) for exactly which events each path
   produces versus stream-json mode.
-  Because it passes no flags, PTY mode does not honour a session's
+  Because it passes no flags, PTY mode does not honor a session's
   `disabled_tools`: every built-in tool stays on.
 - **OTel-sidecar mode.** `llm-bridge-server` spawns
   `llm-bridge-claudecode -otel-sidecar` (`internal/harness/sidecar.go`) before
@@ -710,7 +710,7 @@ go build -o llm-bridge-claudecode .
 
 The binary should be placed on `$PATH` where the parent llm-bridge process can find it. llm-bridge discovers harness binaries by looking for `llm-bridge-*` executables on `$PATH`.
 
-> **Local-development note.** `go.mod` carries `replace github.com/kayushkin/llm-bridge => ../llm-bridge`, which expects a sibling checkout of [llm-bridge](https://github.com/kayushkin/llm-bridge) on disk. This makes the harness easy to develop alongside the protocol library, but means publishing a tagged release of this repo requires either dropping the `replace` line in favour of a published `llm-bridge` version, or moving the override into a top-level `go.work` file. See *OSS publish blockers* below.
+> **Local-development note.** `go.mod` carries `replace github.com/kayushkin/llm-bridge => ../llm-bridge`, which expects a sibling checkout of [llm-bridge](https://github.com/kayushkin/llm-bridge) on disk. This makes the harness easy to develop alongside the protocol library, but means publishing a tagged release of this repo requires either dropping the `replace` line in favor of a published `llm-bridge` version, or moving the override into a top-level `go.work` file. See *OSS publish blockers* below.
 
 ## OSS publish blockers
 

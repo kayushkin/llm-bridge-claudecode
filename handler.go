@@ -240,11 +240,11 @@ type Harness struct {
 	// earlier stream text and a model call after it.
 	turnMu sync.Mutex
 	// deliveredText is the assistant text stream-json delivered in the
-	// current turn, whitespace-normalised, with a count per distinct text.
+	// current turn, whitespace-normalized, with a count per distinct text.
 	// deliveredBefore is the previous turn's. Both are consulted at flush
 	// because Claude Code's exporter batches for about a second, so the OTel
 	// copy of a turn's last segment routinely lands AFTER that turn's result
-	// — in the next turn's buffer, where it must still be recognised as
+	// — in the next turn's buffer, where it must still be recognized as
 	// already delivered rather than recovered.
 	deliveredText   map[string]int
 	deliveredBefore map[string]int
@@ -452,7 +452,7 @@ func (h *Harness) emit(e msg.Event) {
 		if h.deliveredText == nil {
 			h.deliveredText = map[string]int{}
 		}
-		h.deliveredText[normaliseAssistantText(e.Block.Block.Text.Text)]++
+		h.deliveredText[normalizeAssistantText(e.Block.Block.Text.Text)]++
 		h.turnMu.Unlock()
 	}
 
@@ -550,7 +550,7 @@ func (h *Harness) beginTurn() {
 // silent) — this is what makes it visible instead of the session looking
 // frozen. Idempotent: clears the buffer, so calling it more than once is safe.
 //
-// A segment is delivered when its whitespace-normalised text equals one
+// A segment is delivered when its whitespace-normalized text equals one
 // stream-json delivered. Measured 2026-09-03 on a live turn: with
 // OTEL_LOG_ASSISTANT_RESPONSES set the OTel `response` is byte-identical to
 // the stream-json text block, one per block. Each match consumes one delivery,
@@ -579,7 +579,7 @@ func (h *Harness) flushRecoveredAssistant() {
 			continue
 		}
 		text := e.Block.Block.Text.Text
-		key := normaliseAssistantText(text)
+		key := normalizeAssistantText(text)
 		switch {
 		case h.deliveredText[key] > 0:
 			h.deliveredText[key]--
@@ -626,10 +626,10 @@ func (h *Harness) flushRecoveredAssistant() {
 // value, and everything else is a side call.
 const conversationQuerySource = "sdk"
 
-// normaliseAssistantText is the key two copies of one segment are matched on:
+// normalizeAssistantText is the key two copies of one segment are matched on:
 // the text with runs of whitespace collapsed and the ends trimmed, so a
 // trailing newline on one copy does not make it a different answer.
-func normaliseAssistantText(text string) string {
+func normalizeAssistantText(text string) string {
 	return strings.Join(strings.Fields(text), " ")
 }
 
@@ -822,7 +822,7 @@ func (h *Harness) handleStart(params StartParams) error {
 	// that already exists, because Claude Code has no way to move one.
 	//
 	// This overrides h.workDir deliberately and says so in the log, because the
-	// alternative is honouring a directory that makes the session fail.
+	// alternative is honoring a directory that makes the session fail.
 	if continueUUID != "" {
 		if dir, ok := transcriptWorkingDir(h.state, continueUUID); ok && dir != h.workDir {
 			log.Printf("[harness] %s: resuming %s from %q, not %q — that is where Claude Code keeps this conversation",

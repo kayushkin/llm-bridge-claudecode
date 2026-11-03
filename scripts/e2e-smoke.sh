@@ -22,7 +22,7 @@
 #                     (a nil slice encoded straight out) or a stray log line on
 #                     stdout would both break it while compiling perfectly.
 #   2. the main loop  boots the production JSON-RPC path and shuts down cleanly when stdin closes.
-#   3. the sandbox    is honoured — see below.
+#   3. the sandbox    is honored — see below.
 #
 # HERMETICITY IS AN ASSERTION HERE, NOT A PRECAUTION.
 # The harness resolves its own state and session paths from $HOME. This smoke
@@ -138,7 +138,7 @@ DISCOVER_TYPE="$(jq -r 'type' <<<"$DISCOVER_OUT" 2>/dev/null)" \
   || fail "-discover emitted a JSON $DISCOVER_TYPE, want an array. A nil slice encodes as 'null', which is NOT an empty array — bridge-server's discover contract is an array. Got: $DISCOVER_OUT"
 echo "    array of $(jq -r 'length' <<<"$DISCOVER_OUT")"
 
-step "state.db landed inside the sandbox — HOME is honoured"
+step "state.db landed inside the sandbox — HOME is honored"
 # ORDER MATTERS: this runs against the EMPTY sandbox, before any fixture is
 # seeded below. That is deliberate and was paid for. If DefaultStatePath() ever
 # stops resolving from $HOME, the -discover above opens the LIVE state.db — and

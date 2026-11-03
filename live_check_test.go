@@ -6,7 +6,7 @@ import (
 )
 
 // A check against the REAL ~/.claude and state.db on this box, for the session
-// that actually aborted on 2026-08-03 when llm-bridge-server started honouring
+// that actually aborted on 2026-08-03 when llm-bridge-server started honoring
 // the instance's working_dir. Skips everywhere the data is absent, so it never
 // fails on a machine that simply does not have it.
 func TestLive_DeadSessionResolvesToItsOwnDirectory(t *testing.T) {

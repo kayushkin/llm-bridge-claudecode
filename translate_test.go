@@ -457,16 +457,16 @@ func TestTranslateSystemNormalizesTaskStatus(t *testing.T) {
 		},
 		// The next two frames are the SAME task (bmmxgu8ao), verbatim from the
 		// event store: CC reports it "stopped" and then patches it to "killed".
-		// Both are the canonical cancelled. Until they were mapped,
+		// Both are the canonical canceled. Until they were mapped,
 		// TaskStatusIsTerminal recognized neither and the task never settled.
 		{
-			name:       "stopped is cancelled",
+			name:       "stopped is canceled",
 			frame:      `{"type":"system","subtype":"task_notification","task_id":"bmmxgu8ao","tool_use_id":"toolu_014vDBbaWGQJdmGU6QhVH6fh","status":"stopped","output_file":"","summary":"wait for ingest curl to finish","session_id":"fbb3090f"}`,
 			wantStatus: msg.TaskStatusCancelled,
 			wantSummry: "wait for ingest curl to finish",
 		},
 		{
-			name:       "killed is cancelled too — same task, patched a moment later",
+			name:       "killed is canceled too — same task, patched a moment later",
 			frame:      `{"type":"system","subtype":"task_updated","task_id":"bmmxgu8ao","patch":{"status":"killed","end_time":1776671433547},"session_id":"fbb3090f"}`,
 			wantStatus: msg.TaskStatusCancelled,
 		},

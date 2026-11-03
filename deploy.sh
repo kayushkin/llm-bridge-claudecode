@@ -169,7 +169,7 @@ install -m 0755 "$BIN_NAME" "$USER_BIN"
 # running keeps the binary it started with, and /proc shows that binary as
 # deleted. Those sessions switch to this build when their process next starts:
 # after the idle reaper stops it, or on a resume. Name them, so nobody mistakes
-# a live session's behaviour for this build's.
+# a live session's behavior for this build's.
 echo "==> Wrappers still running the previous binary..."
 still_on_previous_binary=0
 for exe in /proc/[0-9]*/exe; do
