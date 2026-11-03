@@ -1405,11 +1405,19 @@ func (h *Harness) Interrupt() {
 	}
 }
 
-// Shutdown cleans up the Claude Code process.
+// Shutdown ends the Claude Code process because the bridge is done with this
+// session (it closed stdin, or sent SIGTERM as the service stops). It sends
+// SIGTERM rather than an interrupt: an interrupt is the user's stop, and
+// Claude Code would mark every background agent stopped by the user and
+// refuse to resume it after the restart. A user's own stop still arrives as
+// SIGINT and goes through Interrupt.
 func (h *Harness) Shutdown() {
 	h.cancel()
 	if h.proc != nil && h.proc.Alive() {
-		h.Interrupt()
+		if err := h.proc.Terminate(); err != nil {
+			log.Printf("SIGTERM to Claude Code failed: %v, killing it", err)
+			h.proc.Kill()
+		}
 		// Give CC a moment to exit gracefully.
 		select {
 		case <-h.proc.Done():

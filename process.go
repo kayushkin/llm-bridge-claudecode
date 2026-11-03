@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/kayushkin/llm-bridge/msg"
@@ -354,6 +355,20 @@ func (p *CCProcess) ReadEvents(ctx context.Context) <-chan json.RawMessage {
 		}
 	}()
 	return ch
+}
+
+// Terminate asks the Claude Code process to exit by sending it SIGTERM.
+// Unlike an interrupt control request, which Claude Code reads as the user
+// pressing stop, a SIGTERM leaves its background agents resumable: each is
+// recorded as finished, not stopped by the user, so a resumed session can
+// continue one with SendMessage. An interrupt marks every background agent
+// stoppedByUser, and Claude Code then refuses to resume it and tells the
+// model not to start it again unless the user asks.
+func (p *CCProcess) Terminate() error {
+	if p.cmd != nil && p.cmd.Process != nil {
+		return p.cmd.Process.Signal(syscall.SIGTERM)
+	}
+	return nil
 }
 
 // Kill terminates the Claude Code process.
