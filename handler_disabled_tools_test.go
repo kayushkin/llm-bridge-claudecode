@@ -96,3 +96,73 @@ func TestCanaryDisabledToolsReachStartAndRespawn(t *testing.T) {
 		t.Fatalf("second spawn was not the respawn: %q", lines[1])
 	}
 }
+
+// The server pins a restricted session's built-in tools as harness_config.tools.
+// An empty list must reach Claude Code as "no built-in tools", never as no flag,
+// which would offer the default set.
+func TestBuiltInToolAllowListArgsTellsAnEmptyListFromNone(t *testing.T) {
+	if got := builtInToolAllowListArgs([]string{"Read", "Glob"}); strings.Join(got, " ") != "--tools=Read,Glob" {
+		t.Fatalf("args = %q, want --tools=Read,Glob", got)
+	}
+	if got := builtInToolAllowListArgs([]string{}); strings.Join(got, " ") != "--tools=" {
+		t.Fatalf("empty list args = %q, want --tools= (no built-in tools)", got)
+	}
+	if got := builtInToolAllowListArgs(nil); len(got) != 0 {
+		t.Fatalf("no list must add no flag, got %q", got)
+	}
+	var params StartParams
+	if err := json.Unmarshal([]byte(`{"tools":[]}`), &params); err != nil {
+		t.Fatal(err)
+	}
+	if params.Tools == nil {
+		t.Fatalf(`"tools":[] decoded to nil; it would offer every default tool`)
+	}
+}
+
+// A respawn builds its own StartParams without the allow list. Until
+// 2026-11-06 it dropped --tools, so a restricted session's second process had
+// Claude Code's whole default set.
+func TestCanaryBuiltInToolAllowListReachesStartAndRespawn(t *testing.T) {
+	_, restore := swapEmit()
+	defer restore()
+
+	path := fakeClaude(t)
+	argvLog := filepath.Join(t.TempDir(), "argv")
+	t.Setenv("FAKECC_MODE", "prompt")
+	t.Setenv("FAKECC_UUID", canaryUUID)
+	t.Setenv("FAKECC_ARGV_LOG", argvLog)
+
+	h := NewHarness(&Config{ClaudePath: path, TurnIdleTimeout: 5 * time.Second})
+	t.Cleanup(func() {
+		if h.proc != nil {
+			_ = h.proc.Kill()
+		}
+		h.cancel()
+	})
+	if err := h.handleStart(StartParams{BridgeSessionID: "canary-bridge", SessionID: "canary-bridge", Prompt: "hello", Tools: []string{"Read", "Glob"}}); err != nil {
+		t.Fatalf("handleStart: %v", err)
+	}
+	if err := h.proc.Kill(); err != nil {
+		t.Fatalf("kill first process: %v", err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for h.proc.Alive() && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err := h.handleMessage(MessageParams{Content: "again"}); err != nil {
+		t.Fatalf("handleMessage respawn: %v", err)
+	}
+	argv, err := os.ReadFile(argvLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(argv)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected two spawns, got %d: %q", len(lines), lines)
+	}
+	for i, line := range lines {
+		if !strings.Contains(line, "--tools=Read,Glob") {
+			t.Fatalf("spawn %d lacks the allow list: %q", i+1, line)
+		}
+	}
+}

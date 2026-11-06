@@ -103,7 +103,7 @@ type StartParams struct {
 	Effort                 string          `json:"effort,omitempty"`                   // --effort: reasoning effort (low/medium/high/xhigh/max)
 	MaxBudgetUSD           float64         `json:"max_budget_usd,omitempty"`           // --max-budget-usd: per-session cost cap
 	DisabledTools          []string        `json:"disabled_tools,omitempty"`           // --disallowed-tools=<name>, one per name: built-in tools Claude Code must not offer
-	Tools                  []string        `json:"tools,omitempty"`                    // --tools: exact built-in tool set ("" disables all, "default" enables all)
+	Tools                  []string        `json:"tools,omitempty"`                    // --tools=<a,b>: the only built-in tools Claude Code may offer; [] offers none, absent offers its default set
 	DisableSlashCommands   bool            `json:"disable_slash_commands,omitempty"`   // --disable-slash-commands
 	NoSessionPersistence   bool            `json:"no_session_persistence,omitempty"`   // --no-session-persistence: ephemeral session
 	IncludePartialMessages bool            `json:"include_partial_messages,omitempty"` // --include-partial-messages: finer streaming
@@ -162,6 +162,11 @@ type Harness struct {
 	autoApprove     *bool                  // persisted across respawns
 	allowedTools    []string               // persisted across respawns
 	disabledTools   []string               // start's disabled_tools, persisted across respawns
+	// builtInToolAllowList is start's tools, persisted across respawns. nil
+	// means the start sent none and Claude Code offers its default set; an
+	// empty, non-nil list means no built-in tool at all. A respawn that
+	// dropped it would hand a restricted session every default tool.
+	builtInToolAllowList []string
 
 	// Start-time prompt flags persisted across respawns so they can be
 	// surfaced in SessionInfo after every init (CC never echoes them back).
@@ -748,6 +753,9 @@ func (h *Harness) handleStart(params StartParams) error {
 	if params.DisabledTools != nil {
 		h.disabledTools = params.DisabledTools
 	}
+	if params.Tools != nil {
+		h.builtInToolAllowList = params.Tools
+	}
 	if params.WorkDir != "" {
 		h.workDir = params.WorkDir
 	}
@@ -894,10 +902,7 @@ func (h *Harness) handleStart(params StartParams) error {
 	// following bare argument as another tool name. h.disabledTools, not
 	// params, so a respawn keeps the list the session started with.
 	extraArgs = append(extraArgs, disallowedToolsArgs(h.disabledTools)...)
-	if len(params.Tools) > 0 {
-		extraArgs = append(extraArgs, "--tools")
-		extraArgs = append(extraArgs, params.Tools...)
-	}
+	extraArgs = append(extraArgs, builtInToolAllowListArgs(h.builtInToolAllowList)...)
 	if params.DisableSlashCommands {
 		extraArgs = append(extraArgs, "--disable-slash-commands")
 	}
@@ -1124,6 +1129,18 @@ func disallowedToolsArgs(disabledTools []string) []string {
 		args = append(args, "--disallowed-tools="+name)
 	}
 	return args
+}
+
+// builtInToolAllowListArgs renders the session's allow list as one
+// --tools=<a,b,…> argument: one argv entry, so the variadic flag cannot
+// swallow a following argument. An empty, non-nil list renders "--tools=",
+// which Claude Code reads as no built-in tools (measured on 2.1.318, as was
+// that a name it does not know is dropped without an error). nil adds no flag.
+func builtInToolAllowListArgs(allowList []string) []string {
+	if allowList == nil {
+		return nil
+	}
+	return []string{"--tools=" + strings.Join(allowList, ",")}
 }
 
 // handleMessage sends a follow-up message to the running Claude Code process.
