@@ -20,11 +20,11 @@ type ccStoredEvent struct {
 
 // ccStoredMessage is the message payload in stored events.
 type ccStoredMessage struct {
-	Role       string                `json:"role"`
-	Content    ccStoredContent       `json:"content"`
-	Model      string                `json:"model,omitempty"`
-	Usage      ccStoredUsage         `json:"usage,omitempty"`
-	StopReason string                `json:"stop_reason,omitempty"`
+	Role       string          `json:"role"`
+	Content    ccStoredContent `json:"content"`
+	Model      string          `json:"model,omitempty"`
+	Usage      ccStoredUsage   `json:"usage,omitempty"`
+	StopReason string          `json:"stop_reason,omitempty"`
 }
 
 // ccStoredContent is a stored message's content. Claude Code writes it in two
@@ -132,38 +132,60 @@ func translateStoredEvent(stored ccStoredEvent, sessionID string) []msg.Event {
 	}
 }
 
-// translateUserEvent converts a CC user event to a user_message msg.Event.
+// translateUserEvent converts a CC user event into canonical events: one
+// tool_result per tool_result block, then a user_message for any text.
+//
+// Claude Code stores every tool result in a user message, because the
+// Anthropic wire format allows a tool_result only in a user-role message. A
+// message made only of tool results carries no text, so reading text alone
+// drops the output of every tool the session ran. Each result names its call
+// by tool_use_id, the same pairing translateUserFrame uses on the live path.
 func translateUserEvent(stored ccStoredEvent, sessionID string, ts time.Time) []msg.Event {
 	var message ccStoredMessage
 	if err := json.Unmarshal(stored.Message, &message); err != nil {
 		return nil
 	}
 
-	// Extract text content
+	var events []msg.Event
 	var text string
 	for _, block := range message.Content {
-		if block.Type == "text" {
+		switch block.Type {
+		case "text":
 			text += block.Text
+		case "tool_result":
+			events = append(events, msg.Event{
+				Type:             msg.EventToolResult,
+				Harness:          harness,
+				HarnessSessionID: sessionID,
+				Timestamp:        ts,
+				ToolResult: &msg.ToolResultEvent{
+					ToolID:  block.ToolUseID,
+					Output:  decodeToolResultContent(block.Content),
+					Content: decodeToolResultMedia(block.Content),
+					IsError: block.IsError,
+				},
+				Raw: stored.Message,
+			})
 		}
 	}
 
-	if text == "" {
-		return nil
+	if text != "" {
+		events = append(events, msg.Event{
+			Type:             msg.EventType("user_message"),
+			Harness:          harness,
+			HarnessSessionID: sessionID,
+			Timestamp:        ts,
+			Result: &msg.ResultEvent{
+				Text: text,
+			},
+			Raw: stored.Message,
+		})
 	}
-
-	return []msg.Event{{
-		Type:      msg.EventType("user_message"),
-		Harness:   harness,
-		HarnessSessionID: sessionID,
-		Timestamp: ts,
-		Result: &msg.ResultEvent{
-			Text: text,
-		},
-		Raw: stored.Message,
-	}}
+	return events
 }
 
-// translateAssistantEvent converts a CC assistant event to a result msg.Event.
+// translateAssistantEvent converts a CC assistant event to a result msg.Event,
+// followed by one tool_call event per tool_use block.
 func translateAssistantEvent(stored ccStoredEvent, sessionID string, ts time.Time) []msg.Event {
 	var message ccStoredMessage
 	if err := json.Unmarshal(stored.Message, &message); err != nil {
@@ -173,6 +195,7 @@ func translateAssistantEvent(stored ccStoredEvent, sessionID string, ts time.Tim
 	// Extract text and thinking content
 	var text, thinking string
 	var tools []msg.ToolSummary
+	var toolCalls []msg.Event
 
 	for _, block := range message.Content {
 		switch block.Type {
@@ -189,18 +212,23 @@ func translateAssistantEvent(stored ccStoredEvent, sessionID string, ts time.Tim
 				Tool:  block.Name,
 				Input: inputStr,
 			})
-		case "tool_result":
-			// Find matching tool and add result
-			for i := len(tools) - 1; i >= 0; i-- {
-				if tools[i].Output == "" {
-					tools[i].Output = decodeToolResultContent(block.Content)
-					if block.IsError {
-						tools[i].Error = "tool error"
-					}
-					break
-				}
-			}
+			toolCalls = append(toolCalls, msg.Event{
+				Type:             msg.EventToolCall,
+				Harness:          harness,
+				HarnessSessionID: sessionID,
+				Timestamp:        ts,
+				ToolCall: &msg.ToolCallEvent{
+					ToolID: block.ID,
+					Name:   block.Name,
+					Input:  block.Input,
+				},
+				Raw: stored.Message,
+			})
 		}
+		// No tool_result case: an assistant message never carries one, so
+		// ToolEvents holds calls with no Output. Each call is also emitted as
+		// a tool_call event carrying its id, and translateUserEvent emits the
+		// matching tool_result event carrying the same id.
 	}
 
 	// Skip empty assistant messages
@@ -209,10 +237,10 @@ func translateAssistantEvent(stored ccStoredEvent, sessionID string, ts time.Tim
 	}
 
 	ev := msg.Event{
-		Type:      msg.EventResult,
-		Harness:   harness,
+		Type:             msg.EventResult,
+		Harness:          harness,
 		HarnessSessionID: sessionID,
-		Timestamp: ts,
+		Timestamp:        ts,
 		Result: &msg.ResultEvent{
 			Text: text,
 			Usage: msg.TokenUsage{
@@ -230,5 +258,5 @@ func translateAssistantEvent(stored ccStoredEvent, sessionID string, ts time.Tim
 		ev.Thinking = &msg.ThinkingEvent{Text: thinking}
 	}
 
-	return []msg.Event{ev}
+	return append([]msg.Event{ev}, toolCalls...)
 }
