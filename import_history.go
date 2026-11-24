@@ -89,6 +89,7 @@ func importHistory(sessionID, path string) error {
 	scanner.Buffer(make([]byte, 0, 1024*1024), 10*1024*1024)
 
 	enc := json.NewEncoder(os.Stdout)
+	translator := newStoredTranscriptTranslator(sessionID)
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -101,13 +102,95 @@ func importHistory(sessionID, path string) error {
 			continue
 		}
 
-		events := translateStoredEvent(stored, sessionID)
-		for _, ev := range events {
-			enc.Encode(ev)
+		for _, ev := range translator.translate(stored) {
+			if err := enc.Encode(ev); err != nil {
+				return err
+			}
 		}
 	}
 
 	return scanner.Err()
+}
+
+// structuredOutputToolName is the tool Claude Code gives a run started with
+// --json-schema, which is how -oneshot asks for an answer in a schema. The
+// model answers by calling it, and Claude Code ends the run as soon as a call
+// succeeds: the transcript's last line is that call's tool_result, and no
+// assistant message follows it. Of the 5,877 newest such transcripts on one
+// host on 2026-11-24, 5,876 ended there.
+const structuredOutputToolName = "StructuredOutput"
+
+// storedTranscriptTranslator translates one transcript's lines in order. It
+// carries what a single line cannot say: which tool calls were the run's
+// structured answer, so that the result of one can be read as the end of the
+// turn.
+type storedTranscriptTranslator struct {
+	sessionID string
+	// structuredOutputCallModels maps the id of each StructuredOutput call
+	// seen so far to the model that made it.
+	structuredOutputCallModels map[string]string
+}
+
+func newStoredTranscriptTranslator(sessionID string) *storedTranscriptTranslator {
+	return &storedTranscriptTranslator{
+		sessionID:                  sessionID,
+		structuredOutputCallModels: map[string]string{},
+	}
+}
+
+// translate converts one stored line, and after a tool_result that answers a
+// StructuredOutput call without an error it adds the result event that ends
+// the turn.
+//
+// Without that event the bridge reads the transcript as "the tools have
+// answered, the model is writing": a finished run stays model_generating for
+// good. The bridge takes a session in that state with no process for one whose
+// process died mid-turn and resumes it. On 2026-11-24 it resumed 113 finished
+// one-shots that way, each as a full Claude Code process, and the host ran out
+// of memory.
+func (t *storedTranscriptTranslator) translate(stored ccStoredEvent) []msg.Event {
+	events := translateStoredEvent(stored, t.sessionID)
+	var message ccStoredMessage
+	if err := json.Unmarshal(stored.Message, &message); err != nil {
+		return events
+	}
+	switch stored.Type {
+	case "assistant":
+		for _, block := range message.Content {
+			if block.Type == "tool_use" && block.Name == structuredOutputToolName {
+				t.structuredOutputCallModels[block.ID] = message.Model
+			}
+		}
+	case "user":
+		for _, block := range message.Content {
+			if block.Type != "tool_result" || block.IsError {
+				continue
+			}
+			model, answersStructuredOutput := t.structuredOutputCallModels[block.ToolUseID]
+			if !answersStructuredOutput {
+				continue
+			}
+			events = append(events, structuredOutputTurnEnd(events, model, stored.Message))
+			break
+		}
+	}
+	return events
+}
+
+// structuredOutputTurnEnd is the result event that ends a turn whose answer
+// was a StructuredOutput call. It takes its session and time from the events
+// of the line that carried the tool_result, and has no text: the answer is the
+// call's input, which the tool_call event already carries.
+func structuredOutputTurnEnd(lineEvents []msg.Event, model string, raw json.RawMessage) msg.Event {
+	last := lineEvents[len(lineEvents)-1]
+	return msg.Event{
+		Type:             msg.EventResult,
+		Harness:          harness,
+		HarnessSessionID: last.HarnessSessionID,
+		Timestamp:        last.Timestamp,
+		Result:           &msg.ResultEvent{Model: model},
+		Raw:              raw,
+	}
 }
 
 // translateStoredEvent converts a CC stored event to msg.Event(s).
